@@ -2,3 +2,90 @@ https://github.com/lucidrains/conformer/blob/master/conformer/conformer.py
 https://github.com/jreremy/conformer
 https://github.com/sooftware/conformer/tree/main/conformer
 https://github.com/xiabingquan/Automatic-Speech-Recognition-from-Scratch/tree/main
+
+
+
+
+
+import moviepy.editor as mp
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Step 1: Extract audio from the video
+def extract_audio_from_video(video_path, audio_path):
+    video = mp.VideoFileClip(video_path)
+    audio = video.audio
+    audio.write_audiofile(audio_path)
+
+# Step 2: Generate and plot Mel spectrogram
+def plot_mel_spectrogram(audio_path):
+    # Load the audio file
+    y, sr = librosa.load(audio_path, sr=None)  # sr=None to preserve the original sample rate
+    
+    # Generate a Mel spectrogram
+    mel_spectrogram = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128, fmax=8000)
+    
+    # Convert to decibel scale (log scale)
+    mel_spectrogram_db = librosa.power_to_db(mel_spectrogram, ref=np.max)
+    
+    # Plot the Mel spectrogram
+    plt.figure(figsize=(10, 6))
+    librosa.display.specshow(mel_spectrogram_db, x_axis='time', y_axis='mel', sr=sr)
+    plt.colorbar(format='%+2.0f dB')
+    plt.title('Mel Spectrogram')
+    plt.show()
+
+# Paths to your video and audio files
+video_path = "your_video.mp4"
+audio_path = "extracted_audio.wav"
+
+# Extract the audio from the video
+extract_audio_from_video(video_path, audio_path)
+
+# Generate and display the Mel spectrogram
+plot_mel_spectrogram(audio_path)
+
+
+
+
+
+
+
+
+import moviepy.editor as mp
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+
+# Step 1: Extract audio from the video
+def extract_audio_from_video(video_path, audio_path):
+    video = mp.VideoFileClip(video_path)
+    audio = video.audio
+    audio.write_audiofile(audio_path)
+
+# Step 2: Generate and plot MFCCs
+def plot_mfcc(audio_path):
+    # Load the audio file
+    y, sr = librosa.load(audio_path, sr=None)  # sr=None preserves the original sample rate
+    
+    # Compute MFCCs (using 13 coefficients, which is standard)
+    mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+    
+    # Plot MFCCs
+    plt.figure(figsize=(10, 6))
+    librosa.display.specshow(mfccs, x_axis='time', sr=sr)
+    plt.colorbar(format='%+2.0f dB')
+    plt.title('MFCCs')
+    plt.show()
+
+# Paths to your video and audio files
+video_path = "your_video.mp4"
+audio_path = "extracted_audio.wav"
+
+# Extract the audio from the video
+extract_audio_from_video(video_path, audio_path)
+
+# Generate and display the MFCCs
+plot_mfcc(audio_path)
