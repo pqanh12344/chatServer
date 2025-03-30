@@ -89,3 +89,295 @@ extract_audio_from_video(video_path, audio_path)
 
 # Generate and display the MFCCs
 plot_mfcc(audio_path)
+
+
+
+
+https://nodejs.org/fr
+
+npx create-react-app chatbot_frontend
+
+
+cd chatbot_frontend
+npm install axios
+
+import React, { useState, useEffect, useRef } from 'react';
+import axios from 'axios';
+import './App.css';
+
+function App() {
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState('');
+  const messageContainerRef = useRef(null);
+
+  // Lấy lịch sử trò chuyện khi tải trang
+  useEffect(() => {
+    const fetchMessages = async () => {
+      try {
+        const response = await axios.get('http://localhost:8000/api/messages/');
+        setMessages(response.data);
+      } catch (error) {
+        console.error('Lỗi khi lấy tin nhắn:', error);
+      }
+    };
+    fetchMessages();
+  }, []);
+
+  // Gửi tin nhắn
+  const sendMessage = async () => {
+    if (input.trim() === '') return;
+
+    const userMessage = { sender: 'user', text: input };
+    setMessages(prevMessages => [...prevMessages, userMessage]);
+
+    try {
+      const response = await axios.post('http://localhost:8000/api/chat/', { message: input });
+      const botMessage = { sender: 'bot', text: response.data.response };
+      setMessages(prevMessages => [...prevMessages, botMessage]);
+    } catch (error) {
+      console.error('Lỗi khi gửi tin nhắn:', error);
+    }
+    setInput('');
+  };
+
+  // Cuộn xuống dưới cùng của danh sách tin nhắn
+  useEffect(() => {
+    if (messageContainerRef.current) {
+      messageContainerRef.current.scrollTop = messageContainerRef.current.scrollHeight;
+    }
+  }, [messages]);
+
+  return (
+    <div className="chat-container">
+      <div className="input-container">
+        <input
+          type="text"
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyPress={e => e.key === 'Enter' && sendMessage()}
+          placeholder="Hỏi bất kỳ điều gì..."
+        />
+        <button onClick={sendMessage}>Gửi</button>
+      </div>
+      <div className="message-container" ref={messageContainerRef}>
+        {messages.map((message, index) => (
+          <div key={index} className={`message ${message.sender}`}>
+            {message.text}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export default App;
+
+
+
+.chat-container {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+}
+
+.input-container {
+  position: absolute;
+  top: 20%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  width: 80%;
+  max-width: 600px;
+}
+
+.input-container input {
+  flex: 1;
+  padding: 10px;
+  border: 1px solid #ddd;
+  border-radius: 5px 0 0 5px;
+}
+
+.input-container button {
+  padding: 10px;
+  border: none;
+  background-color: #007BFF;
+  color: white;
+  border-radius: 0 5px 5px 0;
+}
+
+.message-container {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 400px; /* Có thể điều chỉnh */
+  overflow-y: auto;
+  padding: 10px;
+  background-color: #f9f9f9;
+  border-top: 1px solid #ddd;
+}
+
+.message {
+  margin: 5px 0;
+  padding: 10px;
+  border-radius: 10px;
+  max-width: 80%;
+}
+
+.message.user {
+  background-color: #DCF8C6; /* Màu xanh nhạt cho người dùng */
+  margin-left: auto;
+}
+
+.message.bot {
+  background-color: #F0F0F0; /* Màu xám nhạt cho bot */
+  margin-right: auto;
+}
+
+
+
+python -m venv myenv
+
+pip install django djangorestframework django-cors-headers
+django-admin startproject chatbot_backend
+cd chatbot_backend
+
+pip install Django
+python manage.py startapp chat
+
+
+Trong file chatbot_backend/settings.py, thêm các ứng dụng vào INSTALLED_APPS:
+
+
+INSTALLED_APPS = [
+    ...
+    'rest_framework',
+    'corsheaders',
+    'chat',
+]
+
+
+Thêm middleware và cấu hình CORS:
+
+
+MIDDLEWARE = [
+    ...
+    'corsheaders.middleware.CorsMiddleware',
+    ...
+]
+
+CORS_ALLOW_ALL_ORIGINS = True
+
+
+
+chat/models.py
+
+from django.db import models
+
+class Message(models.Model):
+    SENDER_CHOICES = [
+        ('user', 'User'),
+        ('bot', 'Bot'),
+    ]
+    sender = models.CharField(max_length=4, choices=SENDER_CHOICES)
+    text = models.TextField()
+    timestamp = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.sender}: {self.text[:20]}"
+
+
+
+
+pip install djangorestframework
+pip install django-cors-headers
+
+
+python manage.py makemigrations
+python manage.py migrate
+
+
+
+
+Trong chat/serializers.py:
+
+
+from rest_framework import serializers
+from .models import Message
+
+class MessageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Message
+        fields = ['id', 'sender', 'text', 'timestamp']
+
+
+
+Trong chat/views.py
+
+
+from rest_framework import generics
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from .models import Message
+from .serializers import MessageSerializer
+
+class MessageList(generics.ListAPIView):
+    queryset = Message.objects.all().order_by('timestamp')
+    serializer_class = MessageSerializer
+
+class ChatView(APIView):
+    def post(self, request):
+        user_message_text = request.data.get('message')
+        if not user_message_text:
+            return Response({'error': 'Tin nhắn không được để trống'}, status=400)
+
+        # Lưu tin nhắn của người dùng
+        user_message = Message.objects.create(sender='user', text=user_message_text)
+
+        # Tạo phản hồi từ bot
+        bot_response_text = self.get_bot_response(user_message_text)
+        Message.objects.create(sender='bot', text=bot_response_text)
+
+        return Response({'response': bot_response_text})
+
+    def get_bot_response(self, user_message):
+        # Logic phản hồi đơn giản dựa trên từ khóa
+        keywords = {
+            'hello': 'Xin chào bạn!',
+            'how are you': 'Mình khỏe, cảm ơn bạn!',
+            'bye': 'Tạm biệt!',
+        }
+        for key in keywords:
+            if key in user_message.lower():
+                return keywords[key]
+        return 'Mình không biết trả lời thế nào.'
+
+
+
+
+chat/urls.py:
+
+
+from django.urls import path
+from .views import MessageList, ChatView
+
+urlpatterns = [
+    path('messages/', MessageList.as_view(), name='message-list'),
+    path('chat/', ChatView.as_view(), name='chat'),
+]
+
+
+
+Trong chatbot_backend/urls.py:
+
+
+from django.contrib import admin
+from django.urls import path, include
+
+urlpatterns = [
+    path('admin/', admin.site.urls),
+    path('api/', include('chat.urls')),
+]
+
+python manage.py runserver
+Backend sẽ chạy tại http://localhost:8000
