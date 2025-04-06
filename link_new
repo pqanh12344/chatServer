@@ -381,3 +381,211 @@ urlpatterns = [
 
 python manage.py runserver
 Backend sẽ chạy tại http://localhost:8000
+
+
+
+
+
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
+
+# Giả sử bạn đã có chunks và chunk_embeddings
+# chunks = ["đoạn văn 1", "đoạn văn 2", ..., "đoạn văn 250000"]
+# chunk_embeddings = np.random.randn(250000, 768).astype('float32')  # Ví dụ, thay bằng dữ liệu thực tế
+
+# Đảm bảo chunk_embeddings là float32
+chunk_embeddings = chunk_embeddings.astype('float32')
+
+# Số chiều của vector embedding
+d = chunk_embeddings.shape[1]
+
+# Số lượng centroid
+nlist = 500
+
+# Tạo quantizer
+quantizer = faiss.IndexFlatL2(d)
+
+# Tạo index IVFFlat
+index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+
+# Huấn luyện index
+print("Đang huấn luyện index...")
+index.train(chunk_embeddings)
+print("Huấn luyện hoàn tất.")
+
+# Thêm vector vào index
+print("Đang thêm vector vào index...")
+index.add(chunk_embeddings)
+print("Thêm vector hoàn tất.")
+
+# Tùy chọn: Tăng nprobe để cải thiện độ chính xác
+index.nprobe = 10
+
+# Tùy chọn: Sử dụng GPU nếu có
+if faiss.get_num_gpus() > 0:
+    res = faiss.StandardGpuResources()
+    index = faiss.index_cpu_to_gpu(res, 0, index)
+    print("Đã chuyển index sang GPU.")
+else:
+    print("Không có GPU, sử dụng CPU.")
+
+# Khởi tạo mô hình Sentence Transformer
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Câu query
+query_text = "your query text here"  # Thay bằng câu truy vấn của bạn
+query_embedding = model.encode([query_text]).astype('float32')
+
+# Số lượng kết quả muốn trả về
+k = 10
+
+# Thực hiện tìm kiếm
+print("Đang thực hiện tìm kiếm...")
+distances, indices = index.search(query_embedding, k)
+print("Tìm kiếm hoàn tất.")
+
+# Xử lý kết quả
+print("\nKết quả tìm kiếm:")
+for i in range(k):
+    print(f"Kết quả {i+1}:")
+    print(f"Đoạn văn: {chunks[indices[0][i]]}")
+    print(f"Khoảng cách: {distances[0][i]}")
+    print("---")
+
+
+
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
+
+# Giả sử bạn đã có dữ liệu
+# chunks = ["đoạn văn 1", "đoạn văn 2", ..., "đoạn văn 250000"]
+# chunk_embeddings = np.random.randn(250000, 768).astype('float32')  # Thay bằng dữ liệu thực tế
+
+# Đảm bảo chunk_embeddings là float32
+chunk_embeddings = chunk_embeddings.astype('float32')
+
+# Số chiều của vector embedding
+d = chunk_embeddings.shape[1]
+
+# Số lượng centroid
+nlist = 500
+
+# Tạo quantizer
+quantizer = faiss.IndexFlatL2(d)
+
+# Tạo index IVFFlat
+index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+
+# Huấn luyện index
+print("Đang huấn luyện index...")
+index.train(chunk_embeddings)
+print("Huấn luyện hoàn tất.")
+
+# Định nghĩa batch_size
+batch_size = 10000  # Có thể điều chỉnh
+
+# Tính số lượng batch
+num_batches = (len(chunk_embeddings) + batch_size - 1) // batch_size
+
+# Thêm vector theo batch
+print("Đang thêm vector vào index theo batch...")
+for i in range(num_batches):
+    start_idx = i * batch_size
+    end_idx = min((i + 1) * batch_size, len(chunk_embeddings))
+    batch = chunk_embeddings[start_idx:end_idx]
+    index.add(batch)
+    print(f"Đã thêm batch {i+1}/{num_batches}")
+print("Thêm vector hoàn tất.")
+
+# Khởi tạo mô hình Sentence Transformer
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Câu query
+query_text = "your query text here"  # Thay bằng câu truy vấn của bạn
+query_embedding = model.encode([query_text]).astype('float32')
+
+# Số lượng kết quả muốn trả về
+k = 10
+
+# Thực hiện tìm kiếm
+print("Đang thực hiện tìm kiếm...")
+distances, indices = index.search(query_embedding, k)
+print("Tìm kiếm hoàn tất.")
+
+# Xử lý kết quả
+print("\nKết quả tìm kiếm:")
+for i in range(k):
+    print(f"Kết quả {i+1}:")
+    print(f"Đoạn văn: {chunks[indices[0][i]]}")
+    print(f"Khoảng cách: {distances[0][i]}")
+    print("---")
+
+
+
+
+
+import numpy as np
+from qdrant_client import QdrantClient
+from qdrant_client.http import models
+from sentence_transformers import SentenceTransformer
+
+# Khởi tạo Qdrant Client
+client = QdrantClient("localhost", port=6333)
+
+# Đặt tên collection
+collection_name = "my_collection"
+
+# Kiểm tra và tạo collection nếu chưa tồn tại
+if not client.collection_exists(collection_name):
+    client.create_collection(
+        collection_name=collection_name,
+        vectors_config=models.VectorParams(
+            size=768,  # Kích thước vector embedding
+            distance=models.Distance.COSINE  # Khoảng cách Cosine
+        ),
+    )
+
+# Giả sử bạn đã có dữ liệu
+# chunks = ["đoạn văn 1", "đoạn văn 2", ..., "đoạn văn 250000"]  # 250,000 đoạn văn
+# chunk_embeddings = np.random.rand(250000, 768)  # Ví dụ, thay bằng dữ liệu thực tế của bạn
+
+# Tạo danh sách ID
+ids = list(range(len(chunks)))
+
+# Chuyển chunk_embeddings sang list
+vectors = chunk_embeddings.tolist()
+
+# Upload dữ liệu theo batch
+batch_size = 1000
+for i in range(0, len(ids), batch_size):
+    batch_ids = ids[i:i + batch_size]
+    batch_vectors = vectors[i:i + batch_size]
+    client.upload_collection(
+        collection_name=collection_name,
+        vectors=batch_vectors,
+        ids=batch_ids,
+    )
+    print(f"Uploaded batch {i // batch_size + 1}/{len(ids) // batch_size + 1}")
+
+# Khởi tạo mô hình Sentence Transformer
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Tạo query
+query_text = "your query text here"  # Thay bằng câu truy vấn của bạn
+query_embedding = model.encode(query_text).tolist()
+
+# Thực hiện tìm kiếm
+search_result = client.search(
+    collection_name=collection_name,
+    query_vector=query_embedding,
+    limit=10,
+)
+
+# Xử lý kết quả
+print("\nKết quả tìm kiếm:")
+for hit in search_result:
+    print(f"ID: {hit.id}, Score: {hit.score}")
+    print(f"Đoạn văn: {chunks[hit.id]}")
+    print("---")
