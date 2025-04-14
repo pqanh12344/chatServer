@@ -589,3 +589,53 @@ for hit in search_result:
     print(f"ID: {hit.id}, Score: {hit.score}")
     print(f"Đoạn văn: {chunks[hit.id]}")
     print("---")
+
+
+
+
+
+
+
+
+import streamlit as st
+import random
+import time
+
+st.title("ChatGPT-like clone")
+
+# Danh sách các câu trả lời mẫu cho assistant
+mock_responses = [
+    "Xin chào! Tôi có thể giúp gì cho bạn hôm nay?",
+    "Cảm ơn bạn đã liên hệ. Bạn có câu hỏi gì không?",
+    "Tôi là trợ lý ảo, sẵn sàng hỗ trợ bạn.",
+    "Bạn muốn biết thông tin về chủ đề nào?",
+    "Hãy cho tôi biết bạn cần gì, tôi sẽ cố gắng giúp đỡ."
+]
+
+# Khởi tạo lịch sử chat
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Hiển thị các tin nhắn từ lịch sử
+for message in st.session_state.messages:
+    if message["role"] == "user":
+        st.markdown(f'<div style="display: flex; justify-content: flex-end;"><div style="background-color: #DCF8C6; padding: 10px; border-radius: 10px; max-width: 70%;">{message["content"]}</div></div>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div style="display: flex; justify-content: flex-start;"><div style="background-color: #FFFFFF; padding: 10px; border-radius: 10px; max-width: 70%;">{message["content"]}</div></div>', unsafe_allow_html=True)
+
+# Nhận input từ người dùng
+if prompt := st.chat_input("Bạn khỏe không?"):
+    # Thêm tin nhắn người dùng vào lịch sử
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    # Hiển thị tin nhắn người dùng
+    st.markdown(f'<div style="display: flex; justify-content: flex-end;"><div style="background-color: #DCF8C6; padding: 10px; border-radius: 10px; max-width: 70%;">{prompt}</div></div>', unsafe_allow_html=True)
+    
+    # Tạo phản hồi giả lập cho assistant với hiệu ứng streaming
+    response_placeholder = st.empty()
+    response = random.choice(mock_responses)
+    response_text = ""
+    for char in response:
+        response_text += char
+        response_placeholder.markdown(f'<div style="display: flex; justify-content: flex-start;"><div style="background-color: #FFFFFF; padding: 10px; border-radius: 10px; max-width: 70%;">{response_text}</div></div>', unsafe_allow_html=True)
+        time.sleep(0.05)  # Giả lập độ trễ khi streaming
+    st.session_state.messages.append({"role": "assistant", "content": response})
