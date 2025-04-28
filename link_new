@@ -639,3 +639,27 @@ if prompt := st.chat_input("Bạn khỏe không?"):
         response_placeholder.markdown(f'<div style="display: flex; justify-content: flex-start;"><div style="background-color: #FFFFFF; padding: 10px; border-radius: 10px; max-width: 70%;">{response_text}</div></div>', unsafe_allow_html=True)
         time.sleep(0.05)  # Giả lập độ trễ khi streaming
     st.session_state.messages.append({"role": "assistant", "content": response})
+
+
+
+
+
+o	Machine Learning (ML): Hiểu sâu về các thuật toán như hồi quy, cây quyết định, SVM, Random Forest.
+o	Deep Learning (DL): Làm quen với các framework như TensorFlow, PyTorch; học về neural networks, CNN, RNN.
+o	Natural Language Processing (NLP): Tìm hiểu về xử lý ngôn ngữ tự nhiên, BERT, transformers.
+o	Computer Vision: Học về nhận diện hình ảnh, video (OpenCV, YOLO).
+o	Reinforcement Learning (nếu có thời gian): Một lĩnh vực đang hot nhưng đòi hỏi kiến thức nền tảng vững chắc
+
+
+a. Làm dự án cá nhân
+•	Ý tưởng dự án: 
+o	Chatbot thông minh: Xây dựng một chatbot hỗ trợ khách hàng bằng tiếng Việt, dùng NLP và BERT.
+o	Hệ thống nhận diện khuôn mặt: Dùng OpenCV và deep learning để nhận diện người trong ảnh/video.
+o	Mô hình dự đoán: Dự đoán giá nhà, chứng khoán, hoặc doanh thu bán hàng bằng ML.
+•	Quy trình làm dự án: 
+1.	Xác định vấn đề thực tế (VD: chatbot giúp doanh nghiệp trả lời khách hàng tự động).
+2.	Thu thập dữ liệu (dùng dataset miễn phí từ Kaggle hoặc tự crawl).
+3.	Xây dựng mô hình (dùng Python, TensorFlow/PyTorch).
+4.	Triển khai (deploy lên Heroku, AWS, hoặc Google Cloud).
+•	Thời gian: 1-2 tháng/dự án.
+
