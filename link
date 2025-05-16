@@ -479,3 +479,225 @@ Các trang 4-8 là trọng tâm của bài báo, cung cấp cả lý thuyết (k
 Chúng chứng minh rằng Translatotron 2 không chỉ cải thiện Translatotron gốc mà còn cạnh tranh với cascade, đồng thời mang lại lợi ích đạo đức (quyền riêng tư, chống spoofing) và thực tế (speaker turns).
 Sự kết hợp giữa văn bản, hình ảnh (Hình 1, 2), và bảng (Bảng 1, 2) làm bài báo dễ hiểu, thuyết phục, và có sức ảnh hưởng lớn trong lĩnh vực S2ST.
 Nếu bạn cần phân tích thêm các trang tiếp theo (như Kết luận, Phụ lục) hoặc muốn đi sâu hơn vào bất kỳ đoạn cụ thể nào, hãy cho tôi biết!
+
+
+
+import os
+import pandas as pd
+from tqdm import tqdm
+from sentence_transformers import SentenceTransformer
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import numpy as np
+import gc
+import faiss
+from transformers import pipeline, AutoModelForCausalLM, AutoTokenizer
+import re
+import logging
+import torch
+from typing import List, Tuple
+import time
+
+# Thiết lập logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def preprocess_text(text: str) -> str:
+    """Chuẩn hóa văn bản: loại bỏ khoảng trắng thừa"""
+    try:
+        return re.sub(r'\s+', ' ', text).strip()
+    except Exception as e:
+        logger.error(f"Error in preprocess_text: {e}")
+        return text
+
+def load_documents(contexts_path: str, questions_path: str, answers_path: str) -> Tuple[List[str], List[str], List[str]]:
+    """Tải dữ liệu từ các file văn bản, giới hạn số lượng để tối ưu thời gian"""
+    try:
+        contexts, questions, answers = [], [], []
+        
+        for path, output_list in [(contexts_path, contexts), (questions_path, questions), (answers_path, answers)]:
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"File not found: {path}")
+            with open(path, 'r', encoding='utf-8') as file:
+                lines = file.readlines()[:50]  # Giảm xuống 50 dòng để tăng tốc
+                output_list.extend(preprocess_text(line.strip()) for line in lines if line.strip())
+
+        if not (len(contexts) == len(questions) == len(answers)):
+            raise ValueError("Mismatch in number of contexts, questions, and answers")
+        
+        return contexts, questions, answers
+    except Exception as e:
+        logger.error(f"Error loading documents: {e}")
+        raise
+
+# Đường dẫn tới các file dữ liệu
+contexts_path = '/content/sample_data/data/viquad.contexts'
+questions_path = '/content/sample_data/data/viquad.questions'
+answers_path = '/content/sample_data/data/viquad.answers'
+
+# Kiểm tra sự tồn tại của file
+try:
+    contexts, questions, answers = load_documents(contexts_path, questions_path, answers_path)
+except Exception as e:
+    print(f"Failed to load documents: {e}")
+    exit(1)
+
+# Khởi tạo text splitter
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=128,  # Giảm chunk size để tăng tốc
+    chunk_overlap=10
+)
+
+def chunk_documents(contexts: List[str], questions: List[str], answers: List[str], text_splitter) -> Tuple[List[str], List[dict]]:
+    """Chia nhỏ văn bản thành các chunk"""
+    try:
+        chunks = []
+        metadata = []
+        for context, question, answer in tqdm(zip(contexts, questions, answers), total=len(contexts), desc="Chunking documents"):
+            doc_chunks = text_splitter.split_text(context)
+            for chunk in doc_chunks:
+                chunks.append(chunk)
+                metadata.append({"context": context, "question": question, "answer": answer})
+        return chunks, metadata
+    except Exception as e:
+        logger.error(f"Error chunking documents: {e}")
+        raise
+
+# Chia nhỏ văn bản
+try:
+    chunks, metadata = chunk_documents(contexts, questions, answers, text_splitter)
+    print(f"Number of chunks: {len(chunks)}")
+except Exception as e:
+    print(f"Failed to chunk documents: {e}")
+    exit(1)
+
+def create_embeddings(chunks: List[str], model_path: str) -> np.ndarray:
+    """Tạo embeddings cho các chunk văn bản"""
+    try:
+        model = SentenceTransformer(model_path, device='cpu')
+        gc.collect()
+
+        chunk_size = 256  # Giảm chunk size để tăng tốc
+        batch_size = 4    # Giảm batch size để giảm tải CPU
+        embeddings = []
+
+        for i in tqdm(range(0, len(chunks), chunk_size), desc="Creating embeddings"):
+            batch = chunks[i:i + chunk_size]
+            batch_embeddings = model.encode(
+                batch,
+                batch_size=batch_size,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            )
+            embeddings.append(batch_embeddings)
+            gc.collect()
+
+        embeddings = np.concatenate(embeddings, axis=0)
+        return embeddings
+    except Exception as e:
+        logger.error(f"Error creating embeddings: {e}")
+        raise
+
+# Tạo embeddings với mô hình nhẹ
+model_path = 'sentence-transformers/all-MiniLM-L6-v2'  # Mô hình nhẹ hơn
+try:
+    embeddings = create_embeddings(chunks, model_path)
+except Exception as e:
+    print(f"Failed to create embeddings: {e}")
+    exit(1)
+
+def custom_retrieval(query: str, documents: List[str], doc_embeddings: np.ndarray, model, top_k: int = 3) -> List[str]:
+    """Tìm kiếm top_k tài liệu liên quan, giảm top_k để tăng tốc"""
+    try:
+        start_time = time.time()
+        query_embedding = model.encode([query], convert_to_numpy=True, normalize_embeddings=True)
+        cos_scores = np.dot(doc_embeddings, query_embedding.T).flatten()
+        top_indices = np.argsort(cos_scores)[-min(top_k, len(documents)):]
+        retrieved_docs = [documents[i] for i in top_indices]
+        elapsed_time = time.time() - start_time
+        if elapsed_time < 1:
+            time.sleep(1 - elapsed_time)
+        return retrieved_docs
+    except Exception as e:
+        logger.error(f"Error in custom_retrieval: {e}")
+        return []
+
+def answer_question(query: str, documents: List[str], doc_embeddings: np.ndarray, model, generator, language: str = "vi") -> Tuple[str, List[str]]:
+    """Tạo câu trả lời từ tài liệu tìm kiếm"""
+    try:
+        start_time = time.time()
+        retrieved_docs = custom_retrieval(query, documents, doc_embeddings, model)
+        if not retrieved_docs:
+            return "No relevant documents found.", []
+
+        context = " ".join(retrieved_docs[:2])  # Giảm số tài liệu để tăng tốc
+        prompt = f"Context: {context}\nQuestion: {query}\nAnswer:"
+        
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=128)  # Giảm max_length
+        outputs = generator(prompt, max_new_tokens=20, return_full_text=False)  # Giảm max_new_tokens
+        answer = outputs[0]["generated_text"].strip()
+        
+        elapsed_time = time.time() - start_time
+        if elapsed_time < 1:
+            time.sleep(1 - elapsed_time)
+        return answer, retrieved_docs
+    except Exception as e:
+        logger.error(f"Error in answer_question: {e}")
+        return "Error generating answer.", []
+
+def chatbot_rag(query_text: str = None, language: str = "vi") -> Tuple[str, str]:
+    """Xử lý câu hỏi từ văn bản"""
+    try:
+        if not query_text:
+            return "Please provide a question.", ""
+
+        answer, sources = answer_question(query_text, chunks, embeddings, model, generator, language)
+        return answer, sources[0] if sources else "No source found."
+    except Exception as e:
+        logger.error(f"Error in chatbot_rag: {e}")
+        return "Error processing request.", ""
+
+# Khởi tạo model và generator
+model_name = "distilgpt2"
+try:
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model_llm = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="cpu",
+        low_cpu_mem_usage=True,
+        torch_dtype=torch.float32
+    )
+    generator = pipeline(
+        "text-generation",
+        model=model_llm,
+        tokenizer=tokenizer,
+        max_new_tokens=20,  # Giảm để tăng tốc
+        temperature=0.1,
+        top_p=0.9,
+        do_sample=True,
+        num_beams=1,
+        return_full_text=False,
+        pad_token_id=tokenizer.eos_token_id  # Thêm để tránh warning
+    )
+except Exception as e:
+    print(f"Failed to initialize model or generator: {e}")
+    exit(1)
+
+# Load SentenceTransformer model
+try:
+    model = SentenceTransformer(model_path, device='cpu')
+except Exception as e:
+    print(f"Failed to load SentenceTransformer model: {e}")
+    exit(1)
+
+# Test chatbot
+try:
+    if questions:
+        answer, source = chatbot_rag(questions[0])
+        print(f"Question: {questions[0]}")
+        print(f"Answer: {answer}")
+        print(f"Source: {source}")
+    else:
+        print("No questions available to test.")
+except Exception as e:
+    print(f"Error testing chatbot: {e}")
