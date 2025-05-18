@@ -701,3 +701,669 @@ try:
         print("No questions available to test.")
 except Exception as e:
     print(f"Error testing chatbot: {e}")
+
+
+
+
+
+
+import pandas as pd
+import numpy as np
+import librosa
+import tensorflow as tf
+from tensorflow.keras import layers, Model, Input
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+from transformers import Wav2Vec2Processor, Wav2Vec2ForSequenceClassification
+import torch
+import torchaudio
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import Trainer, TrainingArguments
+
+# Tiền xử lý metadata
+def preprocess_metadata(metadata_path):
+    metadata = pd.read_csv(metadata_path)
+    metadata = metadata.dropna(subset=['gender', 'age'])
+    
+    age_mapping = {'teens': 0, 'twenties': 1, 'thirties': 2, 'forties': 3, 'fifties': 4, 'sixties': 5, 'seventies': 6, 'eighties': 7}
+    gender_mapping = {'male': 0, 'female': 1}
+    regions = ['North', 'Central', 'South']
+    region_mapping = {'North': 0, 'Central': 1, 'South': 2}
+    
+    metadata['age'] = metadata['age'].map(age_mapping)
+    metadata['gender'] = metadata['gender'].map(gender_mapping)
+    np.random.seed(42)
+    metadata['region'] = np.random.choice(regions, size=len(metadata))
+    metadata['region'] = metadata['region'].map(region_mapping)
+    
+    unique_speakers = metadata['client_id'].unique()
+    speaker_mapping = {id: idx for idx, id in enumerate(unique_speakers)}
+    metadata['speaker_id'] = metadata['client_id'].map(speaker_mapping)
+    
+    metadata.to_csv('processed_metadata.csv', index=False)
+    return metadata, {'speaker': speaker_mapping, 'gender': gender_mapping, 'age': age_mapping, 'region': region_mapping}
+
+# Trích xuất log-mel spectrogram
+def extract_log_mel_spectrogram(audio_path, sr=16000, n_mels=128, max_length=1000):
+    y, sr = librosa.load(audio_path, sr=sr)
+    mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels)
+    log_mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
+    if log_mel_spec.shape[1] > max_length:
+        log_mel_spec = log_mel_spec[:, :max_length]
+    else:
+        log_mel_spec = np.pad(log_mel_spec, ((0, 0), (0, max_length - log_mel_spec.shape[1])), mode='constant')
+    return log_mel_spec
+
+# Transformer encoder
+def transformer_encoder(inputs, num_heads, d_model, dff, dropout_rate=0.1):
+    attn_output = layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model)(inputs, inputs)
+    attn_output = layers.Dropout(dropout_rate)(attn_output)
+    out1 = layers.LayerNormalization(epsilon=1e-6)(inputs + attn_output)
+    ffn_output = layers.Dense(dff, activation='relu')(out1)
+    ffn_output = layers.Dense(d_model)(ffn_output)
+    ffn_output = layers.Dropout(dropout_rate)(ffn_output)
+    return layers.LayerNormalization(epsilon=1e-6)(out1 + ffn_output)
+
+# Mô hình Transformer từ đầu
+def create_transformer_model(num_speakers, num_regions, num_ages, n_mels=128, max_length=1000):
+    inputs = Input(shape=(n_mels, max_length, 1))
+    x = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(inputs)
+    x = layers.MaxPooling2D((2, 2))(x)
+    x = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(x)
+    x = layers.MaxPooling2D((2, 2))(x)
+    x = layers.Reshape((-1, x.shape[-1]))(x)
+    
+    def positional_encoding(length, depth):
+        depth = depth / 2
+        positions = np.arange(length)[:, np.newaxis]
+        depths = np.arange(depth)[np.newaxis, :] / depth
+        angle_rates = 1 / (10000 ** depths)
+        angle_rads = positions * angle_rates
+        pos_encoding = np.concatenate([np.sin(angle_rads), np.cos(angle_rads)], axis=-1)
+        return tf.cast(pos_encoding, dtype=tf.float32)
+    
+    pos_encoding = positional_encoding(max_length // 4, x.shape[-1])
+    x = x + pos_encoding
+    
+    num_layers = 4
+    d_model = 128
+    dff = 512
+    num_heads = 8
+    for _ in range(num_layers):
+        x = transformer_encoder(x, num_heads, d_model, dff)
+    
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dense(256, activation='relu')(x)
+    x = layers.Dropout(0.3)(x)
+    
+    speaker_output = layers.Dense(num_speakers, activation='softmax', name='speaker')(x)
+    gender_output = layers.Dense(2, activation='softmax', name='gender')(x)
+    age_output = layers.Dense(num_ages, activation='softmax', name='age')(x)
+    region_output = layers.Dense(num_regions, activation='softmax', name='region')(x)
+    
+    model = Model(inputs=inputs, outputs=[speaker_output, gender_output, age_output, region_output])
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+        loss={
+            'speaker': 'sparse_categorical_crossentropy',
+            'gender': 'sparse_categorical_crossentropy',
+            'age': 'sparse_categorical_crossentropy',
+            'region': 'sparse_categorical_crossentropy'
+        },
+        metrics={
+            'speaker': 'accuracy',
+            'gender': 'accuracy',
+            'age': 'accuracy',
+            'region': 'accuracy'
+        }
+    )
+    return model
+
+# Dataset cho wav2vec2
+class SpeakerDataset(Dataset):
+    def __init__(self, metadata, processor, sr=16000):
+        self.metadata = metadata
+        self.processor = processor
+        self.sr = sr
+    
+    def __len__(self):
+        return len(self.metadata)
+    
+    def __getitem__(self, idx):
+        row = self.metadata.iloc[idx]
+        audio_path = f"common_voice/clips/{row['path']}"
+        waveform, _ = torchaudio.load(audio_path)
+        waveform = torchaudio.transforms.Resample(orig_freq=_, new_freq=self.sr)(waveform)
+        inputs = self.processor(waveform.squeeze(), sampling_rate=self.sr, return_tensors="pt", padding=True)
+        
+        return {
+            'input_values': inputs.input_features.squeeze(),
+            'labels': {
+                'speaker': torch.tensor(row['speaker_id'], dtype=torch.long),
+                'gender': torch.tensor(row['gender'], dtype=torch.long),
+                'age': torch.tensor(row['age'], dtype=torch.long),
+                'region': torch.tensor(row['region'], dtype=torch.long)
+            }
+        }
+
+# Mô hình wav2vec2 multi-task
+class MultiTaskWav2Vec2(Wav2Vec2ForSequenceClassification):
+    def __init__(self, config, num_speakers, num_genders, num_ages, num_regions):
+        super().__init__(config)
+        self.num_speakers = num_speakers
+        self.num_genders = num_genders
+        self.num_ages = num_ages
+        self.num_regions = num_regions
+        self.classifier = nn.ModuleDict({
+            'speaker': nn.Linear(config.hidden_size, num_speakers),
+            'gender': nn.Linear(config.hidden_size, num_genders),
+            'age': nn.Linear(config.hidden_size, num_ages),
+            'region': nn.Linear(config.hidden_size, num_regions)
+        })
+    
+    def forward(self, input_values, attention_mask=None, labels=None):
+        outputs = super().forward(input_values, attention_mask=attention_mask, output_hidden_states=True)
+        hidden_states = outputs.hidden_states[-1].mean(dim=1)
+        logits = {
+            'speaker': self.classifier['speaker'](hidden_states),
+            'gender': self.classifier['gender'](hidden_states),
+            'age': self.classifier['age'](hidden_states),
+            'region': self.classifier['region'](hidden_states)
+        }
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = sum(loss_fct(logits[task], labels[task]) for task in logits)
+        return {'logits': logits, 'loss': loss}
+
+# Dự đoán với Transformer
+def predict_transformer(audio_path, model, mappings):
+    mel_spec = extract_log_mel_spectrogram(audio_path)
+    mel_spec = mel_spec[np.newaxis, ..., np.newaxis]
+    predictions = model.predict(mel_spec)
+    return {
+        'speaker_id': list(mappings['speaker'].keys())[np.argmax(predictions[0], axis=1)[0]],
+        'gender': list(mappings['gender'].keys())[np.argmax(predictions[1], axis=1)[0]],
+        'age': list(mappings['age'].keys())[np.argmax(predictions[2], axis=1)[0]],
+        'region': list(mappings['region'].keys())[np.argmax(predictions[3], axis=1)[0]]
+    }
+
+# Dự đoán với wav2vec2
+def predict_wav2vec2(audio_path, model, processor, mappings, sr=16000):
+    waveform, _ = torchaudio.load(audio_path)
+    waveform = torchaudio.transforms.Resample(orig_freq=_, new_freq=sr)(waveform)
+    inputs = processor(waveform.squeeze(), sampling_rate=sr, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model(inputs.input_features)
+    logits = outputs['logits']
+    predictions = {task: torch.argmax(logits[task], dim=1).item() for task in logits}
+    return {
+        'speaker_id': list(mappings['speaker'].keys())[predictions['speaker']],
+        'gender': list(mappings['gender'].keys())[predictions['gender']],
+        'age': list(mappings['age'].keys())[predictions['age']],
+        'region': list(mappings['region'].keys())[predictions['region']]
+    }
+
+# Main
+if __name__ == "__main__":
+    # Tiền xử lý
+    metadata, mappings = preprocess_metadata('common_voice/cv-valid-train.csv')
+    
+    # Trích xuất đặc trưng
+    mel_features = []
+    labels = []
+    for idx, row in metadata.iterrows():
+        audio_path = f"common_voice/clips/{row['path']}"
+        try:
+            mel_spec = extract_log_mel_spectrogram(audio_path)
+            mel_features.append(mel_spec)
+            labels.append({
+                'speaker_id': row['speaker_id'],
+                'gender': row['gender'],
+                'age': row['age'],
+                'region': row['region']
+            })
+        except Exception as e:
+            print(f"Error processing {audio_path}: {e}")
+    
+    mel_features = np.array(mel_features)
+    labels = pd.DataFrame(labels)
+    
+    # Transformer từ đầu
+    X_train, X_test, y_train, y_test = train_test_split(mel_features, labels, test_size=0.2, random_state=42)
+    X_train = X_train[..., np.newaxis]
+    X_test = X_test[..., np.newaxis]
+    
+    y_train_dict = {
+        'speaker': y_train['speaker_id'],
+        'gender': y_train['gender'],
+        'age': y_train['age'],
+        'region': y_train['region']
+    }
+    y_test_dict = {
+        'speaker': y_test['speaker_id'],
+        'gender': y_test['gender'],
+        'age': y_test['age'],
+        'region': y_test['region']
+    }
+    
+    model = create_transformer_model(len(mappings['speaker']), len(mappings['region']), len(mappings['age']))
+    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+    lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3)
+    
+    history = model.fit(
+        X_train, y_train_dict,
+        validation_data=(X_test, y_test_dict),
+        epochs=50,
+        batch_size=16,
+        callbacks=[early_stopping, lr_scheduler]
+    )
+    
+    model.save('transformer_speaker_model.h5')
+    
+    # Fine-tuning wav2vec2
+    processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base")
+    multi_task_model = MultiTaskWav2Vec2(
+        Wav2Vec2ForSequenceClassification.from_pretrained("facebook/wav2vec2-base").config,
+        len(mappings['speaker']), 2, len(mappings['age']), len(mappings['region'])
+    )
+    
+    train_data, test_data = train_test_split(metadata, test_size=0.2, random_state=42)
+    train_dataset = SpeakerDataset(train_data, processor)
+    test_dataset = SpeakerDataset(test_data, processor)
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=8)
+    
+    training_args = TrainingArguments(
+        output_dir='./results',
+        num_train_epochs=10,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        learning_rate=1e-5,
+        load_best_model_at_end=True,
+        metric_for_best_model="loss",
+        fp16=True
+    )
+    
+    def compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        predictions = {task: np.argmax(logits[i], axis=1) for i, task in enumerate(['speaker', 'gender', 'age', 'region'])}
+        accuracies = {
+            task: (predictions[task] == labels[i]).mean() for i, task in enumerate(['speaker', 'gender', 'age', 'region'])
+        }
+        return accuracies
+    
+    trainer = Trainer(
+        model=multi_task_model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=test_dataset,
+        compute_metrics=compute_metrics
+    )
+    
+    trainer.train()
+    trainer.save_model('wav2vec2_speaker_model')
+    
+    # Đánh giá Transformer
+    results = model.evaluate(X_test, y_test_dict)
+    print("Transformer Test Loss:", results[0])
+    print("Speaker Accuracy:", results[1])
+    print("Gender Accuracy:", results[2])
+    print("Age Accuracy:", results[3])
+    print("Region Accuracy:", results[4])
+    
+    # Trực quan hóa
+    plt.figure(figsize=(12, 8))
+    for task in ['speaker', 'gender', 'age', 'region']:
+        plt.plot(history.history[f'{task}_accuracy'], label=f'Train {task}')
+        plt.plot(history.history[f'val_{task}_accuracy'], label=f'Val {task}')
+    plt.title('Transformer Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.savefig('transformer_accuracy.png')
+    plt.show()
+
+
+
+
+
+import pandas as pd
+import numpy as np
+import os
+import json
+import librosa
+import nemo
+import nemo.collections.asr as nemo_asr
+from nemo.core.config import hydra_runner
+from nemo.utils import logging
+import torch
+import torch.nn as nn
+from pytorch_lightning import Trainer
+
+# Tiền xử lý metadata
+def preprocess_metadata(metadata_path):
+    metadata = pd.read_csv(metadata_path)
+    metadata = metadata.dropna(subset=['gender', 'age'])
+    
+    age_mapping = {'teens': 0, 'twenties': 1, 'thirties': 2, 'forties': 3, 'fifties': 4, 'sixties': 5, 'seventies': 6, 'eighties': 7}
+    gender_mapping = {'male': 0, 'female': 1}
+    regions = ['North', 'Central', 'South']
+    region_mapping = {'North': 0, 'Central': 1, 'South': 2}
+    
+    metadata['age'] = metadata['age'].map(age_mapping)
+    metadata['gender'] = metadata['gender'].map(gender_mapping)
+    np.random.seed(42)
+    metadata['region'] = np.random.choice(regions, size=len(metadata))
+    metadata['region'] = metadata['region'].map(region_mapping)
+    
+    unique_speakers = metadata['client_id'].unique()
+    speaker_mapping = {id: idx for idx, id in enumerate(unique_speakers)}
+    metadata['speaker_id'] = metadata['client_id'].map(speaker_mapping)
+    
+    manifest_data = []
+    for idx, row in metadata.iterrows():
+        audio_path = os.path.abspath(f"common_voice/clips/{row['path']}")
+        if os.path.exists(audio_path):
+            manifest_data.append({
+                'audio_filepath': audio_path,
+                'duration': librosa.get_duration(filename=audio_path),
+                'speaker_id': row['speaker_id'],
+                'gender': row['gender'],
+                'age': row['age'],
+                'region': row['region']
+            })
+    
+    with open('manifest.json', 'w') as f:
+        for item in manifest_data:
+            f.write(json.dumps(item) + '\n')
+    
+    metadata.to_csv('processed_metadata.csv', index=False)
+    return metadata, {'speaker': speaker_mapping, 'gender': gender_mapping, 'age': age_mapping, 'region': region_mapping}
+
+# Mô hình multi-task
+class MultiTaskSpeakerModel(nemo_asr.models.EncDecSpeakerLabelModel):
+    def __init__(self, cfg, trainer=None):
+        super().__init__(cfg, trainer=trainer)
+        self.num_speakers = len(unique_speakers)
+        self.num_genders = 2
+        self.num_ages = len(age_mapping)
+        self.num_regions = len(region_mapping)
+        
+        self.speaker_head = nn.Linear(self._cfg.encoder.d_model, self.num_speakers)
+        self.gender_head = nn.Linear(self._cfg.encoder.d_model, self.num_genders)
+        self.age_head = nn.Linear(self._cfg.encoder.d_model, self.num_ages)
+        self.region_head = nn.Linear(self._cfg.encoder.d_model, self.num_regions)
+    
+    def forward(self, input_signal, input_signal_length):
+        processed_signal, processed_signal_len = self.preprocessor(
+            input_signal=input_signal, length=input_signal_length
+        )
+        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_len)
+        speaker_logits = self.speaker_head(encoded)
+        gender_logits = self.gender_head(encoded)
+        age_logits = self.age_head(encoded)
+        region_logits = self.region_head(encoded)
+        return speaker_logits, gender_logits, age_logits, region_logits
+
+# Dự đoán
+def predict_speaker(audio_path, model, mappings):
+    audio_signal, audio_signal_len = nemo_asr.data.audio_to_mel.audio_file_to_features(
+        audio_path, sample_rate=16000
+    )
+    audio_signal = torch.tensor(audio_signal).unsqueeze(0)
+    audio_signal_len = torch.tensor([audio_signal_len])
+    
+    with torch.no_grad():
+        speaker_logits, gender_logits, age_logits, region_logits = model(
+            input_signal=audio_signal, input_signal_length=audio_signal_len
+        )
+    
+    speaker_pred = torch.argmax(speaker_logits, dim=1).item()
+    gender_pred = torch.argmax(gender_logits, dim=1).item()
+    age_pred = torch.argmax(age_logits, dim=1).item()
+    region_pred = torch.argmax(region_logits, dim=1).item()
+    
+    return {
+        'speaker_id': list(mappings['speaker'].keys())[speaker_pred],
+        'gender': list(mappings['gender'].keys())[gender_pred],
+        'age': list(mappings['age'].keys())[age_pred],
+        'region': list(mappings['region'].keys())[region_pred]
+    }
+
+# Main
+if __name__ == "__main__":
+    # Tiền xử lý
+    metadata, mappings = preprocess_metadata('common_voice/cv-valid-train.csv')
+    
+    # Tải mô hình
+    speaker_model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained("titanet_large")
+    cfg = speaker_model._cfg
+    cfg.train_ds.manifest_filepath = 'manifest.json'
+    cfg.val_ds.manifest_filepath = 'manifest.json'
+    cfg.test_ds.manifest_filepath = 'manifest.json'
+    cfg.train_ds.batch_size = 16
+    cfg.val_ds.batch_size = 16
+    cfg.test_ds.batch_size = 16
+    
+    # Khởi tạo mô hình multi-task
+    multi_task_model = MultiTaskSpeakerModel(cfg)
+    multi_task_model.loss = nn.CrossEntropyLoss()
+    multi_task_model.setup_optimization(optim_config=cfg.optim)
+    
+    # Huấn luyện
+    trainer = Trainer(
+        max_epochs=20,
+        accelerator='gpu',
+        devices=1,
+        callbacks=[
+            nemo.core.ModelCheckpoint(monitor='val_loss', save_top_k=1, mode='min'),
+            nemo.core.EarlyStopping(monitor='val_loss', patience=5)
+        ]
+    )
+    multi_task_model.setup_training_data(cfg.train_ds)
+    multi_task_model.setup_validation_data(cfg.val_ds)
+    trainer.fit(multi_task_model)
+    
+    # Lưu mô hình
+    multi_task_model.save_to('multi_task_speaker_model.nemo')
+    
+    # Đánh giá
+    multi_task_model.setup_test_data(cfg.test_ds)
+    results = trainer.test(multi_task_model)
+    print("Test Results:", results)
+
+
+
+
+
+import pandas as pd
+import numpy as np
+import librosa
+import tensorflow as tf
+from tensorflow.keras import layers, Model, Input
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Tiền xử lý metadata
+def preprocess_metadata(metadata_path):
+    metadata = pd.read_csv(metadata_path)
+    metadata = metadata.dropna(subset=['gender', 'age'])
+    
+    age_mapping = {'teens': 0, 'twenties': 1, 'thirties': 2, 'forties': 3, 'fifties': 4, 'sixties': 5, 'seventies': 6, 'eighties': 7}
+    gender_mapping = {'male': 0, 'female': 1}
+    regions = ['North', 'Central', 'South']
+    region_mapping = {'North': 0, 'Central': 1, 'South': 2}
+    
+    metadata['age'] = metadata['age'].map(age_mapping)
+    metadata['gender'] = metadata['gender'].map(gender_mapping)
+    np.random.seed(42)
+    metadata['region'] = np.random.choice(regions, size=len(metadata))
+    metadata['region'] = metadata['region'].map(region_mapping)
+    
+    unique_speakers = metadata['client_id'].unique()
+    speaker_mapping = {id: idx for idx, id in enumerate(unique_speakers)}
+    metadata['speaker_id'] = metadata['client_id'].map(speaker_mapping)
+    
+    metadata.to_csv('processed_metadata.csv', index=False)
+    return metadata, {'speaker': speaker_mapping, 'gender': gender_mapping, 'age': age_mapping, 'region': region_mapping}
+
+# Trích xuất log-mel spectrogram
+def extract_log_mel_spectrogram(audio_path, sr=16000, n_mels=128, max_length=1000):
+    y, sr = librosa.load(audio_path, sr=sr)
+    mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels)
+    log_mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
+    if log_mel_spec.shape[1] > max_length:
+        log_mel_spec = log_mel_spec[:, :max_length]
+    else:
+        log_mel_spec = np.pad(log_mel_spec, ((0, 0), (0, max_length - log_mel_spec.shape[1])), mode='constant')
+    return log_mel_spec
+
+# Tạo mô hình CNN + Transformer
+def create_cnn_transformer_model(num_speakers, num_regions, num_ages):
+    inputs = Input(shape=(128, 1000, 1))
+    x = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(inputs)
+    x = layers.MaxPooling2D((2, 2))(x)
+    x = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(x)
+    x = layers.MaxPooling2D((2, 2))(x)
+    x = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(x)
+    x = layers.MaxPooling2D((2, 2))(x)
+    x = layers.Reshape((-1, x.shape[-1]))(x)
+    
+    for _ in range(2):
+        x = layers.MultiHeadAttention(num_heads=4, key_dim=128)(x, x)
+        x = layers.LayerNormalization()(x)
+        x = layers.Dense(128, activation='relu')(x)
+        x = layers.Dropout(0.1)(x)
+    
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dense(256, activation='relu')(x)
+    x = layers.Dropout(0.3)(x)
+    
+    speaker_output = layers.Dense(num_speakers, activation='softmax', name='speaker')(x)
+    gender_output = layers.Dense(2, activation='softmax', name='gender')(x)
+    age_output = layers.Dense(num_ages, activation='softmax', name='age')(x)
+    region_output = layers.Dense(num_regions, activation='softmax', name='region')(x)
+    
+    model = Model(inputs=inputs, outputs=[speaker_output, gender_output, age_output, region_output])
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+        loss={
+            'speaker': 'sparse_categorical_crossentropy',
+            'gender': 'sparse_categorical_crossentropy',
+            'age': 'sparse_categorical_crossentropy',
+            'region': 'sparse_categorical_crossentropy'
+        },
+        metrics={
+            'speaker': 'accuracy',
+            'gender': 'accuracy',
+            'age': 'accuracy',
+            'region': 'accuracy'
+        }
+    )
+    return model
+
+# Dự đoán
+def predict_speaker(audio_path, model, mappings):
+    mel_spec = extract_log_mel_spectrogram(audio_path)
+    mel_spec = mel_spec[np.newaxis, ..., np.newaxis]
+    predictions = model.predict(mel_spec)
+    
+    speaker_pred = np.argmax(predictions[0], axis=1)[0]
+    gender_pred = np.argmax(predictions[1], axis=1)[0]
+    age_pred = np.argmax(predictions[2], axis=1)[0]
+    region_pred = np.argmax(predictions[3], axis=1)[0]
+    
+    return {
+        'speaker_id': list(mappings['speaker'].keys())[speaker_pred],
+        'gender': list(mappings['gender'].keys())[gender_pred],
+        'age': list(mappings['age'].keys())[age_pred],
+        'region': list(mappings['region'].keys())[region_pred]
+    }
+
+# Main
+if __name__ == "__main__":
+    # Tiền xử lý metadata
+    metadata, mappings = preprocess_metadata('common_voice/cv-valid-train.csv')
+    
+    # Trích xuất đặc trưng
+    mel_features = []
+    labels = []
+    for idx, row in metadata.iterrows():
+        audio_path = f"common_voice/clips/{row['path']}"
+        try:
+            mel_spec = extract_log_mel_spectrogram(audio_path)
+            mel_features.append(mel_spec)
+            labels.append({
+                'speaker_id': row['speaker_id'],
+                'gender': row['gender'],
+                'age': row['age'],
+                'region': row['region']
+            })
+        except Exception as e:
+            print(f"Error processing {audio_path}: {e}")
+    
+    mel_features = np.array(mel_features)
+    labels = pd.DataFrame(labels)
+    
+    # Chia dữ liệu
+    X_train, X_test, y_train, y_test = train_test_split(mel_features, labels, test_size=0.2, random_state=42)
+    X_train = X_train[..., np.newaxis]
+    X_test = X_test[..., np.newaxis]
+    
+    y_train_dict = {
+        'speaker': y_train['speaker_id'],
+        'gender': y_train['gender'],
+        'age': y_train['age'],
+        'region': y_train['region']
+    }
+    y_test_dict = {
+        'speaker': y_test['speaker_id'],
+        'gender': y_test['gender'],
+        'age': y_test['age'],
+        'region': y_test['region']
+    }
+    
+    # Tạo và huấn luyện mô hình
+    model = create_cnn_transformer_model(len(mappings['speaker']), len(mappings['region']), len(mappings['age']))
+    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+    lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3)
+    
+    history = model.fit(
+        X_train, y_train_dict,
+        validation_data=(X_test, y_test_dict),
+        epochs=50,
+        batch_size=16,
+        callbacks=[early_stopping, lr_scheduler]
+    )
+    
+    # Lưu mô hình
+    model.save('cnn_transformer_speaker_model.h5')
+    
+    # Đánh giá
+    results = model.evaluate(X_test, y_test_dict)
+    print("Test Loss:", results[0])
+    print("Speaker Accuracy:", results[1])
+    print("Gender Accuracy:", results[2])
+    print("Age Accuracy:", results[3])
+    print("Region Accuracy:", results[4])
+    
+    # Trực quan hóa
+    plt.figure(figsize=(12, 8))
+    for task in ['speaker', 'gender', 'age', 'region']:
+        plt.plot(history.history[f'{task}_accuracy'], label=f'Train {task}')
+        plt.plot(history.history[f'val_{task}_accuracy'], label=f'Val {task}')
+    plt.title('Model Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.savefig('accuracy_plot.png')
+    plt.show()
+
+
+
+
