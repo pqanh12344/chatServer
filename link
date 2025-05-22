@@ -1366,4 +1366,94 @@ if __name__ == "__main__":
 
 
 
+#!/usr/bin/env python3
 
+import os
+import resource
+import time
+from multiprocessing import Pool, cpu_count
+from pathlib import Path
+import sys
+
+def process_file(file_path):
+    """Đọc nội dung file, xóa dấu xuống dòng, trả về (đường dẫn, nội dung)"""
+    try:
+        if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
+            with open(file_path, 'r', encoding='utf-8', buffering=8192) as f:
+                return (file_path, f.read().rstrip('\n'))  # Xóa dấu xuống dòng
+        return (file_path, '')
+    except Exception as e:
+        with open('error.log', 'a', encoding='utf-8') as log:
+            log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Lỗi khi đọc {file_path}: {e}\n")
+        return (file_path, '')
+
+def main():
+    input_file = 'list.txt'
+    output_file = 'output.txt'
+    chunk_size = 100000  # Số file mỗi chunk
+    num_processes = max(1, cpu_count() - 1)  # Sử dụng n-1 CPU để tránh quá tải
+    buffer_size = 1024 * 1024  # Buffer 1MB cho ghi file
+
+    # Tăng giới hạn số file mở
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (100000, 100000))
+    except Exception as e:
+        print(f"Cảnh báo: Không thể tăng giới hạn file mở: {e}")
+
+    # Kiểm tra file danh sách
+    if not os.path.isfile(input_file):
+        print(f"Lỗi: File {input_file} không tồn tại!")
+        sys.exit(1)
+
+    # Đọc danh sách đường dẫn
+    start_time = time.time()
+    files = []
+    try:
+        with open(input_file, 'r', encoding='utf-8', buffering=8192) as f:
+            files = [line.strip() for line in f if line.strip()]
+    except Exception as e:
+        print(f"Lỗi khi đọc {input_file}: {e}")
+        sys.exit(1)
+
+    if not files:
+        print("Lỗi: Danh sách file rỗng!")
+        sys.exit(1)
+
+    total_files = len(files)
+    print(f"Đã đọc {total_files:,} đường dẫn từ {input_file}")
+    print(f"Sử dụng {num_processes} luồng, chunk size: {chunk_size:,}")
+
+    # Tạo file đầu ra và file log rỗng
+    with open(output_file, 'w', encoding='utf-8', buffering=buffer_size) as out, \
+         open('error.log', 'w', encoding='utf-8') as log:
+        log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Bắt đầu xử lý {total_files:,} file\n")
+
+        # Xử lý file theo chunk để tối ưu bộ nhớ
+        for i in range(0, total_files, chunk_size):
+            chunk_files = files[i:i + chunk_size]
+            chunk_start = time.time()
+            print(f"Đang xử lý chunk {i // chunk_size + 1}/{total_files // chunk_size + 1} ({len(chunk_files):,} file)")
+
+            # Sử dụng Pool để xử lý song song
+            with Pool(processes=num_processes, maxtasksperchild=1000) as pool:
+                results = pool.imap(process_file, chunk_files)
+                processed = 0
+
+                # Ghi kết quả theo thứ tự
+                for file_path, content in results:
+                    if content:
+                        out.write(content)
+                    processed += 1
+                    if processed % 10000 == 0:
+                        print(f"  Đã xử lý {processed:,}/{len(chunk_files):,} file trong chunk")
+
+            print(f"  Chunk hoàn tất trong {time.time() - chunk_start:.2f} giây")
+
+    end_time = time.time()
+    print(f"Hoàn tất! Kết quả được lưu trong {output_file}")
+    print(f"Tổng thời gian thực hiện: {end_time - start_time:.2f} giây")
+    print(f"Tốc độ trung bình: {total_files / (end_time - start_time):.2f} file/giây")
+    print(f"Log lỗi được lưu trong error.log")
+
+if __name__ == '__main__':
+    main()
