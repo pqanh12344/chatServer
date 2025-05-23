@@ -1457,3 +1457,160 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+
+
+
+# Bước 1: Thiết lập môi trường
+print("Kiểm tra GPU...")
+!nvidia-smi
+!pip install -q unsloth transformers peft datasets torch bitsandbytes trl
+
+import torch
+print(f"Torch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+
+# Bước 2: Tải và kiểm tra dataset Elise
+from datasets import load_dataset, DatasetDict
+import soundfile as sf
+import os
+
+print("Đang tải dataset MrDragonFox/Elise...")
+dataset = load_dataset("MrDragonFox/Elise", split="train")
+
+def check_audio(audio_path):
+    try:
+        audio, sr = sf.read(audio_path)
+        if sr not in [16000, 22050]:
+            return False
+        return True
+    except Exception as e:
+        print(f"Lỗi file âm thanh {audio_path}: {e}")
+        return False
+
+valid_data = {"audio": [], "transcript": []}
+for item in dataset:
+    audio_path = item["audio"]["path"]
+    if check_audio(audio_path):
+        valid_data["audio"].append(audio_path)
+        valid_data["transcript"].append(item["transcript"])
+
+dataset = DatasetDict({"train": Dataset.from_dict(valid_data)})
+dataset = dataset["train"].train_test_split(test_size=0.1)
+print(f"Số mẫu train: {len(dataset['train'])}")
+print(f"Số mẫu test: {len(dataset['test'])}")
+dataset.save_to_disk("/content/processed_dataset")
+print("Dataset đã được lưu vào /content/processed_dataset")
+
+# Bước 3: Tải mô hình với QLoRA
+from unsloth import FastModel
+from transformers import AutoTokenizer
+
+model_name = "unsloth/orpheus-3b-0.1-pretrained"
+print(f"Đang tải mô hình {model_name}...")
+model, tokenizer = FastModel.from_pretrained(
+    model_name,
+    load_in_4bit=True,
+    max_seq_length=1024,
+    device_map="auto"
+)
+print("Mô hình và tokenizer đã được tải.")
+
+# Bước 4: Cấu hình LoRA
+from peft import LoraConfig
+
+peft_config = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
+
+model = FastModel.get_peft_model(
+    model,
+    peft_config,
+    adapter_name="lora"
+)
+print("LoRA đã được áp dụng vào mô hình.")
+
+# Bước 5: Cấu hình huấn luyện
+from transformers import TrainingArguments
+from trl import SFTTrainer
+
+training_args = TrainingArguments(
+    output_dir="/content/logs",
+    num_train_epochs=3,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=16,
+    learning_rate=2e-4,
+    fp16=True,
+    logging_steps=5,
+    save_strategy="epoch",
+    save_total_limit=2,
+    evaluation_strategy="no",
+    report_to="none"
+)
+
+trainer = SFTTrainer(
+    model=model,
+    train_dataset=dataset["train"],
+    peft_config=peft_config,
+    dataset_text_field="transcript",
+    tokenizer=tokenizer,
+    max_seq_length=512,
+    args=training_args
+)
+print("Trainer đã được khởi tạo.")
+
+# Bước 6: Huấn luyện và lưu
+from google.colab import drive
+drive.mount('/content/drive')
+
+print("Bắt đầu huấn luyện...")
+trainer.train()
+model.save_pretrained("/content/drive/MyDrive/fine_tuned_tts_lora")
+tokenizer.save_pretrained("/content/drive/MyDrive/fine_tuned_tts_lora")
+print("Mô hình đã được lưu vào /content/drive/MyDrive/fine_tuned_tts_lora")
+
+# Bước 7: Đánh giá và tạo âm thanh
+from transformers import pipeline
+import soundfile as sf
+
+pipe = pipeline("text-to-speech", model=model, tokenizer=tokenizer)
+
+test_sentences = [
+    "Xin chào, đây là bài kiểm tra giọng nói của Elise.",
+    "Cảm ơn bạn đã sử dụng mô hình này.",
+    "Hôm nay là một ngày đẹp trời!"
+]
+
+for i, sentence in enumerate(test_sentences):
+    print(f"Tạo âm thanh cho câu {i+1}: {sentence}")
+    audio = pipe(sentence)
+    output_path = f"/content/drive/MyDrive/output_{i+1}.wav"
+    with open(output_path, "wb") as f:
+        f.write(audio["audio"])
+    print(f"Đã lưu âm thanh vào {output_path}")
+
+print("Đánh giá trên tập test...")
+for i, item in enumerate(dataset["test"].select(range(min(5, len(dataset["test"]))))) :
+    audio = pipe(item["transcript"])
+    output_path = f"/content/drive/MyDrive/test_output_{i+1}.wav"
+    with open(output_path, "wb") as f:
+        f.write(audio["audio"])
+    print(f"Đã tạo âm thanh cho transcript: {item['transcript']}")
+
+# Bước 8: Kiểm tra log
+import glob
+log_files = glob.glob("/content/logs/*.txt")
+if log_files:
+    with open(log_files[-1], "r") as f:
+        print("Log huấn luyện mới nhất:")
+        print(f.read())
+else:
+    print("Không tìm thấy file log.")
