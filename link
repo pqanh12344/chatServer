@@ -1614,3 +1614,29 @@ if log_files:
         print(f.read())
 else:
     print("Không tìm thấy file log.")
+
+
+
+2. Các bài báo và tài liệu tham khảo gần đây
+Dưới đây là một số bài báo và tài liệu đáng chú ý để bạn tham khảo, tập trung vào các kỹ thuật cải thiện RAG:
+
+"Retrieval-Augmented Generation for Large Language Models: A Survey" (Gao et al., 2024)
+Nội dung: Cung cấp cái nhìn toàn diện về RAG, từ Naive RAG đến Advanced và Modular RAG. Bài báo thảo luận về các kỹ thuật như reranking, query transformation, và context compression.
+Lý do tham khảo: Bài báo này là nguồn tài liệu lý tưởng cho người mới bắt đầu và cung cấp các phương pháp tiên tiến để cải thiện RAG.
+Link tham khảo: Tìm trên arXiv hoặc Google Scholar với tiêu đề bài báo.
+"Astute RAG: Overcoming Imperfect Retrieval for Enhanced LLM Performance" (Google DeepMind, 2024)
+Nội dung: Đề xuất kỹ thuật Astute RAG để giải quyết vấn đề truy xuất không hoàn hảo, giảm thiểu thông tin không liên quan hoặc gây nhiễu.
+Lý do tham khảo: Cung cấp cách tiếp cận mới để cải thiện độ chính xác bằng cách xử lý xung đột giữa kiến thức nội bộ và bên ngoài.
+Link tham khảo: Kiểm tra trên X hoặc Google DeepMind publications.
+"RAG 2.0: Các Kỹ Thuật Cải Thiện Cho Mô Hình Truy Xuất Ngữ Cảnh" (kungfutech.edu.vn)
+Nội dung: Thảo luận về các kỹ thuật như In-Context RALM, Frozen RAG, và ATLAS, tập trung vào tối ưu hóa truy xuất và sinh văn bản.
+Lý do tham khảo: Cung cấp các phương pháp cụ thể như BM25 và reranking, phù hợp với hệ thống sử dụng FAISS.
+Link: kungfutech.edu.vn
+"Toàn cảnh các kỹ thuật Advanced RAG" (Atekco, 2024)
+Nội dung: Tổng quan về các kỹ thuật như Hierarchical Indexing, Metadata Attachment, và FLARE để tăng độ chính xác và liên quan của RAG.
+Lý do tham khảo: Bài viết cung cấp các kỹ thuật thực tiễn có thể áp dụng trực tiếp vào hệ thống RAG với FAISS.
+Link: atekco.io
+"ChatGPT Series 5: Tìm hiểu về Retrieval Augmented Generation (RAG)" (viblo.asia, 2023)
+Nội dung: Giải thích cách Sentence Transformers nâng cao hiệu quả truy xuất của RAG, đặc biệt khi kết hợp với LLM.
+Lý do tham khảo: Cung cấp thông tin chi tiết về việc sử dụng embedding để cải thiện truy xuất ngữ nghĩa, phù hợp với FAISS.
+Link: viblo.asia
