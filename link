@@ -1635,8 +1635,228 @@ Link: kungfutech.edu.vn
 "Toàn cảnh các kỹ thuật Advanced RAG" (Atekco, 2024)
 Nội dung: Tổng quan về các kỹ thuật như Hierarchical Indexing, Metadata Attachment, và FLARE để tăng độ chính xác và liên quan của RAG.
 Lý do tham khảo: Bài viết cung cấp các kỹ thuật thực tiễn có thể áp dụng trực tiếp vào hệ thống RAG với FAISS.
+
+
+
+
+
 Link: atekco.io
 "ChatGPT Series 5: Tìm hiểu về Retrieval Augmented Generation (RAG)" (viblo.asia, 2023)
 Nội dung: Giải thích cách Sentence Transformers nâng cao hiệu quả truy xuất của RAG, đặc biệt khi kết hợp với LLM.
 Lý do tham khảo: Cung cấp thông tin chi tiết về việc sử dụng embedding để cải thiện truy xuất ngữ nghĩa, phù hợp với FAISS.
 Link: viblo.asia
+
+
+
+
+
+import os
+import sqlite3
+import uuid
+import spacy
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_core.prompts import PromptTemplate
+from langchain_core.documents import Document
+import numpy as np
+import json
+
+# Cấu hình môi trường
+os.environ["OPENAI_API_KEY"] = "your-openai-api-key"
+nlp = spacy.load("en_core_web_sm")  # Tải mô hình spaCy
+
+# Khởi tạo mô hình embedding và LLM
+embeddings = OpenAIEmbeddings()
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+# Kết nối và thiết lập SQLite
+def init_sqlite_db(db_name="rag_chatbot.db"):
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS documents (
+            id TEXT PRIMARY KEY,
+            content TEXT,
+            embedding TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS entities (
+            id TEXT PRIMARY KEY,
+            text TEXT,
+            label TEXT,
+            doc_id TEXT,
+            FOREIGN KEY (doc_id) REFERENCES documents(id)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS relationships (
+            id TEXT PRIMARY KEY,
+            source_entity_id TEXT,
+            target_entity_id TEXT,
+            type TEXT,
+            doc_id TEXT,
+            FOREIGN KEY (source_entity_id) REFERENCES entities(id),
+            FOREIGN KEY (target_entity_id) REFERENCES entities(id),
+            FOREIGN KEY (doc_id) REFERENCES documents(id)
+        )
+    """)
+    conn.commit()
+    return conn
+
+# Hàm chia nhỏ văn bản
+def split_text_to_chunks(contexts):
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=len
+    )
+    chunks = []
+    for context in contexts:
+        split_docs = text_splitter.split_text(context)
+        for doc in split_docs:
+            chunks.append(Document(page_content=doc, metadata={"id": str(uuid.uuid4())}))
+    return chunks
+
+# Hàm trích xuất thực thể và mối quan hệ
+def extract_entities_and_relationships(doc, doc_id):
+    spacy_doc = nlp(doc.page_content)
+    entities = []
+    relationships = []
+    
+    # Trích xuất thực thể
+    for ent in spacy_doc.ents:
+        entities.append({
+            "id": str(uuid.uuid4()),
+            "text": ent.text,
+            "label": ent.label_,
+            "doc_id": doc_id
+        })
+    
+    # Giả định mối quan hệ đơn giản (ví dụ: các thực thể trong cùng câu có quan hệ "RELATED")
+    sentences = list(spacy_doc.sents)
+    for sent in sentences:
+        sent_entities = [ent for ent in entities if ent["text"] in sent.text]
+        for i in range(len(sent_entities)):
+            for j in range(i + 1, len(sent_entities)):
+                relationships.append({
+                    "id": str(uuid.uuid4()),
+                    "source_entity_id": sent_entities[i]["id"],
+                    "target_entity_id": sent_entities[j]["id"],
+                    "type": "RELATED",
+                    "doc_id": doc_id
+                })
+    
+    return entities, relationships
+
+# Hàm lưu dữ liệu vào SQLite
+def store_in_sqlite(conn, chunks):
+    cursor = conn.cursor()
+    for chunk in chunks:
+        doc_id = chunk.metadata["id"]
+        embedding = embeddings.embed_query(chunk.page_content)
+        cursor.execute(
+            "INSERT INTO documents (id, content, embedding) VALUES (?, ?, ?)",
+            (doc_id, chunk.page_content, json.dumps(embedding))
+        )
+        
+        # Trích xuất thực thể và mối quan hệ
+        entities, relationships = extract_entities_and_relationships(chunk, doc_id)
+        
+        # Lưu thực thể
+        for entity in entities:
+            cursor.execute(
+                "INSERT INTO entities (id, text, label, doc_id) VALUES (?, ?, ?, ?)",
+                (entity["id"], entity["text"], entity["label"], entity["doc_id"])
+            )
+        
+        # Lưu mối quan hệ
+        for rel in relationships:
+            cursor.execute(
+                "INSERT INTO relationships (id, source_entity_id, target_entity_id, type, doc_id) VALUES (?, ?, ?, ?, ?)",
+                (rel["id"], rel["source_entity_id"], rel["target_entity_id"], rel["type"], rel["doc_id"])
+            )
+    
+    conn.commit()
+
+# Hàm tính độ tương đồng cosine
+def cosine_similarity(vec1, vec2):
+    vec1 = np.array(vec1)
+    vec2 = np.array(vec2)
+    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+
+# Hàm truy xuất ngữ cảnh liên quan
+def retrieve_relevant_chunks(conn, query):
+    cursor = conn.cursor()
+    query_embedding = embeddings.embed_query(query)
+    
+    cursor.execute("SELECT id, content, embedding FROM documents")
+    documents = cursor.fetchall()
+    
+    relevant_docs = []
+    for doc_id, content, emb_json in documents:
+        doc_embedding = json.loads(emb_json)
+        similarity = cosine_similarity(query_embedding, doc_embedding)
+        if similarity > 0.8:
+            relevant_docs.append((content, similarity))
+    
+    relevant_docs.sort(key=lambda x: x[1], reverse=True)
+    return [doc[0] for doc in relevant_docs[:3]]
+
+# Tạo prompt template cho RAG
+template = """
+Bạn là một trợ lý AI thông minh. Dựa trên các thông tin sau đây, trả lời câu hỏi một cách chính xác và ngắn gọn. Nếu không biết câu trả lời, hãy nói "Tôi không biết". 
+
+**Ngữ cảnh**:
+{context}
+
+**Câu hỏi**: {question}
+
+**Trả lời** (tối đa 3 câu):
+{answer}
+Cảm ơn bạn đã hỏi!
+"""
+
+prompt = PromptTemplate.from_template(template)
+
+# Hàm chính để xử lý câu hỏi
+def answer_question(conn, query):
+    # Truy xuất ngữ cảnh liên quan
+    relevant_chunks = retrieve_relevant_chunks(conn, query)
+    context = "\n".join(relevant_chunks)
+    
+    # Tạo prompt với ngữ cảnh và câu hỏi
+    formatted_prompt = prompt.format(
+        context=context,
+        question=query,
+        answer=""
+    )
+    
+    # Gọi LLM để tạo câu trả lời
+    response = llm.invoke(formatted_prompt)
+    return response.content
+
+# Ví dụ sử dụng
+if __name__ == "__main__":
+    # Dữ liệu mẫu (contexts)
+    contexts = [
+        "Công ty ABC chuyên cung cấp giải pháp công nghệ AI cho doanh nghiệp.",
+        "Sản phẩm chủ lực của ABC là phần mềm phân tích dữ liệu lớn, giúp tối ưu hóa quy trình kinh doanh.",
+        "ABC được thành lập vào năm 2015 và có trụ sở tại Hà Nội."
+    ]
+    
+    # Khởi tạo SQLite
+    conn = init_sqlite_db()
+    
+    # Chia nhỏ và lưu vào SQLite
+    chunks = split_text_to_chunks(contexts)
+    store_in_sqlite(conn, chunks)
+    
+    # Đặt câu hỏi
+    query = "ABC được thành lập khi nào?"
+    answer = answer_question(conn, query)
+    print(f"Câu hỏi: {query}")
+    print(f"Trả lời: {answer}")
+    
+    # Đóng kết nối
+    conn.close()
