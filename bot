@@ -1,4 +1,4 @@
-https://nodejs.org/fr
+tôihttps://nodejs.org/fr
 
 npx create-react-app chatbot_frontend
 
@@ -286,3 +286,119 @@ urlpatterns = [
 
 python manage.py runserver
 Backend sẽ chạy tại http://localhost:8000
+
+
+
+import torch
+import torch.nn as nn
+from transformers import AutoModel, AutoTokenizer
+from torch.utils.data import DataLoader, Dataset
+import torch.nn.functional as F
+
+# Hàm mất mát InfoNCE
+class InfoNCELoss(nn.Module):
+    def __init__(self, temperature=0.07):
+        super(InfoNCELoss, self).__init__()
+        self.temperature = temperature
+
+    def forward(self, features_1, features_2, labels):
+        # Chuẩn hóa đặc trưng
+        features_1 = F.normalize(features_1, p=2, dim=1)
+        features_2 = F.normalize(features_2, p=2, dim=1)
+        # Tính độ tương đồng
+        similarity_matrix = torch.matmul(features_1, features_2.T) / self.temperature
+        # Tạo nhãn cho cặp positive (cùng chỉ số)
+        batch_size = features_1.shape[0]
+        labels = torch.arange(batch_size, device=features_1.device)
+        # Tính loss
+        loss = F.cross_entropy(similarity_matrix, labels)
+        return loss
+
+# Dataset tùy chỉnh
+class TextPairDataset(Dataset):
+    def __init__(self, texts_1, texts_2, labels):
+        self.texts_1 = texts_1  # Danh sách văn bản 1
+        self.texts_2 = texts_2  # Danh sách văn bản 2 (positive/negative pairs)
+        self.labels = labels    # Nhãn: 1 cho positive, 0 cho negative
+        self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+    def __len__(self):
+        return len(self.texts_1)
+
+    def __getitem__(self, idx):
+        text_1 = self.texts_1[idx]
+        text_2 = self.texts_2[idx]
+        label = self.labels[idx]
+        encoding_1 = self.tokenizer(text_1, return_tensors="pt", padding="max_length", truncation=True, max_length=128)
+        encoding_2 = self.tokenizer(text_2, return_tensors="pt", padding="max_length", truncation=True, max_length=128)
+        return {
+            "input_ids_1": encoding_1["input_ids"].squeeze(),
+            "attention_mask_1": encoding_1["attention_mask"].squeeze(),
+            "input_ids_2": encoding_2["input_ids"].squeeze(),
+            "attention_mask_2": encoding_2["attention_mask"].squeeze(),
+            "label": label
+        }
+
+# Mô hình
+class TextContrastiveModel(nn.Module):
+    def __init__(self, model_name="bert-base-uncased"):
+        super(TextContrastiveModel, self).__init__()
+        self.bert = AutoModel.from_pretrained(model_name)
+        self.pooling = nn.AdaptiveAvgPool1d(1)  # Mean pooling
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids, attention_mask=attention_mask)
+        # Lấy hidden states của token [CLS] hoặc mean pooling
+        embeddings = outputs.last_hidden_state.mean(dim=1)  # Mean pooling
+        return embeddings
+
+# Dữ liệu mẫu
+texts_1 = ["I love this movie!", "This film is great!", "I hate this movie."]
+texts_2 = ["This movie is amazing!", "I enjoyed the film.", "This film is terrible."]
+labels = [1, 1, 0]  # 1: positive pair, 0: negative pair
+
+# Tạo dataset và dataloader
+dataset = TextPairDataset(texts_1, texts_2, labels)
+dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+
+# Khởi tạo mô hình và hàm mất mát
+model = TextContrastiveModel()
+criterion = InfoNCELoss(temperature=0.07)
+optimizer = torch.optim.Adam(model.parameters(), lr=2e-5)
+
+# Huấn luyện
+model.train()
+for epoch in range(3):
+    for batch in dataloader:
+        optimizer.zero_grad()
+        input_ids_1 = batch["input_ids_1"]
+        attention_mask_1 = batch["attention_mask_1"]
+        input_ids_2 = batch["input_ids_2"]
+        attention_mask_2 = batch["attention_mask_2"]
+        labels = batch["label"].float()
+
+        # Trích xuất đặc trưng
+        features_1 = model(input_ids_1, attention_mask_1)
+        features_2 = model(input_ids_2, attention_mask_2)
+
+        # Tính loss
+        loss = criterion(features_1, features_2, labels)
+        loss.backward()
+        optimizer.step()
+        print(f"Epoch {epoch+1}, Loss: {loss.item()}")
+
+# Phân loại (tinh chỉnh)
+class TextClassifier(nn.Module):
+    def __init__(self, pretrained_model):
+        super(TextClassifier, self).__init__()
+        self.bert = pretrained_model
+        self.fc = nn.Linear(768, 2)  # Giả sử phân loại nhị phân (positive/negative)
+
+    def forward(self, input_ids, attention_mask):
+        embeddings = self.bert(input_ids, attention_mask)
+        logits = self.fc(embeddings)
+        return logits
+
+# Tinh chỉnh cho phân loại
+classifier = TextClassifier(model)
+# Tiếp tục huấn luyện với cross-entropy loss cho bài toán phân loại
