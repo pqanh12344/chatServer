@@ -3,6 +3,212 @@ import time
 import base64
 from PIL import Image
 import io
+import os
+import pandas as pd
+
+# Thiết lập cấu hình trang
+st.set_page_config(page_title="HAN", layout="wide", page_icon="🚖")
+
+# Tùy chỉnh CSS để giao diện giống Grok với nền trắng, tin nhắn không khung, màu chữ đen, và xuống dòng
+st.markdown("""
+    <style>
+    .stApp {
+        background-color: #ffffff;
+        color: #000000;
+        font-family: 'Arial', sans-serif;
+    }
+    .stChatMessage {
+        border-radius: 10px;
+        padding: 10px;
+        margin: 5px 0;
+        background-color: transparent; /* Không có màu nền */
+    }
+    .user-message {
+        background-color: transparent; /* Hòa với nền trắng */
+        text-align: right;
+        color: #000000; /* Màu đen */
+        border: none; /* Không có khung */
+        max-width: 80%; /* Giới hạn */
+        word-wrap: break-word; /* Tự động xuống dòng */
+        margin-left: auto; /* Đẩy sang phải */
+    }
+    .assistant-message {
+        background-color: transparent; /* Hòa với nền trắng */
+        text-align: left;
+        color: #000000; /* Màu đen */
+        border: none; /* Không khung */
+        max-width: 80%; /* Giới hạn */
+        word-wrap: break-word; /* Tự động xuống dòng */
+        margin-right: auto; /* Đẩy sang trái */
+    }
+    .feedback-button {
+        font-size: 12px;
+        padding: 2px 8px;
+        margin-left: 10px;
+    }
+    .stTextInput > div > div > input {
+        background-color: #f0f0f0;
+        color: #000000;
+        border: 1px solid #cccccc;
+        border-radius: 20px;
+        padding: 10px;
+    }
+    .stButton > button {
+        background-color: #1da1f2;
+        color: #ffffff;
+        border-radius: 20px;
+        border: none;
+        padding: 8px 16px;
+    }
+    .stButton > button:hover {
+        background-color: #0d8bdc;
+    }
+    .sidebar .sidebar-content {
+        background-color: #f8f8f8;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# Hàm lưu nội dung vào file CSV
+def save_to_csv(user_message, bot_message, feedback, rating):
+    data = {
+        "UserMessage": [user_message],
+        "BotMessage": [bot_message],
+        "Feedback": [feedback],
+        "Rating": [rating]
+    }
+    df = pd.DataFrame(data)
+    file_exists = os.path.exists('chat_log.csv')
+    df.to_csv('chat_log.csv', mode='a', header=not file_exists, index=False, encoding='utf-8')
+
+# Khởi tạo trạng thái phiên
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "image_prompt" not in st.session_state:
+    st.session_state.image_prompt = ""
+if "selected_message_index" not in st.session_state:
+    st.session_state.selected_message_index = None
+if "last_user_message" not in st.session_state:
+    st.session_state.last_user_message = ""
+if "last_bot_message" not in st.session_state:
+    st.session_state.last_bot_message = ""
+
+# Tạo file CSV nếu chưa tồn tại
+if not os.path.exists('chat_log.csv'):
+    pd.DataFrame(columns=["UserMessage", "BotMessage", "Feedback", "Rating"]).to_csv('chat_log.csv', index=False, encoding='utf-8')
+
+# Sidebar
+with st.sidebar:
+    st.header("HAN")
+    if st.button("Clear Chat"):
+        st.session_state.messages = []
+        st.session_state.image_prompt = ""
+        st.session_state.selected_message_index = None
+        st.session_state.last_user_message = ""
+        st.session_state.last_bot_message = ""
+
+# Tiêu đề chính
+st.markdown("<h1 style='text-align: center; color: #1da1f2;'>HAN</h1>", unsafe_allow_html=True)
+
+# Khu vực trò chuyện
+chat_container = st.container()
+with chat_container:
+    for index, message in enumerate(st.session_state.messages):
+        with st.chat_message(message["role"]):
+            role_class = "user-message" if message["role"] == "user" else "assistant-message"
+            if message["role"] == "assistant":
+                # Hiển thị tin nhắn bot với một nút phản hồi
+                col1, col2 = st.columns([8, 1])
+                with col1:
+                    st.markdown(f"<div class='{role_class}'>{message['content']}</div>", unsafe_allow_html=True)
+                with col2:
+                    if st.button("📝", key=f"feedback_{index}", help="Phản hồi câu trả lời", type="secondary"):
+                        st.session_state.selected_message_index = index if st.session_state.selected_message_index != index else None
+                # Hiển thị form phản hồi ngay dưới tin nhắn nếu được chọn
+                if st.session_state.selected_message_index == index:
+                    with st.container():
+                        st.write(f"Phản hồi cho: {message['content'][:50]}...")
+                        feedback = st.text_area("Nhập phản hồi của bạn:", key=f"feedback_text_{index}")
+                        rating = st.slider("Đánh giá (1-5):", 1, 5, 3, key=f"feedback_rating_{index}")
+                        if st.button("Gửi phản hồi", key=f"submit_feedback_{index}"):
+                            # Lưu cả tin nhắn người dùng, bot, và phản hồi vào CSV
+                            save_to_csv(
+                                user_message=st.session_state.last_user_message,
+                                bot_message=message['content'],
+                                feedback=feedback,
+                                rating=rating
+                            )
+                            st.success("Phản hồi đã được gửi! Cảm ơn bạn!")
+                            st.session_state.selected_message_index = None
+            else:
+                st.markdown(f"<div class='{role_class}'>{message['content']}</div>", unsafe_allow_html=True)
+            if "image" in message:
+                st.image(message["image"], caption="Generated by Grok", width=300)
+
+# Ô nhập liệu
+prompt = st.chat_input("Ask me anything...")
+
+# Xử lý tin nhắn người dùng
+if prompt:
+    # Lưu tin nhắn người dùng vào trạng thái
+    st.session_state.last_user_message = prompt
+    # Thêm tin nhắn người dùng
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with chat_container:
+        with st.chat_message("user"):
+            st.markdown(f"<div class='user-message'>{prompt}</div>", unsafe_allow_html=True)
+    
+    # Giả lập phản hồi từ chatbot
+    with chat_container:
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            full_response = ""
+            response_text = f"Tôi không biết câu hỏi này {prompt}"
+            for chunk in response_text.split():
+                full_response += chunk + " "
+                time.sleep(0.05)
+                message_placeholder.markdown(f"<div class='assistant-message'>{full_response}▌</div>", unsafe_allow_html=True)
+            # Hiển thị phản hồi hoàn chỉnh với một nút phản hồi
+            col1, col2 = st.columns([8, 1])
+            with col1:
+                message_placeholder.markdown(f"<div class='assistant-message'>{full_response}</div>", unsafe_allow_html=True)
+            with col2:
+                new_index = len(st.session_state.messages)
+                if st.button("📝", key=f"feedback_{new_index}", help="Phản hồi câu trả lời", type="secondary"):
+                    st.session_state.selected_message_index = new_index if st.session_state.selected_message_index != index else None
+            # Hiển thị form phản hồi ngay dưới tin nhắn nếu được chọn
+            if st.session_state.selected_message_index == new_index:
+                with st.container():
+                    st.write(f"Phản hồi cho: {full_response[:50]}...")
+                    feedback = st.text_area("Nhập phản hồi của bạn:", key=f"feedback_text_{new_index}")
+                    rating = st.slider("Đánh giá (1-5):", 1, 5, 3, key=f"feedback_rating_{new_index}")
+                    if st.button("Gửi phản hồi", key=f"submit_feedback_{new_index}"):
+                        # Lưu cả tin nhắn người dùng, bot, và phản hồi vào CSV
+                        save_to_csv(
+                            user_message=st.session_state.last_user_message,
+                            bot_message=full_response,
+                            feedback=feedback,
+                            rating=rating
+                        )
+                        st.success("Phản hồi đã được gửi! Cảm ơn bạn!")
+                        st.session_state.selected_message_index = None
+    
+    # Lưu tin nhắn bot vào trạng thái
+    st.session_state.last_bot_message = full_response
+    # Lưu phản hồi
+    st.session_state.messages.append({"role": "assistant", "content": full_response})
+
+
+
+
+
+
+
+import streamlit as st
+import time
+import base64
+from PIL import Image
+import io
 
 # Thiết lập cấu hình trang
 st.set_page_config(page_title="Grok-like Chatbot", layout="wide", page_icon="🚀")
