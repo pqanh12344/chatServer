@@ -1,3 +1,183 @@
+import json
+from typing import Dict, Any, Optional
+from llama_index.core import PropertyGraphIndex
+from llama_index.core.graph_stores import SimplePropertyGraphStore
+from llama_index.llms.openai import OpenAI
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.core.schema import TextNode, Relation
+from uuid import uuid4
+
+class TextNodePropertyGraphBuilder:
+    def __init__(self,
+                 llm_model: str = "gpt-3.5-turbo",
+                 embed_model: str = "text-embedding-3-small"):
+        """Initialize PropertyGraphBuilder with LLM and embedding model"""
+        self.llm = OpenAI(model=llm_model, temperature=0.0)
+        self.embed_model = OpenAIEmbedding(model_name=embed_model)
+        self.graph_store = SimplePropertyGraphStore()
+        self.index = PropertyGraphIndex(
+            nodes=[],
+            llm=self.llm,
+            embed_model=self.embed_model,
+            property_graph_store=self.graph_store,
+            embed_kg_nodes=True
+        )
+
+    def create_node(self, label: str, attributes: Dict[str, Any]) -> TextNode:
+        """Create a TextNode with given label and attributes"""
+        if 'id' not in attributes:
+            raise ValueError("Node attributes must include 'id'")
+        
+        # Generate unique node_id
+        node_id = str(uuid4())
+        
+        # Create TextNode with metadata
+        metadata = attributes.copy()
+        metadata['label'] = label
+        
+        node = TextNode(
+            id_=node_id,
+            text=f"{label}: {attributes.get('name', attributes['id'])}",
+            metadata=metadata
+        )
+        
+        # Insert node into graph store
+        self.graph_store.upsert_nodes([node])
+        self.index.insert(node)
+        return node
+
+    def create_relationship(self, source_label: str, source_id: str, 
+                          target_label: str, target_id: str, 
+                          rel_type: str, attributes: Optional[Dict[str, Any]] = None) -> Relation:
+        """Create a relationship between two TextNodes with optional attributes"""
+        # Find source and target nodes
+        source_nodes = self.graph_store.get(properties={"id": source_id, "label": source_label})
+        target_nodes = self.graph_store.get(properties={"id": target_id, "label": target_label})
+        
+        if not source_nodes:
+            raise ValueError(f"Source node {source_label}:{source_id} does not exist")
+        if not target_nodes:
+            raise ValueError(f"Target node {target_label}:{target_id} does not exist")
+        
+        source_node = source_nodes[0]
+        target_node = target_nodes[0]
+        
+        # Create relation
+        relation = Relation(
+            label=rel_type,
+            source_id=source_node.id_,
+            target_id=target_node.id_,
+            properties=attributes if attributes else {}
+        )
+        
+        # Insert relation into graph store
+        self.graph_store.upsert_relations([relation])
+        return relation
+
+    def create_node_from_json(self, json_str: str) -> TextNode:
+        """Create a TextNode from JSON string"""
+        try:
+            data = json.loads(json_str)
+            label = data.get('label')
+            attributes = data.get('attributes', {})
+            if not label or not attributes:
+                raise ValueError("JSON must contain 'label' and 'attributes'")
+            return self.create_node(label, attributes)
+        except json.JSONDecodeError:
+            raise ValueError("Invalid JSON string")
+
+    def create_relationship_from_json(self, json_str: str) -> Relation:
+        """Create a relationship from JSON string"""
+        try:
+            data = json.loads(json_str)
+            source_label = data.get('source_label')
+            source_id = data.get('source_id')
+            target_label = data.get('target_label')
+            target_id = data.get('target_id')
+            rel_type = data.get('rel_type')
+            attributes = data.get('attributes', {})
+            if not all([source_label, source_id, target_label, target_id, rel_type]):
+                raise ValueError("JSON must contain 'source_label', 'source_id', 'target_label', 'target_id', and 'rel_type'")
+            return self.create_relationship(source_label, source_id, target_label, target_id, rel_type, attributes)
+        except json.JSONDecodeError:
+            raise ValueError("Invalid JSON string")
+
+    def get_all_nodes(self) -> list:
+        """Return all nodes in the graph store"""
+        return self.graph_store.get(properties={})
+
+    def get_all_relationships(self) -> list:
+        """Return all relationships in the graph store"""
+        return self.graph_store.get_relations()
+
+# Example usage
+def main():
+    # Initialize builder
+    builder = TextNodePropertyGraphBuilder()
+
+    try:
+        # Example 1: Create a node directly
+        person_attrs = {
+            "id": "P001",
+            "name": "John Doe",
+            "age": 30
+        }
+        person = builder.create_node("PERSON", person_attrs)
+        print(f"Created person node: {person}")
+
+        # Example 2: Create a node from JSON
+        company_json = '''
+        {
+            "label": "ORGANIZATION",
+            "attributes": {
+                "id": "C001",
+                "name": "Tech Corp",
+                "industry": "Technology"
+            }
+        }
+        '''
+        company = builder.create_node_from_json(company_json)
+        print(f"Created company node: {company}")
+
+        # Example 3: Create a relationship from JSON
+        relationship_json = '''
+        {
+            "source_label": "PERSON",
+            "source_id": "P001",
+            "target_label": "ORGANIZATION",
+            "target_id": "C001",
+            "rel_type": "WORKS_FOR",
+            "attributes": {
+                "role": "Developer",
+                "start_date": "2023-10-01"
+            }
+        }
+        '''
+        relationship = builder.create_relationship_from_json(relationship_json)
+        print(f"Created relationship: {relationship}")
+
+        # Print all nodes and relationships
+        print("\nAll nodes:")
+        for node in builder.get_all_nodes():
+            print(f"{node.id_}: {node.metadata}")
+        print("\nAll relationships:", builder.get_all_relationships())
+
+    except Exception as e:
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
 import pandas as pd
 
 def convert_csv_to_excel(csv_file_path, excel_file_path):
