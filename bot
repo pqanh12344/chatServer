@@ -1,4 +1,79 @@
 import json
+from llama_index.core import PropertyGraphIndex, TextNode, StorageContext, SimpleDirectoryStore
+from llama_index.graph_stores.simple import SimplePropertyGraphStore
+
+# Đọc file JSON
+json_file_path = "data.json"
+with open(json_file_path, 'r', encoding='utf-8') as file:
+    json_data = json.load(file)
+
+# Khởi tạo SimplePropertyGraphStore
+graph_store = SimplePropertyGraphStore()
+
+# Tạo nodes và relationships
+nodes = []
+relationships = []
+
+for item in json_data:
+    # Tạo node cho Property
+    property_node = TextNode(
+        text=f"{item['name']}: {item['value']}",
+        metadata={
+            "id": item["id"],
+            "name": item["name"],
+            "value": item["value"],
+            "category": item["category"],
+            "entity_type": "Property"
+        }
+    )
+    nodes.append(property_node)
+
+    # Tạo node cho Category
+    category_node = TextNode(
+        text=item["category"],
+        metadata={
+            "category": item["category"],
+            "entity_type": "Category"
+        }
+    )
+    nodes.append(category_node)
+
+    # Tạo mối quan hệ
+    relationships.append({
+        "source_node_id": property_node.node_id,
+        "target_node_id": category_node.node_id,
+        "relationship_type": "BELONGS_TO_CATEGORY"
+    })
+
+# Tạo PropertyGraphIndex
+index = PropertyGraphIndex(
+    nodes=nodes,
+    property_graph_store=graph_store,
+    relationships=relationships
+)
+
+# Lưu index
+storage_context = StorageContext.from_defaults(
+    persist_dir="./property_graph_db",
+    graph_store=graph_store
+)
+index.storage_context.persist(persist_dir="./property_graph_db")
+print("Đã lưu Property Graph vào ./property_graph_db!")
+
+# Truy vấn
+query_engine = index.as_query_engine()
+response = query_engine.query("Tìm tất cả các Property thuộc category 'cat1'")
+print("Kết quả truy vấn:", response) có 
+
+
+
+
+
+
+
+
+
+import json
 from typing import Dict, Any, Optional
 from llama_index.core import PropertyGraphIndex
 from llama_index.core.graph_stores import SimplePropertyGraphStore
