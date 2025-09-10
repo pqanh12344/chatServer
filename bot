@@ -19,6 +19,38 @@ CMD ["nginx", "-g", "daemon off;"]
 
 
 
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: my-backend
+    ports:
+      - "9078:9078"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9078/api/hello"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: my-frontend
+    ports:
+      - "8868:80"   # nginx serve FE -> map ra port 8868
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+
+
+
+
 
 
 import json
