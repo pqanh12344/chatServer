@@ -1,3 +1,95 @@
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import TransformerConv
+from torch_geometric.utils import from_networkx
+import networkx as nx
+import numpy as np
+import random
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.model_selection import train_test_split
+
+# ====== 1️⃣ Build line graph với edge có 100 thuộc tính ======
+G = nx.Graph()
+for (src, dst) in [('A','B'), ('B','C'), ('C','D'), ('D','E'), ('A','E'), ('B','D')]:
+    edge_feats = np.random.rand(100)
+    attack = random.randint(0, 1)
+    G.add_edge(src, dst, **{f'feat_{i}': edge_feats[i] for i in range(100)}, attack=attack)
+
+LG = nx.line_graph(G)
+for edge in G.edges(data=True):
+    node = edge[:2]
+    LG.nodes[node]['x'] = [edge[2][f'feat_{i}'] for i in range(100)]
+    LG.nodes[node]['attack'] = edge[2]['attack']
+
+data = from_networkx(LG)
+data.x = torch.tensor([v['x'] for _, v in LG.nodes(data=True)], dtype=torch.float)
+data.y = torch.tensor([v['attack'] for _, v in LG.nodes(data=True)], dtype=torch.long)
+
+# ====== 2️⃣ Graph Transformer model ======
+class GraphTransformer(torch.nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim):
+        super().__init__()
+        self.conv1 = TransformerConv(in_dim, hidden_dim, heads=4, dropout=0.1)
+        self.conv2 = TransformerConv(hidden_dim * 4, out_dim, heads=1)
+        
+    def forward(self, data):
+        x = F.relu(self.conv1(data.x, data.edge_index))
+        x = self.conv2(x, data.edge_index)
+        return F.normalize(x, dim=-1)
+
+model = GraphTransformer(100, 64, 32)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+# ====== 3️⃣ Contrastive loss ======
+def contrastive_loss(emb, labels, temperature=0.5):
+    sim = F.cosine_similarity(emb.unsqueeze(1), emb.unsqueeze(0), dim=-1)
+    mask = torch.eq(labels.unsqueeze(1), labels.unsqueeze(0)).float()
+
+    exp_sim = torch.exp(sim / temperature)
+    pos = exp_sim * mask
+    neg = exp_sim * (1 - mask)
+
+    pos_sum = pos.sum(1)
+    neg_sum = neg.sum(1)
+
+    loss = -torch.log(pos_sum / (pos_sum + neg_sum + 1e-8))
+    return loss.mean()
+
+# ====== 4️⃣ Training loop ======
+for epoch in range(1, 201):
+    optimizer.zero_grad()
+    emb = model(data)
+    loss = contrastive_loss(emb, data.y)
+    loss.backward()
+    optimizer.step()
+    
+    if epoch % 20 == 0:
+        print(f"Epoch {epoch:03d} | Contrastive Loss: {loss.item():.4f}")
+
+# ====== 5️⃣ Evaluation: linear probe (embedding quality test) ======
+# Tách embedding và label để train 1 classifier đơn giản
+embeddings = model(data).detach().cpu().numpy()
+labels = data.y.cpu().numpy()
+
+X_train, X_test, y_train, y_test = train_test_split(embeddings, labels, test_size=0.4, random_state=42)
+
+clf = LogisticRegression(max_iter=1000)
+clf.fit(X_train, y_train)
+y_pred = clf.predict(X_test)
+
+acc = accuracy_score(y_test, y_pred)
+f1 = f1_score(y_test, y_pred, average='macro')
+
+print("\n===== Evaluation =====")
+print(f"Accuracy: {acc:.4f}")
+print(f"F1-score: {f1:.4f}")
+
+
+
+
+
+
 # ===============================
 # 0️⃣ Imports
 # ===============================
