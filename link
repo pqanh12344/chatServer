@@ -1,3 +1,319 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torch_geometric.data import Data, HeteroData
+from torch_geometric.nn import GCNConv, HypergraphConv
+from torch_geometric.loader import LinkNeighborLoader
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==================== CONFIG ====================
+BATCH_SIZE = 32
+NUM_EPOCHS = 50
+LEARNING_RATE = 0.001
+NUM_WORKERS = 4
+DEVICE_IDS = [0, 1]  # Multi-GPU IDs
+
+class DataPreprocessor:
+    """Xử lý dữ liệu NF-ToN-IoT-V2"""
+    
+    def __init__(self, csv_path):
+        self.df = pd.read_csv(csv_path)
+        self.label_encoder = LabelEncoder()
+        self.scaler = StandardScaler()
+        
+    def preprocess(self):
+        """Tiền xử lý dữ liệu"""
+        print(f"[*] Dữ liệu gốc: {self.df.shape}")
+        
+        # Xóa rows với giá trị NaN
+        self.df = self.df.dropna()
+        
+        # Encode Attack labels (string -> int)
+        self.df['Attack_encoded'] = self.label_encoder.fit_transform(self.df['Attack'])
+        
+        # Tách features (100 thuộc tính)
+        feature_cols = [col for col in self.df.columns 
+                       if col not in ['Label', 'Attack', 'Attack_encoded']]
+        
+        X = self.df[feature_cols].values
+        y = self.df['Attack_encoded'].values
+        
+        # Normalize features
+        X = self.scaler.fit_transform(X)
+        
+        print(f"[*] Số lượng features: {X.shape[1]}")
+        print(f"[*] Số lượng attack types: {len(self.label_encoder.classes_)}")
+        print(f"[*] Attack types: {self.label_encoder.classes_}")
+        
+        return X, y, feature_cols
+    
+    def create_graph_from_ips(self, X, y):
+        """Tạo hypergraph từ IPs và ports"""
+        # Giả định: 2 cột đầu là IP src, IP dst
+        # Tạo edge list dựa trên IP-Port connections
+        
+        num_nodes = X.shape[0]
+        
+        # Tạo edges: kết nối các nodes có cùng IP hoặc cùng port
+        edges = []
+        for i in range(num_nodes):
+            for j in range(i+1, num_nodes):
+                # Khoảng cách Euclidean (có thể tùy chỉnh)
+                dist = np.linalg.norm(X[i][:2] - X[j][:2])
+                if dist < 0.5:  # Ngưỡng kết nối
+                    edges.append([i, j])
+                    edges.append([j, i])
+        
+        if not edges:
+            # Fallback: tạo k-NN graph
+            from sklearn.neighbors import NearestNeighbors
+            nbrs = NearestNeighbors(n_neighbors=5).fit(X)
+            distances, indices = nbrs.kneighbors(X)
+            for i, neighbors in enumerate(indices):
+                for j in neighbors:
+                    if i != j:
+                        edges.append([i, j])
+        
+        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+        
+        print(f"[*] Số lượng edges: {edge_index.shape[1]}")
+        
+        return edge_index
+
+class HypergraphGNN(nn.Module):
+    """Hypergraph Neural Network"""
+    
+    def __init__(self, in_features, hidden_dim=64, num_classes=2, num_layers=3):
+        super(HypergraphGNN, self).__init__()
+        
+        self.in_features = in_features
+        self.hidden_dim = hidden_dim
+        self.num_classes = num_classes
+        
+        # Hypergraph layers
+        self.hypergraph_layers = nn.ModuleList()
+        self.hypergraph_layers.append(HypergraphConv(in_features, hidden_dim))
+        for _ in range(num_layers - 2):
+            self.hypergraph_layers.append(HypergraphConv(hidden_dim, hidden_dim))
+        
+        # Output layer
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim // 2, num_classes)
+        )
+    
+    def forward(self, x, hyperedge_index, batch=None):
+        """
+        Args:
+            x: Node features [num_nodes, in_features]
+            hyperedge_index: Hyperedge indices
+            batch: Batch assignment
+        """
+        for layer in self.hypergraph_layers:
+            x = layer(x, hyperedge_index)
+            x = F.relu(x)
+            x = F.dropout(x, p=0.3, training=self.training)
+        
+        # Global pooling nếu có batch
+        if batch is not None:
+            x = torch.cat([x[batch == i].mean(0, keepdim=True) 
+                          for i in range(batch.max().item() + 1)])
+        
+        x = self.fc(x)
+        return x
+
+class Trainer:
+    """Trainer cho multi-GPU"""
+    
+    def __init__(self, model, train_loader, val_loader, test_loader, 
+                 device_ids, learning_rate=0.001):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device_ids = device_ids
+        
+        # Multi-GPU
+        if len(device_ids) > 1:
+            self.model = nn.DataParallel(model, device_ids=device_ids)
+        else:
+            self.model = model
+        
+        self.model = self.model.to(self.device)
+        
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
+        
+        self.optimizer = torch.optim.Adam(self.model.parameters(), 
+                                         lr=learning_rate)
+        self.criterion = nn.CrossEntropyLoss()
+        
+    def train_epoch(self):
+        """Training một epoch"""
+        self.model.train()
+        total_loss = 0
+        correct = 0
+        total = 0
+        
+        for batch in self.train_loader:
+            batch = batch.to(self.device)
+            
+            self.optimizer.zero_grad()
+            out = self.model(batch.x, batch.edge_index)
+            loss = self.criterion(out, batch.y)
+            
+            loss.backward()
+            self.optimizer.step()
+            
+            total_loss += loss.item()
+            pred = out.argmax(dim=1)
+            correct += (pred == batch.y).sum().item()
+            total += batch.y.size(0)
+        
+        return total_loss / len(self.train_loader), correct / total
+    
+    def validate(self):
+        """Validation"""
+        self.model.eval()
+        total_loss = 0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for batch in self.val_loader:
+                batch = batch.to(self.device)
+                out = self.model(batch.x, batch.edge_index)
+                loss = self.criterion(out, batch.y)
+                
+                total_loss += loss.item()
+                pred = out.argmax(dim=1)
+                correct += (pred == batch.y).sum().item()
+                total += batch.y.size(0)
+        
+        return total_loss / len(self.val_loader), correct / total
+    
+    def test(self):
+        """Testing"""
+        self.model.eval()
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for batch in self.test_loader:
+                batch = batch.to(self.device)
+                out = self.model(batch.x, batch.edge_index)
+                pred = out.argmax(dim=1)
+                correct += (pred == batch.y).sum().item()
+                total += batch.y.size(0)
+        
+        return correct / total
+    
+    def train(self, num_epochs=50):
+        """Training loop"""
+        best_val_acc = 0
+        
+        for epoch in range(num_epochs):
+            train_loss, train_acc = self.train_epoch()
+            val_loss, val_acc = self.validate()
+            
+            print(f"Epoch {epoch+1:3d} | "
+                  f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
+                  f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+            
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save(self.model.state_dict(), 'best_model.pt')
+        
+        # Test với best model
+        self.model.load_state_dict(torch.load('best_model.pt'))
+        test_acc = self.test()
+        print(f"\n[*] Test Accuracy: {test_acc:.4f}")
+
+def create_graph_data(X, y, edge_index, test_size=0.2, val_size=0.1):
+    """Tạo train/val/test splits"""
+    
+    num_nodes = X.shape[0]
+    indices = np.arange(num_nodes)
+    
+    # Split train/test
+    train_idx, test_idx = train_test_split(indices, test_size=test_size, 
+                                           random_state=42)
+    
+    # Split train/val
+    train_idx, val_idx = train_test_split(train_idx, test_size=val_size, 
+                                          random_state=42)
+    
+    print(f"[*] Train: {len(train_idx)} | Val: {len(val_idx)} | Test: {len(test_idx)}")
+    
+    x = torch.FloatTensor(X)
+    y = torch.LongTensor(y)
+    
+    # Tạo masks
+    train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    
+    train_mask[train_idx] = True
+    val_mask[val_idx] = True
+    test_mask[test_idx] = True
+    
+    data = Data(x=x, edge_index=edge_index, y=y,
+                train_mask=train_mask, val_mask=val_mask, test_mask=test_mask)
+    
+    return data, train_idx, val_idx, test_idx
+
+def main():
+    # Đường dẫn CSV
+    csv_path = "NF-ToN-IoT-V2.csv"  # Thay bằng path thực tế
+    
+    print("[*] Bắt đầu tiền xử lý dữ liệu...")
+    preprocessor = DataPreprocessor(csv_path)
+    X, y, feature_cols = preprocessor.preprocess()
+    
+    print("[*] Tạo hypergraph từ dữ liệu...")
+    edge_index = preprocessor.create_graph_from_ips(X, y)
+    
+    print("[*] Tạo train/val/test splits...")
+    data, train_idx, val_idx, test_idx = create_graph_data(X, y, edge_index)
+    
+    print("[*] Khởi tạo model...")
+    model = HypergraphGNN(in_features=X.shape[1], 
+                         hidden_dim=128, 
+                         num_classes=len(np.unique(y)),
+                         num_layers=4)
+    
+    print("[*] Tạo data loaders với LinkNeighborLoader...")
+    
+    # LinkNeighborLoader cho training
+    train_loader = LinkNeighborLoader(data, num_neighbors=[10, 10],
+                                     edge_label_index=data.edge_index[:, data.train_mask],
+                                     batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
+    
+    val_loader = LinkNeighborLoader(data, num_neighbors=[10, 10],
+                                   edge_label_index=data.edge_index[:, data.val_mask],
+                                   batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
+    
+    test_loader = LinkNeighborLoader(data, num_neighbors=[10, 10],
+                                    edge_label_index=data.edge_index[:, data.test_mask],
+                                    batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
+    
+    print("[*] Bắt đầu training với multi-GPU...")
+    trainer = Trainer(model, train_loader, val_loader, test_loader,
+                     DEVICE_IDS, learning_rate=LEARNING_RATE)
+    
+    trainer.train(num_epochs=NUM_EPOCHS)
+
+if __name__ == "__main__":
+    main()
+
+
+
 import torch
 import torch.nn.functional as F
 import pandas as pd
