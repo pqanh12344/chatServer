@@ -1,5 +1,202 @@
 import torch
 import torch.nn.functional as F
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from torch_geometric.data import Data
+from torch_geometric.nn import HypergraphConv
+from torch_geometric.utils import line_graph
+from torch_geometric.loader import LinkNeighborLoader
+from torch_geometric.nn import DataParallel
+
+# =====================================================
+# 1️⃣ Đọc dữ liệu & tiền xử lý
+# =====================================================
+df = pd.read_csv("NF-ToN-IoT-V2.csv")
+
+# Giả sử có 100 thuộc tính số
+feature_cols = [f"feat_{i}" for i in range(1, 101)]
+scaler = StandardScaler()
+df[feature_cols] = scaler.fit_transform(df[feature_cols])
+
+# Encode nhãn Attack (string)
+attack_enc = LabelEncoder()
+df["Attack_enc"] = attack_enc.fit_transform(df["Attack"])
+
+# =====================================================
+# 2️⃣ Tạo node (IP:Port)
+# =====================================================
+df["src_node"] = df["src_ip"].astype(str) + ":" + df["src_port"].astype(str)
+df["dst_node"] = df["dst_ip"].astype(str) + ":" + df["dst_port"].astype(str)
+
+nodes = pd.Index(pd.concat([df["src_node"], df["dst_node"]]).unique())
+node_map = {n: i for i, n in enumerate(nodes)}
+df["src_id"] = df["src_node"].map(node_map)
+df["dst_id"] = df["dst_node"].map(node_map)
+
+# =====================================================
+# 3️⃣ Tạo edge_index
+# =====================================================
+edge_index = torch.tensor(df[["src_id", "dst_id"]].values.T, dtype=torch.long)
+
+# =====================================================
+# 4️⃣ Node features
+# =====================================================
+node_features = []
+for node in nodes:
+    flows = df[(df["src_node"] == node) | (df["dst_node"] == node)]
+    feats = flows[feature_cols].mean().fillna(0)
+    node_features.append(feats.values)
+x = torch.tensor(np.vstack(node_features), dtype=torch.float)
+
+# =====================================================
+# 5️⃣ Node labels (optional)
+# =====================================================
+node_labels = []
+for node in nodes:
+    flows = df[(df["src_node"] == node) | (df["dst_node"] == node)]
+    label = flows["Attack_enc"].mode()[0] if len(flows) > 0 else 0
+    node_labels.append(label)
+y = torch.tensor(node_labels, dtype=torch.long)
+
+# =====================================================
+# 6️⃣ Graph & Line Graph
+# =====================================================
+data = Data(x=x, edge_index=edge_index, y=y)
+line_data = line_graph(data)
+
+print(f"Graph: {data}")
+print(f"Line Graph: {line_data}")
+
+# =====================================================
+# 7️⃣ Chuẩn bị tập train/val/test cho edge
+# =====================================================
+num_edges = edge_index.size(1)
+perm = torch.randperm(num_edges)
+train_size = int(0.7 * num_edges)
+val_size = int(0.15 * num_edges)
+test_size = num_edges - train_size - val_size
+
+train_edges = perm[:train_size]
+val_edges = perm[train_size:train_size + val_size]
+test_edges = perm[train_size + val_size:]
+
+train_edge_index = edge_index[:, train_edges]
+val_edge_index = edge_index[:, val_edges]
+test_edge_index = edge_index[:, test_edges]
+
+# =====================================================
+# 8️⃣ LinkNeighborLoader (chia batch theo cạnh)
+# =====================================================
+train_loader = LinkNeighborLoader(
+    data=data,
+    edge_label_index=train_edge_index,
+    edge_label=torch.ones(train_edge_index.size(1)),  # nếu cần nhãn edge (ở đây chỉ là dummy)
+    batch_size=2048,
+    num_neighbors=[15, 10],
+    shuffle=True
+)
+
+val_loader = LinkNeighborLoader(
+    data=data,
+    edge_label_index=val_edge_index,
+    edge_label=torch.ones(val_edge_index.size(1)),
+    batch_size=4096,
+    num_neighbors=[15, 10],
+    shuffle=False
+)
+
+test_loader = LinkNeighborLoader(
+    data=data,
+    edge_label_index=test_edge_index,
+    edge_label=torch.ones(test_edge_index.size(1)),
+    batch_size=4096,
+    num_neighbors=[15, 10],
+    shuffle=False
+)
+
+# =====================================================
+# 9️⃣ Model HypergraphConv
+# =====================================================
+class HyperGraphNet(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels):
+        super().__init__()
+        self.conv1 = HypergraphConv(in_channels, hidden_channels)
+        self.conv2 = HypergraphConv(hidden_channels, out_channels)
+
+    def forward(self, x, edge_index):
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.dropout(x, p=0.4, training=self.training)
+        x = self.conv2(x, edge_index)
+        return x
+
+# =====================================================
+# 🔟 Multi-GPU setup
+# =====================================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+num_gpus = torch.cuda.device_count()
+print(f"🔧 Using {num_gpus} GPU(s)")
+
+model = HyperGraphNet(
+    in_channels=data.x.size(1),
+    hidden_channels=256,
+    out_channels=len(attack_enc.classes_)
+)
+if num_gpus > 1:
+    model = DataParallel(model)
+model = model.to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-4)
+
+# =====================================================
+# 1️⃣1️⃣ Training loop với LinkNeighborLoader
+# =====================================================
+def evaluate(loader):
+    model.eval()
+    total_loss = 0
+    total_examples = 0
+    for batch in loader:
+        batch = batch.to(device)
+        out = model(batch.x, batch.edge_index)
+        # Ở đây minh họa loss theo node label (tùy chỉnh nếu là edge label)
+        loss = F.cross_entropy(out, batch.y)
+        total_loss += loss.item() * batch.num_nodes
+        total_examples += batch.num_nodes
+    return total_loss / total_examples
+
+for epoch in range(1, 51):
+    model.train()
+    total_loss = 0
+    for batch in train_loader:
+        batch = batch.to(device)
+        optimizer.zero_grad()
+        out = model(batch.x, batch.edge_index)
+        loss = F.cross_entropy(out, batch.y)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * batch.num_nodes
+
+    val_loss = evaluate(val_loader)
+    print(f"Epoch {epoch:03d} | Train Loss: {total_loss/len(train_edges):.4f} | Val Loss: {val_loss:.4f}")
+
+# =====================================================
+# 1️⃣2️⃣ Đánh giá test
+# =====================================================
+test_loss = evaluate(test_loader)
+print(f"✅ Final Test Loss: {test_loss:.4f}")
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn.functional as F
 from torch_geometric.nn import TransformerConv
 from torch_geometric.utils import from_networkx
 import networkx as nx
