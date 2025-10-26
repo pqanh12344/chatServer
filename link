@@ -1,4 +1,226 @@
 import pandas as pd
+import torch
+from torch_geometric.data import Data
+from tqdm import tqdm
+import numpy as np
+import os
+
+# ======================================================
+# ⚙️ CONFIG
+# ======================================================
+INPUT = "NF-ToN-IoT-v2_100K_clean.csv"
+CHUNKSIZE = 100_000
+HYPEREDGE_FILE = "hyperedges_temp.npy"
+FEATURE_FILE = "features_temp.pt"
+LABEL_FILE = "labels_temp.pt"
+
+if os.path.exists(HYPEREDGE_FILE):
+    os.remove(HYPEREDGE_FILE)
+
+# ======================================================
+# 🧱 Cấu hình cột
+# ======================================================
+hyper_cols = ["IPV4_SRC_ADDR", "L4_SRC_PORT", "IPV4_DST_ADDR", "L4_DST_PORT"]
+
+# ======================================================
+# 🧠 Biến lưu tạm
+# ======================================================
+node_offset = 0
+hyperedge_id_counter = 0
+hyperedge_map = {}  # (col, value) -> hyperedge_id
+hyperedge_links = []  # (node_id, hyperedge_id)
+all_features, all_labels = [], []
+
+# ======================================================
+# 1️⃣ Đọc từng chunk
+# ======================================================
+for chunk in tqdm(pd.read_csv(INPUT, chunksize=CHUNKSIZE), desc="📖 Reading chunks"):
+    # Bỏ Attack nếu có
+    if "Attack" in chunk.columns:
+        chunk = chunk.drop(columns=["Attack"])
+    
+    # Tạo node_id
+    chunk["node_id"] = range(node_offset, node_offset + len(chunk))
+    node_offset += len(chunk)
+
+    # Lưu nhãn (Label dạng nhị phân, không mã hóa lại)
+    labels = torch.tensor(chunk["Label"].values, dtype=torch.long)
+    all_labels.append(labels)
+
+    # Lấy feature: tất cả cột trừ Label, node_id, 4 cột hypergraph
+    feature_cols = [c for c in chunk.columns if c not in ["Label", "node_id"] + hyper_cols]
+    
+    # Ép kiểu số, giá trị không phải số => NaN => 0
+    feature_values = chunk[feature_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    x_chunk = torch.tensor(feature_values.values, dtype=torch.float32)
+    all_features.append(x_chunk)
+
+    # Sinh hyperedge theo 4 cột chính
+    for col in hyper_cols:
+        for val, nodes in chunk.groupby(col)["node_id"]:
+            key = (col, val)
+            if key not in hyperedge_map:
+                hyperedge_map[key] = hyperedge_id_counter
+                hyperedge_id_counter += 1
+            he_id = hyperedge_map[key]
+            for n in nodes:
+                hyperedge_links.append((int(n), he_id))
+
+# ======================================================
+# 2️⃣ Lưu tạm và đóng gói
+# ======================================================
+# Lưu các liên kết node–hyperedge
+hyperedges_np = np.array(hyperedge_links, dtype=np.int64)
+np.save(HYPEREDGE_FILE, hyperedges_np)
+
+# Hợp nhất features & labels
+x = torch.cat(all_features, dim=0)
+y = torch.cat(all_labels, dim=0)
+torch.save(x, FEATURE_FILE)
+torch.save(y, LABEL_FILE)
+
+# ======================================================
+# 3️⃣ Load lại hyperedges và tạo Data
+# ======================================================
+edge_index_hyper = torch.from_numpy(np.load(HYPEREDGE_FILE)).T  # [2, num_links]
+data_hyper = Data(x=x, y=y, edge_index=edge_index_hyper)
+
+torch.save(data_hyper, "hypergraph_label_binary.pt")
+
+print("✅ Done! Saved to hypergraph_label_binary.pt")
+print(f"Nodes: {data_hyper.num_nodes}")
+print(f"Hyperedges: {edge_index_hyper[1].max().item() + 1}")
+print("edge_index_hyper shape:", edge_index_hyper.shape)
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import HypergraphConv
+from sklearn.metrics import accuracy_score, f1_score, recall_score
+from sklearn.model_selection import StratifiedShuffleSplit
+
+# ==========================================================
+# Load dữ liệu Hypergraph
+# ==========================================================
+data = torch.load('hypergraph_label_binary.pt')  # data.x, data.edge_index, data.y
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+data = data.to(device)
+
+num_nodes = data.num_nodes
+labels = data.y.cpu().numpy()
+
+# ==========================================================
+# Chia tập train / val / test (70 / 15 / 15)
+# ==========================================================
+split1 = StratifiedShuffleSplit(n_splits=1, test_size=0.3, random_state=42)
+train_idx, temp_idx = next(split1.split(range(num_nodes), labels))
+
+split2 = StratifiedShuffleSplit(n_splits=1, test_size=0.5, random_state=42)
+val_idx, test_idx = next(split2.split(temp_idx, labels[temp_idx]))
+
+train_idx = torch.tensor(train_idx, dtype=torch.long, device=device)
+val_idx = torch.tensor(temp_idx[val_idx], dtype=torch.long, device=device)
+test_idx = torch.tensor(temp_idx[test_idx], dtype=torch.long, device=device)
+
+print(f"Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+
+# ==========================================================
+# Mô hình HypergraphConv (Node Classification)
+# ==========================================================
+class HyperGraphNet(nn.Module):
+    def __init__(self, in_channels, hidden_channels=128, out_channels=2):
+        super().__init__()
+        self.conv1 = HypergraphConv(in_channels, hidden_channels)
+        self.bn1 = nn.BatchNorm1d(hidden_channels)
+        self.conv2 = HypergraphConv(hidden_channels, hidden_channels // 2)
+        self.bn2 = nn.BatchNorm1d(hidden_channels // 2)
+        self.lin = nn.Linear(hidden_channels // 2, out_channels)
+        self.dropout = nn.Dropout(0.5)
+
+    def forward(self, x, edge_index):
+        x = F.relu(self.bn1(self.conv1(x, edge_index)))
+        x = self.dropout(x)
+        x = F.relu(self.bn2(self.conv2(x, edge_index)))
+        x = self.dropout(x)
+        return self.lin(x)
+
+# ==========================================================
+# Huấn luyện và đánh giá
+# ==========================================================
+model = HyperGraphNet(data.x.size(1)).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+
+def train_one_epoch():
+    model.train()
+    optimizer.zero_grad()
+    out = model(data.x, data.edge_index)
+    loss = criterion(out[train_idx], data.y[train_idx])
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+
+@torch.no_grad()
+def evaluate(split):
+    model.eval()
+    out = model(data.x, data.edge_index)
+    pred = out.argmax(dim=1)
+
+    if split == 'val':
+        idx = val_idx
+    elif split == 'test':
+        idx = test_idx
+    else:
+        idx = train_idx
+
+    acc = accuracy_score(data.y[idx].cpu(), pred[idx].cpu())
+    f1 = f1_score(data.y[idx].cpu(), pred[idx].cpu(), average='binary')
+    recall = recall_score(data.y[idx].cpu(), pred[idx].cpu(), average='binary')
+    return acc, f1, recall
+
+# ==========================================================
+# Training loop + Early stopping
+# ==========================================================
+EPOCHS = 200
+best_f1, counter, patience = 0, 0, 15
+
+for epoch in range(1, EPOCHS + 1):
+    loss = train_one_epoch()
+    val_acc, val_f1, val_recall = evaluate('val')
+
+    scheduler.step(epoch)
+    print(f"Epoch {epoch:03d} | Loss: {loss:.4f} | ValAcc: {val_acc:.4f} | F1: {val_f1:.4f} | Recall: {val_recall:.4f}")
+
+    if val_f1 > best_f1:
+        best_f1 = val_f1
+        counter = 0
+        torch.save(model.state_dict(), "best_hypergraph_model.pt")
+        print(f"✅ Saved best model (F1={val_f1:.4f})")
+    else:
+        counter += 1
+        if counter >= patience:
+            print(f"⛔ Early stopping at epoch {epoch}")
+            break
+
+# ==========================================================
+# Đánh giá trên Test
+# ==========================================================
+model.load_state_dict(torch.load("best_hypergraph_model.pt"))
+test_acc, test_f1, test_recall = evaluate('test')
+print(f"\nFinal Test → Acc: {test_acc:.4f} | F1: {test_f1:.4f} | Recall: {test_recall:.4f}")
+
+
+
+
+
+
+
+import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
