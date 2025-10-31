@@ -1,3 +1,64 @@
+import torch
+import torch.nn as nn
+
+# --- DỮ LIỆU ---
+X = torch.tensor([
+    [[1.0], [1.0], [1.0]],  # chuỗi 1
+    [[2.0], [1.0], [2.0]]   # chuỗi 2
+])
+y = torch.tensor([[0.0], [1.0]])
+
+# --- MÔ HÌNH LSTM ---
+class SimpleLSTM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size=1, hidden_size=1, batch_first=True)
+        self.fc = nn.Linear(1, 1)
+
+    def forward(self, x):
+        out, (h, c) = self.lstm(x)
+        y_hat = torch.sigmoid(self.fc(h[-1]))
+        return y_hat
+
+# --- MÔ HÌNH GRU ---
+class SimpleGRU(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gru = nn.GRU(input_size=1, hidden_size=1, batch_first=True)
+        self.fc = nn.Linear(1, 1)
+
+    def forward(self, x):
+        out, h = self.gru(x)
+        y_hat = torch.sigmoid(self.fc(h[-1]))
+        return y_hat
+
+# Chọn 1 trong 2 mô hình
+model = SimpleLSTM()
+# model = SimpleGRU()
+
+criterion = nn.BCELoss()
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+# --- HUẤN LUYỆN ---
+for epoch in range(200):
+    optimizer.zero_grad()
+    y_hat = model(X)
+    loss = criterion(y_hat, y)
+    loss.backward()
+    optimizer.step()
+    if epoch % 40 == 0:
+        print(f"Epoch {epoch:03d} | Loss: {loss.item():.4f}")
+
+# --- KIỂM TRA ---
+with torch.no_grad():
+    preds = model(X)
+    print("\nDự đoán:")
+    print(preds)
+
+
+
+
+
 import pandas as pd
 import torch
 from torch_geometric.data import Data
