@@ -1,3 +1,100 @@
+
+PNA tổng hợp thông tin như thế nào?
+1) Không dùng một aggregator → dùng nhiều aggregator
+Các GNN truyền thống chỉ dùng mean hoặc sum để gộp thông tin từ hàng xóm.
+→ Điều này làm mô hình không phân biệt được các cấu trúc khác nhau.
+
+PNA giải quyết bằng cách dùng nhiều loại aggregator một lúc:
+- mean
+- max
+- min
+
+2) Không chỉ lấy thống kê → còn điều chỉnh theo degree (độ)
+
+Hai node có mean như nhau nhưng số lượng hàng xóm khác nhau.
+→ Các GNN cũ không phân biệt được.
+
+PNA thêm degree-scalers để mô hình biết được node có nhiều hay ít hàng xóm:
+
+Scaler làm rõ:
+- Nếu node có nhiều hàng xóm → tăng trọng số
+- Node ít hàng xóm → giảm trọng số
+
+
+3) PNA gộp (tensor product) aggregator × scaler
+
+Mỗi aggregator tạo ra một vector.
+Mỗi scaler nhân vào aggregator.
+
+→ Kết quả: một vector đa thống kê, đa tỉ lệ độ.
+
+
+4) Sau khi tạo message → đưa vào MLP
+
+PNA sau khi gộp xong sẽ “trộn” (mix) tất cả thông điệp bằng một MLP phi tuyến
+
+
+=> PNA tổng hợp thông tin bằng cách sử dụng nhiều thống kê (mean/max/min/std) kết hợp với scale theo độ, rồi ghép toàn bộ lại và đưa qua MLP để cập nhật node — giúp mô hình phân biệt cấu trúc tốt hơn rất nhiều.
+
+
+h1 = [1,2]
+h2 = [3,0]
+h3 = [0,4]
+
+- Aggregators: mean, max, min, std
+- Degree scaler: S(d) = log(d+1) = log(4)
+
+- Tính aggregator mean, max, min, std theo feature rồi nhân với Degree Scaler
+- Kết hợp tất cả aggregator (concat lại) thành M
+- Kết hợp với self-feature h_v rồi cho vào MLP
+
+
+
+GenAgg
+
+- Thu thập tập feature của hàng xóm 𝑋
+- Áp dụng hàm GenAgg tham số hoá (Augmented f-Mean) để tạo một vector (hoặc một giá trị) tổng hợp thay vì chỉ dùng mean/sum.
+
+Kết quả vừa tổng hợp này giữ được nhiều thông tin hơn vì hàm có khả năng biến đổi để phù hợp với phân phối dữ liệu hàng xóm cụ thể, từ đó giảm mất mát thông tin do aggregator quá đơn giản.
+
+x1 = [1,2]
+x2 = [3,0]
+x3 = [0,4]
+
+a = 1
+b = 0.5
+
+mean u = 1/3(....) = [1.3, 2]
+
+=> tính bu
+
+=> tính f
+
+
+
+
+
+GIN
+
+Ví dụ 1-v-2-3
+
+[1,0], [0,1], [1,1], [2,1]
+1,2,3,v
+
+
+- Cộng tất cả vector hàng xóm (SUM)(cộng node 1,2,3)
+
+- Cộng thêm vector của chính node (1+e)v
+
+- Đưa qua MLP để tạo embedding mới
+
+
+
+
+
+
+
+
 {
   "id": "utt_0001",
   "audio": {"path": "data/wavs/utt_0001.wav", "array": null, "sampling_rate": 16000},
