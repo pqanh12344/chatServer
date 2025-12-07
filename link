@@ -1,3 +1,734 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from einops import rearrange, repeat
+from typing import Optional, Tuple, List
+
+
+# ============================================================================
+# 1. SELECTIVE STATE SPACE LAYER - Core of Mamba
+# ============================================================================
+
+class SelectiveStateSpace(nn.Module):
+    """
+    Selective State-Space Model (SSM) - Mamba's core mechanism
+    
+    Handles: x(t+1) = A(t)*x(t) + B(t)*u(t)
+             y(t) = C(t)*x(t)
+    
+    With selective dynamics that adapt to input content
+    """
+    
+    def __init__(self, d_model: int, d_state: int = 64, d_conv: int = 4):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        
+        # Projection A, B, C parameters
+        self.A = nn.Parameter(torch.randn(1, d_model, d_state))
+        self.B_proj = nn.Linear(d_model, d_state)
+        self.C_proj = nn.Linear(d_model, d_state)
+        
+        # Input projection
+        self.in_proj = nn.Linear(d_model, 2 * d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+        # Delta (discretization parameter) projection
+        self.delta_proj = nn.Linear(d_model, d_model)
+        
+        # Convolution layer for local context
+        self.conv = nn.Conv1d(
+            in_channels=d_model,
+            out_channels=d_model,
+            kernel_size=d_conv,
+            padding=d_conv - 1,
+            groups=d_model
+        )
+        
+        # Initialize parameters
+        self._initialize_parameters()
+    
+    def _initialize_parameters(self):
+        """Initialize A matrix with proper scaling"""
+        # A should have negative real parts for stability
+        self.A.data = -torch.exp(torch.randn(1, self.d_model, self.d_state) * 0.1)
+    
+    def discretize(self, delta: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
+        """
+        Discretize continuous-time system to discrete-time
+        Using zero-order hold: A_discrete = exp(delta * A)
+        """
+        # delta shape: (batch, seq_len, d_model)
+        # A shape: (1, d_model, d_state)
+        
+        delta = delta.unsqueeze(-1)  # (batch, seq_len, d_model, 1)
+        A_discrete = torch.exp(delta * A)  # (batch, seq_len, d_model, d_state)
+        return A_discrete
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (batch, seq_len, d_model)
+        """
+        batch, seq_len, d_model = x.shape
+        
+        # Split into content and selection gates
+        z = self.in_proj(x)  # (batch, seq_len, 2*d_model)
+        z, gate = z.chunk(2, dim=-1)  # each (batch, seq_len, d_model)
+        
+        # Convolution for local context
+        z = rearrange(z, 'b l d -> b d l')
+        z = self.conv(z)[:, :, :seq_len]  # truncate to seq_len
+        z = rearrange(z, 'b d l -> b l d')
+        
+        # Project to delta (discretization rate per timestep)
+        delta = F.softplus(self.delta_proj(z))  # (batch, seq_len, d_model)
+        delta = delta * 0.1  # scale for numerical stability
+        
+        # Project input
+        B = self.B_proj(z)  # (batch, seq_len, d_state)
+        C = self.C_proj(z)  # (batch, seq_len, d_state)
+        
+        # Discretize A matrix
+        A_discrete = self.discretize(delta, self.A)  # (batch, seq_len, d_model, d_state)
+        
+        # SSM recurrence: process sequentially
+        # h(t+1) = A_discrete(t) * h(t) + B(t) * z(t)
+        h = torch.zeros(batch, d_model, self.d_state, device=x.device)
+        outputs = []
+        
+        for t in range(seq_len):
+            h = A_discrete[:, t] * h + B[:, t].unsqueeze(-1) * z[:, t].unsqueeze(-1)
+            y = (C[:, t].unsqueeze(1) * h).sum(-1)  # (batch, d_model)
+            outputs.append(y)
+        
+        y = torch.stack(outputs, dim=1)  # (batch, seq_len, d_model)
+        
+        # Gating mechanism (learned output modulation)
+        y = y * F.silu(gate)  # (batch, seq_len, d_model)
+        
+        # Output projection
+        y = self.out_proj(y)
+        
+        return y
+
+
+# ============================================================================
+# 2. MAMBA BLOCK - Complete Mamba building block
+# ============================================================================
+
+class MambaBlock(nn.Module):
+    """
+    Complete Mamba block: SSM + Normalization + Residual connections
+    """
+    
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 64,
+        d_conv: int = 4,
+        expand_ratio: float = 2.0,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.d_inner = int(d_model * expand_ratio)
+        
+        # Pre-normalization
+        self.norm = nn.LayerNorm(d_model)
+        
+        # Expansion projection
+        self.expand_proj = nn.Linear(d_model, 2 * self.d_inner)
+        
+        # SSM module
+        self.ssm = SelectiveStateSpace(self.d_inner, d_state, d_conv)
+        
+        # Contraction projection
+        self.contract_proj = nn.Linear(self.d_inner, d_model)
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (batch, seq_len, d_model)
+        """
+        # Pre-normalization residual
+        residual = x
+        x = self.norm(x)
+        
+        # Expand and split
+        expanded = self.expand_proj(x)  # (batch, seq_len, 2*d_inner)
+        z, gate = expanded.chunk(2, dim=-1)  # each (batch, seq_len, d_inner)
+        
+        # SSM on expanded representation
+        z = self.ssm(z)  # (batch, seq_len, d_inner)
+        
+        # Gate mechanism
+        z = z * F.silu(gate)
+        
+        # Contract back
+        z = self.contract_proj(z)  # (batch, seq_len, d_model)
+        
+        # Dropout and residual
+        z = self.dropout(z)
+        return residual + z
+
+
+# ============================================================================
+# 3. AUDIO ENCODER - Processes raw audio to embeddings
+# ============================================================================
+
+class AudioEncoder(nn.Module):
+    """
+    Converts raw audio (mel-spectrogram or waveform) to d_model embeddings
+    Using stacked convolutional layers for feature extraction
+    """
+    
+    def __init__(
+        self,
+        n_mel: int = 80,
+        d_model: int = 256,
+        kernel_sizes: List[int] = None,
+        n_layers: int = 3
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.n_mel = n_mel
+        
+        if kernel_sizes is None:
+            kernel_sizes = [3, 3, 3]
+        
+        layers = []
+        in_channels = n_mel
+        
+        # Stacked conv layers with increasing dilation
+        for i, kernel_size in enumerate(kernel_sizes):
+            out_channels = min(d_model, (i + 1) * 64)
+            stride = 2 if i == 0 else 1  # Downsample first layer
+            
+            layers.append(nn.Conv1d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=kernel_size // 2
+            ))
+            layers.append(nn.BatchNorm1d(out_channels))
+            layers.append(nn.ReLU())
+            
+            in_channels = out_channels
+        
+        # Final projection to d_model
+        layers.append(nn.Linear(in_channels, d_model))
+        
+        self.encoder = nn.Sequential(*layers[:-1])  # Conv layers
+        self.final_proj = layers[-1]  # Linear projection
+    
+    def forward(self, mel_spec: torch.Tensor) -> torch.Tensor:
+        """
+        mel_spec: (batch, n_mel, time_steps)
+        output: (batch, time_steps, d_model)
+        """
+        # Pass through conv layers
+        x = self.encoder(mel_spec)  # (batch, channels, time)
+        
+        # Permute for linear layer
+        x = rearrange(x, 'b c t -> b t c')
+        
+        # Project to d_model
+        x = self.final_proj(x)  # (batch, time, d_model)
+        
+        return x
+
+
+# ============================================================================
+# 4. MAMBA ENCODER - Stack of Mamba blocks
+# ============================================================================
+
+class MambaEncoder(nn.Module):
+    """
+    Encoder using stacked Mamba blocks
+    Captures both local and global dependencies in audio
+    """
+    
+    def __init__(
+        self,
+        d_model: int = 256,
+        n_layers: int = 6,
+        d_state: int = 64,
+        d_conv: int = 4,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.n_layers = n_layers
+        
+        # Stack of Mamba blocks
+        self.layers = nn.ModuleList([
+            MambaBlock(
+                d_model=d_model,
+                d_state=d_state,
+                d_conv=d_conv,
+                dropout=dropout
+            )
+            for _ in range(n_layers)
+        ])
+        
+        # Positional encoding
+        self.pos_encoding = self._create_positional_encoding(d_model)
+    
+    def _create_positional_encoding(self, d_model: int, max_len: int = 5000):
+        """Create sinusoidal positional encoding"""
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * 
+                            (-math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        return nn.Parameter(pe, requires_grad=False)
+    
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        x: (batch, seq_len, d_model)
+        mask: (batch, seq_len) - True for valid positions
+        output: (batch, seq_len, d_model)
+        """
+        seq_len = x.size(1)
+        
+        # Add positional encoding
+        x = x + self.pos_encoding[:seq_len]
+        
+        # Process through Mamba blocks
+        for layer in self.layers:
+            x = layer(x)
+        
+        return x
+
+
+# ============================================================================
+# 5. MAMBA-CROSS-CONNECTION - Attention-like mechanism for decoder
+# ============================================================================
+
+class MambaCrossConnection(nn.Module):
+    """
+    Cross-connection between encoder and decoder
+    Enables alignment between audio features and text generation
+    """
+    
+    def __init__(self, d_model: int, n_heads: int = 4):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        
+        # Query, Key, Value projections
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+        self.scale = self.head_dim ** -0.5
+        self.dropout = nn.Dropout(0.1)
+    
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        query: (batch, tgt_len, d_model) - from decoder
+        key: (batch, src_len, d_model) - from encoder
+        value: (batch, src_len, d_model) - from encoder
+        mask: (batch, src_len) - padding mask
+        """
+        batch = query.size(0)
+        tgt_len = query.size(1)
+        src_len = key.size(1)
+        
+        # Project to multi-head
+        Q = self.q_proj(query).view(batch, tgt_len, self.n_heads, self.head_dim)
+        K = self.k_proj(key).view(batch, src_len, self.n_heads, self.head_dim)
+        V = self.v_proj(value).view(batch, src_len, self.n_heads, self.head_dim)
+        
+        # Transpose for attention computation
+        Q = Q.transpose(1, 2)  # (batch, n_heads, tgt_len, head_dim)
+        K = K.transpose(1, 2)  # (batch, n_heads, src_len, head_dim)
+        V = V.transpose(1, 2)  # (batch, n_heads, src_len, head_dim)
+        
+        # Scaled dot-product attention
+        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+        
+        # Apply mask
+        if mask is not None:
+            mask = rearrange(mask, 'b s -> b 1 1 s')
+            scores = scores.masked_fill(~mask, float('-inf'))
+        
+        # Softmax and dropout
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Apply to values
+        context = torch.matmul(attn_weights, V)  # (batch, n_heads, tgt_len, head_dim)
+        
+        # Merge heads
+        context = context.transpose(1, 2).contiguous()
+        context = context.view(batch, tgt_len, self.d_model)
+        
+        # Output projection
+        output = self.out_proj(context)
+        
+        return output, attn_weights
+
+
+# ============================================================================
+# 6. DECODER - Generates text tokens
+# ============================================================================
+
+class MambaDecoder(nn.Module):
+    """
+    Decoder using Mamba blocks with cross-connection to encoder
+    Generates character/token sequences
+    """
+    
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 256,
+        n_layers: int = 6,
+        d_state: int = 64,
+        d_conv: int = 4,
+        dropout: float = 0.1,
+        n_heads: int = 4
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.vocab_size = vocab_size
+        
+        # Token embedding
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        
+        # Positional encoding
+        self.pos_encoding = self._create_positional_encoding(d_model)
+        
+        # Decoder blocks
+        self.blocks = nn.ModuleList([
+            MambaBlock(d_model, d_state, d_conv, dropout=dropout)
+            for _ in range(n_layers)
+        ])
+        
+        # Cross-connection to encoder
+        self.cross_connections = nn.ModuleList([
+            MambaCrossConnection(d_model, n_heads)
+            for _ in range(n_layers)
+        ])
+        
+        # Output layers
+        self.norm = nn.LayerNorm(d_model)
+        self.output_proj = nn.Linear(d_model, vocab_size)
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def _create_positional_encoding(self, d_model: int, max_len: int = 5000):
+        """Create sinusoidal positional encoding"""
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * 
+                            (-math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        return nn.Parameter(pe, requires_grad=False)
+    
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        encoder_output: torch.Tensor,
+        encoder_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        tokens: (batch, seq_len) - input token indices
+        encoder_output: (batch, src_len, d_model) - from encoder
+        encoder_mask: (batch, src_len) - padding mask
+        output: (batch, seq_len, vocab_size)
+        """
+        seq_len = tokens.size(1)
+        
+        # Embed tokens
+        x = self.embedding(tokens)  # (batch, seq_len, d_model)
+        x = x * math.sqrt(self.d_model)
+        
+        # Add positional encoding
+        x = x + self.pos_encoding[:seq_len]
+        x = self.dropout(x)
+        
+        # Process through decoder blocks with cross-attention
+        for block, cross_conn in zip(self.blocks, self.cross_connections):
+            # Self-recurrence (Mamba)
+            x = block(x)
+            
+            # Cross-connection to encoder
+            x = cross_conn(x, encoder_output, encoder_output, encoder_mask)
+        
+        # Output projection
+        x = self.norm(x)
+        logits = self.output_proj(x)  # (batch, seq_len, vocab_size)
+        
+        return logits
+
+
+# ============================================================================
+# 7. COMPLETE SAMBA-ASR MODEL
+# ============================================================================
+
+class SambaASR(nn.Module):
+    """
+    Complete Samba-based Automatic Speech Recognition model
+    
+    Architecture:
+    1. Audio Encoder: Mel-spectrogram -> embeddings
+    2. Mamba Encoder: Processes audio features
+    3. Mamba Decoder: Generates text tokens with cross-attention
+    """
+    
+    def __init__(
+        self,
+        n_mel: int = 80,
+        vocab_size: int = 1000,
+        d_model: int = 256,
+        encoder_layers: int = 6,
+        decoder_layers: int = 6,
+        d_state: int = 64,
+        d_conv: int = 4,
+        dropout: float = 0.1,
+        n_heads: int = 4
+    ):
+        super().__init__()
+        
+        self.d_model = d_model
+        self.vocab_size = vocab_size
+        
+        # Audio encoder
+        self.audio_encoder = AudioEncoder(
+            n_mel=n_mel,
+            d_model=d_model,
+            n_layers=3
+        )
+        
+        # Mamba encoder
+        self.mamba_encoder = MambaEncoder(
+            d_model=d_model,
+            n_layers=encoder_layers,
+            d_state=d_state,
+            d_conv=d_conv,
+            dropout=dropout
+        )
+        
+        # Mamba decoder
+        self.mamba_decoder = MambaDecoder(
+            vocab_size=vocab_size,
+            d_model=d_model,
+            n_layers=decoder_layers,
+            d_state=d_state,
+            d_conv=d_conv,
+            dropout=dropout,
+            n_heads=n_heads
+        )
+    
+    def forward(
+        self,
+        mel_spec: torch.Tensor,
+        tokens: torch.Tensor,
+        mel_mask: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        mel_spec: (batch, n_mel, time_steps) - mel-spectrogram
+        tokens: (batch, seq_len) - ground truth tokens for training
+        mel_mask: (batch, time_steps) - padding mask for mel-spec
+        token_mask: (batch, seq_len) - padding mask for tokens
+        
+        output: (batch, seq_len, vocab_size) - logits
+        """
+        # 1. Audio encoding
+        audio_features = self.audio_encoder(mel_spec)  # (batch, time, d_model)
+        
+        # 2. Mamba encoding
+        encoder_output = self.mamba_encoder(audio_features, mel_mask)
+        
+        # 3. Mamba decoding with cross-attention
+        logits = self.mamba_decoder(tokens, encoder_output, mel_mask)
+        
+        return logits
+    
+    def encode(self, mel_spec: torch.Tensor) -> torch.Tensor:
+        """
+        Encode mel-spectrogram to embeddings
+        Useful for inference
+        
+        mel_spec: (batch, n_mel, time_steps)
+        output: (batch, time_steps, d_model)
+        """
+        audio_features = self.audio_encoder(mel_spec)
+        encoder_output = self.mamba_encoder(audio_features)
+        return encoder_output
+    
+    def decode(
+        self,
+        encoder_output: torch.Tensor,
+        tokens: torch.Tensor,
+        encoder_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Decode encoder output to logits
+        
+        encoder_output: (batch, src_len, d_model)
+        tokens: (batch, seq_len)
+        output: (batch, seq_len, vocab_size)
+        """
+        logits = self.mamba_decoder(tokens, encoder_output, encoder_mask)
+        return logits
+
+
+# ============================================================================
+# 8. EXAMPLE USAGE
+# ============================================================================
+
+if __name__ == "__main__":
+    # Model configuration
+    config = {
+        'n_mel': 80,           # Mel-spectrogram dimension
+        'vocab_size': 1000,    # Number of unique tokens
+        'd_model': 256,        # Model dimension
+        'encoder_layers': 6,   # Number of encoder blocks
+        'decoder_layers': 6,   # Number of decoder blocks
+        'd_state': 64,         # State-space dimension
+        'd_conv': 4,           # Conv kernel size
+        'dropout': 0.1,
+        'n_heads': 4
+    }
+    
+    # Initialize model
+    model = SambaASR(**config)
+    
+    # Example input
+    batch_size = 2
+    n_mel = 80
+    time_steps = 1000  # e.g., 10 seconds at 100ms frames
+    seq_len = 100      # Output sequence length
+    
+    mel_spec = torch.randn(batch_size, n_mel, time_steps)
+    tokens = torch.randint(0, config['vocab_size'], (batch_size, seq_len))
+    
+    # Forward pass
+    print("Input shapes:")
+    print(f"  Mel-spec: {mel_spec.shape}")
+    print(f"  Tokens: {tokens.shape}")
+    
+    logits = model(mel_spec, tokens)
+    
+    print(f"\nOutput shape: {logits.shape}")
+    print(f"Expected: ({batch_size}, {seq_len}, {config['vocab_size']})")
+    
+    # Encode only (for inference)
+    print("\n--- Encoding only (for inference) ---")
+    encoder_output = model.encode(mel_spec)
+    print(f"Encoder output shape: {encoder_output.shape}")
+    
+    # Model statistics
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print(f"\n--- Model Statistics ---")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Model size: {total_params * 4 / 1024 / 1024:.2f} MB (fp32)")
+
+
+model = SambaASR()
+optimizer = torch.optim.Adam(model.parameters())
+loss_fn = nn.CrossEntropyLoss()
+
+# Training loop
+for mel, tokens in train_loader:
+    logits = model(mel, tokens)
+    loss = loss_fn(logits.view(-1, vocab_size), tokens.view(-1))
+    loss.backward()
+    optimizer.step()
+
+
+Tôi đã build một Samba-ASR model chi tiết hoàn chỉnh! Đây là những thành phần chính:
+📐 Kiến trúc chính:
+
+SelectiveStateSpace - Core Mamba layer với:
+
+Discretization liên tục sang rời rạc
+Selective dynamics (A, B, C matrices)
+Convolutional layer cho local context
+Gating mechanism
+
+
+MambaBlock - Block hoàn chỉnh:
+
+Pre-normalization
+Expansion/Contraction projections
+SSM + Gating
+
+
+AudioEncoder - Xử lý mel-spectrogram:
+
+Stacked convolutional layers
+Downsampling ở layer đầu
+Projection to embedding space
+
+
+MambaEncoder - Stack 6 Mamba blocks:
+
+Xử lý audio features
+Positional encoding
+Global + local dependencies
+
+
+MambaCrossConnection - Multi-head attention:
+
+Kết nối encoder-decoder
+Alignment giữa audio và text
+
+
+MambaDecoder - Sinh text tokens:
+
+Token embedding
+6 Mamba blocks + cross-attention
+Output logits
+
+
+SambaASR - Model hoàn chỉnh:
+
+Training: forward() nhận mel-spec + tokens
+Inference: encode() sau đó decode()
+
+
+🎯 Ưu điểm:
+
+Độ phức tạp tuyến tính (vs Transformer quadratic)
+Selective state-space cho context adaptive
+Efficient memory + computation
+Có thể mở rộng dễ dàng
+
+
+
+
+
+
+
+
 
 PNA tổng hợp thông tin như thế nào?
 1) Không dùng một aggregator → dùng nhiều aggregator
