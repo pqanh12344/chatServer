@@ -2,6 +2,911 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import numpy as np
+from typing import Optional, Tuple
+import librosa
+
+
+# ============================================================================
+# AUDIO COLLATOR - Batch processing with variable length
+# ============================================================================
+
+class AudioCollator:
+    """
+    Collate function for DataLoader
+    Handles variable length audio and creates proper masks
+    """
+    
+    def __init__(self, processor: MelSpectrogramProcessor):
+        self.processor = processor
+    
+    def __call__(self, batch: list) -> dict:
+        """
+        batch: list of (audio, text) tuples
+        returns: dict with mel_specs, tokens, and masks
+        """
+        mel_specs = []
+        tokens_list = []
+        mel_lengths = []
+        token_lengths = []
+        
+        for audio, text_tokens in batch:
+            # Process audio to mel-spectrogram
+            mel_spec, mel_length = self.processor(audio, return_length=True)
+            mel_specs.append(mel_spec)
+            mel_lengths.append(mel_length)
+            
+            # Pad tokens to same length
+            tokens_list.append(text_tokens)
+            token_lengths.append(len(text_tokens))
+        
+        # Stack mel-specs
+        mel_specs = torch.stack(mel_specs)  # (batch, n_mels, max_frames)
+        
+        # Pad tokens to same length
+        max_token_len = max(token_lengths)
+        tokens_padded = []
+        for tokens in tokens_list:
+            padded = F.pad(
+                torch.tensor(tokens, dtype=torch.long),
+                (0, max_token_len - len(tokens)),
+                value=0  # pad_token_id
+            )
+            tokens_padded.append(padded)
+        
+        tokens = torch.stack(tokens_padded)  # (batch, max_token_len)
+        
+        # Create masks
+        mel_mask = torch.ones(mel_specs.size(0), mel_specs.size(2), dtype=torch.bool)
+        token_mask = torch.ones(tokens.size(0), tokens.size(1), dtype=torch.bool)
+        
+        # Mark padded positions as False
+        for i, length in enumerate(mel_lengths):
+            mel_mask[i, length:] = False
+        
+        for i, length in enumerate(token_lengths):
+            token_mask[i, length:] = False
+        
+        return {
+            'mel_specs': mel_specs,  # (batch, n_mels, max_frames)
+            'tokens': tokens,  # (batch, max_token_len)
+            'mel_mask': mel_mask,  # (batch, max_frames)
+            'token_mask': token_mask,  # (batch, max_token_len)
+            'mel_lengths': torch.tensor(mel_lengths),
+            'token_lengths': torch.tensor(token_lengths)
+        }
+
+class MelSpectrogramProcessor:
+    """
+    Converts raw audio (waveform) to mel-spectrogram with max_length support
+    """
+    
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        n_fft: int = 400,
+        hop_length: int = 160,
+        n_mels: int = 80,
+        f_min: float = 80.0,
+        f_max: float = 7600.0,
+        max_duration: float = 30.0  # max audio duration in seconds
+    ):
+        self.sample_rate = sample_rate
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.n_mels = n_mels
+        self.f_min = f_min
+        self.f_max = f_max
+        self.max_duration = max_duration
+        self.max_samples = int(sample_rate * max_duration)  # max audio samples
+        
+        # Calculate max frames after mel-spectrogram
+        # frames = (samples - n_fft) / hop_length + 1
+        self.max_frames = (self.max_samples - n_fft) // hop_length + 1
+        
+        # Create mel-spectrogram filter bank using librosa
+        self.mel_fb = librosa.filters.mel(
+            sr=sample_rate,
+            n_fft=n_fft,
+            n_mels=n_mels,
+            fmin=f_min,
+            fmax=f_max
+        )  # Shape: (n_mels, n_fft // 2 + 1)
+        
+        self.mel_fb = torch.from_numpy(self.mel_fb).float()
+    
+    def __call__(
+        self,
+        audio: np.ndarray,
+        return_length: bool = False
+    ) -> torch.Tensor:
+        """
+        audio: numpy array, shape (samples,)
+        return_length: if True, return (mel_spec, original_length)
+        returns: torch tensor, shape (n_mels, time_frames) or (n_mels, time_frames), length
+        
+        Automatically truncates audio if longer than max_length
+        Automatically pads audio if shorter than max_length
+        """
+        original_length = len(audio)
+        
+        # Truncate if too long
+        if len(audio) > self.max_samples:
+            audio = audio[:self.max_samples]
+        
+        # Pad if too short (zero-padding at the end)
+        if len(audio) < self.max_samples:
+            audio = np.pad(audio, (0, self.max_samples - len(audio)), mode='constant', constant_values=0)
+        
+        # Compute STFT (Short-Time Fourier Transform)
+        D = librosa.stft(
+            audio,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            window='hann',
+            center=True
+        )  # Shape: (n_fft // 2 + 1, time_frames)
+        
+        # Convert to magnitude
+        S = np.abs(D)  # Shape: (n_fft // 2 + 1, time_frames)
+        
+        # Apply mel-scale filter bank
+        S = torch.from_numpy(S).float()  # (n_fft // 2 + 1, time_frames)
+        mel_spec = torch.matmul(self.mel_fb, S)  # (n_mels, time_frames)
+        
+        # Log-scale (add small epsilon to avoid log(0))
+        mel_spec = torch.log(torch.clamp(mel_spec, min=1e-9))
+        
+        # Normalize
+        mel_spec = (mel_spec - mel_spec.mean()) / (mel_spec.std() + 1e-9)
+        
+        # Truncate or pad mel_spec to exactly max_frames
+        if mel_spec.size(1) > self.max_frames:
+            mel_spec = mel_spec[:, :self.max_frames]
+        elif mel_spec.size(1) < self.max_frames:
+            pad_frames = self.max_frames - mel_spec.size(1)
+            mel_spec = F.pad(mel_spec, (0, pad_frames), mode='constant', value=0)
+        
+        if return_length:
+            # Calculate actual frames from original audio
+            actual_frames = (original_length - self.n_fft) // self.hop_length + 1
+            actual_frames = min(actual_frames, self.max_frames)
+            return mel_spec, actual_frames
+        
+        return mel_spec  # (n_mels, max_frames)
+
+
+# ============================================================================
+# 1. SELECTIVE STATE SPACE - Mamba Core (FIXED)
+# ============================================================================
+
+class SelectiveStateSpace(nn.Module):
+    """
+    Selective State-Space Model - Mamba's core
+    
+    Fixed version with proper matrix dimensions and operations
+    """
+    
+    def __init__(self, d_model: int, d_state: int = 16):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        
+        # Input projection: expand dimension
+        self.in_proj = nn.Linear(d_model, d_model * 2)
+        
+        # A matrix: (d_model, d_state) - state transition
+        self.A_log = nn.Parameter(torch.randn(d_model, d_state) * 0.01)
+        
+        # B projection: (d_model,) -> (d_model, 1) per timestep
+        self.B_proj = nn.Linear(d_model, d_state)
+        
+        # C projection: (d_model,) -> (d_model, 1) per timestep
+        self.C_proj = nn.Linear(d_model, d_state)
+        
+        # Delta projection: (d_model,) -> scalar per element
+        self.delta_proj = nn.Linear(d_model, d_model)
+        
+        # Output projection
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+        # Initialize parameters
+        nn.init.xavier_uniform_(self.A_log)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (batch, seq_len, d_model)
+        output: (batch, seq_len, d_model)
+        """
+        batch_size, seq_len, d_model = x.shape
+        
+        # Project input
+        xz = self.in_proj(x)  # (batch, seq_len, 2*d_model)
+        x, z = xz.chunk(2, dim=-1)  # each (batch, seq_len, d_model)
+        
+        # Delta (discretization parameter)
+        delta = F.softplus(self.delta_proj(x))  # (batch, seq_len, d_model)
+        delta = delta * 0.1
+        
+        # B, C projections
+        B = self.B_proj(x)  # (batch, seq_len, d_state)
+        C = self.C_proj(z)  # (batch, seq_len, d_state)
+        
+        # A matrix
+        A = -torch.exp(self.A_log)  # (d_model, d_state)
+        
+        # Discretize: A_bar = exp(delta * A)
+        # delta: (batch, seq_len, d_model, 1)
+        # A: (d_model, d_state)
+        # Result: (batch, seq_len, d_model, d_state)
+        
+        delta_expanded = delta.unsqueeze(-1)  # (batch, seq_len, d_model, 1)
+        A_expanded = A.unsqueeze(0).unsqueeze(0)  # (1, 1, d_model, d_state)
+        A_bar = torch.exp(delta_expanded * A_expanded)  # (batch, seq_len, d_model, d_state)
+        
+        # SSM recurrence over time
+        h = torch.zeros(batch_size, d_model, d_state, dtype=x.dtype, device=x.device)
+        y_list = []
+        
+        for t in range(seq_len):
+            # h(t+1) = A_bar(t) * h(t) + B(t) * x(t)
+            # x(t): (batch, d_model)
+            # h(t): (batch, d_model, d_state)
+            # A_bar(t): (batch, d_model, d_state)
+            # B(t): (batch, d_state)
+            
+            x_t = x[:, t]  # (batch, d_model)
+            B_t = B[:, t]  # (batch, d_state)
+            C_t = C[:, t]  # (batch, d_state)
+            A_bar_t = A_bar[:, t]  # (batch, d_model, d_state)
+            
+            # Update hidden state
+            h = (A_bar_t * h) + x_t.unsqueeze(-1) * B_t.unsqueeze(1)
+            # (batch, d_model, d_state) = (batch, d_model, d_state) + (batch, d_model, 1) * (batch, 1, d_state)
+            
+            # Output: y(t) = C(t) * h(t)
+            # C_t: (batch, d_state), h: (batch, d_model, d_state)
+            y_t = (h * C_t.unsqueeze(1)).sum(dim=-1)  # (batch, d_model)
+            y_list.append(y_t)
+        
+        # Stack outputs
+        y = torch.stack(y_list, dim=1)  # (batch, seq_len, d_model)
+        
+        # Gating
+        y = y * F.silu(z)  # (batch, seq_len, d_model)
+        
+        # Output projection
+        y = self.out_proj(y)
+        
+        return y
+
+
+# ============================================================================
+# 2. MAMBA BLOCK
+# ============================================================================
+
+class MambaBlock(nn.Module):
+    """
+    Complete Mamba block with pre-normalization and residual connection
+    """
+    
+    def __init__(self, d_model: int, d_state: int = 16, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        
+        # Pre-normalization
+        self.norm = nn.LayerNorm(d_model)
+        
+        # SSM layer
+        self.ssm = SelectiveStateSpace(d_model, d_state)
+        
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (batch, seq_len, d_model)
+        output: (batch, seq_len, d_model)
+        """
+        # Pre-normalization with residual
+        residual = x
+        x = self.norm(x)
+        x = self.ssm(x)
+        x = self.dropout(x)
+        x = residual + x
+        
+        return x
+
+
+# ============================================================================
+# 3. MEL-SPECTROGRAM TO EMBEDDING LAYER
+# ============================================================================
+
+class MelToEmbedding(nn.Module):
+    """
+    Convert mel-spectrogram to embeddings
+    Input: (batch, n_mels, time)
+    Output: (batch, time, d_model)
+    """
+    
+    def __init__(self, n_mels: int = 80, d_model: int = 256):
+        super().__init__()
+        self.n_mels = n_mels
+        self.d_model = d_model
+        
+        # Conv1d layers to process mel-spectrogram
+        self.conv_layers = nn.Sequential(
+            # Layer 1: (n_mels, time) -> (64, time/2)
+            nn.Conv1d(n_mels, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            
+            # Layer 2: (64, time/2) -> (128, time/4)
+            nn.Conv1d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            
+            # Layer 3: (128, time/4) -> (256, time/4)
+            nn.Conv1d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+        )
+        
+        # Project to d_model
+        self.linear = nn.Linear(256, d_model)
+    
+    def forward(self, mel_spec: torch.Tensor) -> torch.Tensor:
+        """
+        mel_spec: (batch, n_mels, time)
+        output: (batch, time, d_model)
+        """
+        # Pass through conv layers
+        x = self.conv_layers(mel_spec)  # (batch, 256, time/4)
+        
+        # Transpose for linear layer
+        x = x.transpose(1, 2)  # (batch, time/4, 256)
+        
+        # Project to d_model
+        x = self.linear(x)  # (batch, time/4, d_model)
+        
+        return x
+
+
+# ============================================================================
+# 4. POSITIONAL ENCODING
+# ============================================================================
+
+class PositionalEncoding(nn.Module):
+    """
+    Sinusoidal positional encoding
+    """
+    
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * 
+            (-math.log(10000.0) / d_model)
+        )
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        self.register_buffer('pe', pe.unsqueeze(0))  # (1, max_len, d_model)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (batch, seq_len, d_model)
+        output: (batch, seq_len, d_model)
+        """
+        seq_len = x.size(1)
+        return x + self.pe[:, :seq_len]
+
+
+# ============================================================================
+# 5. MAMBA ENCODER
+# ============================================================================
+
+class MambaEncoder(nn.Module):
+    """
+    Encoder: stack of Mamba blocks with masking support
+    """
+    
+    def __init__(self, d_model: int = 256, n_layers: int = 4, d_state: int = 16, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        
+        self.pos_encoding = PositionalEncoding(d_model)
+        
+        self.layers = nn.ModuleList([
+            MambaBlock(d_model, d_state, dropout)
+            for _ in range(n_layers)
+        ])
+        
+        self.norm = nn.LayerNorm(d_model)
+    
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        x: (batch, seq_len, d_model)
+        mask: (batch, seq_len) - True for valid positions, False for padding
+        output: (batch, seq_len, d_model)
+        """
+        x = self.pos_encoding(x)
+        
+        for layer in self.layers:
+            x = layer(x)
+            
+            # Apply mask by zeroing out padded positions
+            if mask is not None:
+                x = x * mask.unsqueeze(-1).float()
+        
+        x = self.norm(x)
+        return x
+
+
+# ============================================================================
+# 6. CROSS-ATTENTION (Encoder-Decoder Connection)
+# ============================================================================
+
+class CrossAttention(nn.Module):
+    """
+    Cross-attention between encoder and decoder
+    """
+    
+    def __init__(self, d_model: int = 256, n_heads: int = 4):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        
+        assert d_model % n_heads == 0
+        
+        self.query = nn.Linear(d_model, d_model)
+        self.key = nn.Linear(d_model, d_model)
+        self.value = nn.Linear(d_model, d_model)
+        self.out = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(0.1)
+    
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        query: (batch, tgt_len, d_model) - from decoder
+        key: (batch, src_len, d_model) - from encoder
+        value: (batch, src_len, d_model) - from encoder
+        output: (batch, tgt_len, d_model)
+        """
+        batch, tgt_len, _ = query.shape
+        src_len = key.size(1)
+        
+        # Project and reshape for multi-head attention
+        Q = self.query(query).view(batch, tgt_len, self.n_heads, self.head_dim)
+        K = self.key(key).view(batch, src_len, self.n_heads, self.head_dim)
+        V = self.value(value).view(batch, src_len, self.n_heads, self.head_dim)
+        
+        # Transpose: (batch, n_heads, seq_len, head_dim)
+        Q = Q.transpose(1, 2)
+        K = K.transpose(1, 2)
+        V = V.transpose(1, 2)
+        
+        # Scaled dot-product attention
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        
+        # Apply to values
+        context = torch.matmul(attn, V)  # (batch, n_heads, tgt_len, head_dim)
+        
+        # Merge heads
+        context = context.transpose(1, 2).contiguous()
+        context = context.view(batch, tgt_len, self.d_model)
+        
+        output = self.out(context)
+        return output
+
+
+# ============================================================================
+# 7. MAMBA DECODER
+# ============================================================================
+
+class MambaDecoder(nn.Module):
+    """
+    Decoder: generates tokens with cross-attention to encoder
+    """
+    
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 256,
+        n_layers: int = 4,
+        d_state: int = 16,
+        dropout: float = 0.1,
+        n_heads: int = 4
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.vocab_size = vocab_size
+        
+        # Token embedding
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        
+        # Positional encoding
+        self.pos_encoding = PositionalEncoding(d_model)
+        
+        # Decoder blocks
+        self.blocks = nn.ModuleList([
+            MambaBlock(d_model, d_state, dropout)
+            for _ in range(n_layers)
+        ])
+        
+        # Cross-attention layers
+        self.cross_attns = nn.ModuleList([
+            CrossAttention(d_model, n_heads)
+            for _ in range(n_layers)
+        ])
+        
+        # Output
+        self.norm = nn.LayerNorm(d_model)
+        self.output = nn.Linear(d_model, vocab_size)
+    
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        encoder_output: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        tokens: (batch, tgt_len)
+        encoder_output: (batch, src_len, d_model)
+        output: (batch, tgt_len, vocab_size)
+        """
+        # Embed tokens
+        x = self.embedding(tokens) * math.sqrt(self.d_model)
+        x = self.pos_encoding(x)
+        
+        # Process through decoder blocks with cross-attention
+        for block, cross_attn in zip(self.blocks, self.cross_attns):
+            x = block(x)
+            x = cross_attn(x, encoder_output, encoder_output)
+        
+        # Output
+        x = self.norm(x)
+        logits = self.output(x)  # (batch, tgt_len, vocab_size)
+        
+        return logits
+
+
+# ============================================================================
+# 8. COMPLETE SAMBA-ASR MODEL
+# ============================================================================
+
+class SambaASR(nn.Module):
+    """
+    Complete Samba-ASR model
+    
+    Pipeline:
+    1. Raw audio -> mel-spectrogram
+    2. Mel-spectrogram -> embeddings
+    3. Encoder: process embeddings
+    4. Decoder: generate text with cross-attention
+    """
+    
+    def __init__(
+        self,
+        n_mels: int = 80,
+        vocab_size: int = 128,
+        d_model: int = 256,
+        encoder_layers: int = 4,
+        decoder_layers: int = 4,
+        d_state: int = 16,
+        dropout: float = 0.1,
+        n_heads: int = 4
+    ):
+        super().__init__()
+        
+        self.n_mels = n_mels
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        
+        # Mel-spectrogram to embedding
+        self.mel_to_embedding = MelToEmbedding(n_mels, d_model)
+        
+        # Encoder
+        self.encoder = MambaEncoder(d_model, encoder_layers, d_state, dropout)
+        
+        # Decoder
+        self.decoder = MambaDecoder(vocab_size, d_model, decoder_layers, d_state, dropout, n_heads)
+    
+    def forward(
+        self,
+        mel_spec: torch.Tensor,
+        tokens: torch.Tensor,
+        mel_mask: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        mel_spec: (batch, n_mels, time)
+        tokens: (batch, seq_len)
+        mel_mask: (batch, time) - True for valid, False for padding
+        token_mask: (batch, seq_len) - True for valid, False for padding
+        output: (batch, seq_len, vocab_size)
+        """
+        # Encode mel-spectrogram
+        encoder_embeddings = self.mel_to_embedding(mel_spec)  # (batch, time/4, d_model)
+        encoder_output = self.encoder(encoder_embeddings, mel_mask)  # (batch, time/4, d_model)
+        
+        # Decode tokens with cross-attention
+        logits = self.decoder(tokens, encoder_output)  # (batch, seq_len, vocab_size)
+        
+        # Apply token mask to logits (set padding positions to -inf for loss)
+        if token_mask is not None:
+            logits = logits * token_mask.unsqueeze(-1).float()
+        
+        return logits
+    
+    def encode_audio(self, mel_spec: torch.Tensor) -> torch.Tensor:
+        """
+        Encode mel-spectrogram to context embeddings (for inference)
+        mel_spec: (batch, n_mels, time)
+        output: (batch, time/4, d_model)
+        """
+        encoder_embeddings = self.mel_to_embedding(mel_spec)
+        encoder_output = self.encoder(encoder_embeddings)
+        return encoder_output
+    
+    def decode_tokens(
+        self,
+        encoder_output: torch.Tensor,
+        tokens: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Decode tokens given encoder output (for inference)
+        encoder_output: (batch, time/4, d_model)
+        tokens: (batch, seq_len)
+        output: (batch, seq_len, vocab_size)
+        """
+        return self.decoder(tokens, encoder_output)
+
+
+# ============================================================================
+# 9. EXAMPLE USAGE WITH REAL AUDIO
+# ============================================================================
+
+if __name__ == "__main__":
+    print("=" * 80)
+    print("SAMBA-ASR MODEL - Complete Example")
+    print("=" * 80)
+    
+    # Configuration
+    config = {
+        'n_mels': 80,
+        'vocab_size': 128,  # Number of tokens (characters, BPE, etc)
+        'd_model': 256,
+        'encoder_layers': 4,
+        'decoder_layers': 4,
+        'd_state': 16,
+        'dropout': 0.1,
+        'n_heads': 4
+    }
+    
+    # Initialize model
+    model = SambaASR(**config)
+    print(f"\nModel initialized with config:")
+    for k, v in config.items():
+        print(f"  {k}: {v}")
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\nTotal parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Model size: {total_params * 4 / 1024 / 1024:.2f} MB (fp32)")
+    
+    # ========== EXAMPLE 1: Using synthetic mel-spectrogram ==========
+    print("\n" + "=" * 80)
+    print("EXAMPLE 1: Synthetic Mel-Spectrogram")
+    print("=" * 80)
+    
+    batch_size = 2
+    n_mels = 80
+    time_steps = 400  # e.g., ~4 seconds at 16kHz
+    seq_len = 50  # Output sequence length
+    
+    # Create synthetic mel-spectrogram
+    mel_spec = torch.randn(batch_size, n_mels, time_steps)
+    print(f"Mel-spectrogram shape: {mel_spec.shape}")
+    
+    # Create token input (for training)
+    tokens = torch.randint(0, config['vocab_size'], (batch_size, seq_len))
+    print(f"Token input shape: {tokens.shape}")
+    
+    # Forward pass
+    logits = model(mel_spec, tokens)
+    print(f"Output logits shape: {logits.shape}")
+    print(f"Expected shape: ({batch_size}, {seq_len}, {config['vocab_size']})")
+    
+    # Calculate loss (example)
+    loss_fn = nn.CrossEntropyLoss()
+    loss = loss_fn(logits.view(-1, config['vocab_size']), tokens.view(-1))
+    print(f"Training loss: {loss.item():.4f}")
+    
+    # ========== EXAMPLE 2: Using real audio file ==========
+    print("\n" + "=" * 80)
+    print("EXAMPLE 2: Real Audio with Variable Length (Max 30 seconds)")
+    print("=" * 80)
+    
+    try:
+        # Configure processor with max length
+        processor = MelSpectrogramProcessor(
+            sample_rate=16000,
+            n_mels=80,
+            n_fft=400,
+            hop_length=160,
+            max_duration=30.0  # 30 seconds max
+        )
+        
+        print(f"Processor configured:")
+        print(f"  Max duration: {processor.max_duration} seconds")
+        print(f"  Max samples: {processor.max_samples}")
+        print(f"  Max mel frames: {processor.max_frames}")
+        
+        # Create 3 different length audio examples
+        print("\n--- Creating variable-length audio samples ---")
+        audio_samples = []
+        
+        # Audio 1: 2 seconds
+        duration_1 = 2.0
+        t_1 = np.linspace(0, duration_1, int(16000 * duration_1))
+        audio_1 = (0.5 * np.sin(2 * np.pi * 440 * t_1) + 0.1 * np.random.randn(len(t_1)) * 0.1).astype(np.float32)
+        audio_samples.append(audio_1)
+        print(f"Audio 1: {duration_1}s ({len(audio_1)} samples)")
+        
+        # Audio 2: 5 seconds
+        duration_2 = 5.0
+        t_2 = np.linspace(0, duration_2, int(16000 * duration_2))
+        audio_2 = (0.5 * np.sin(2 * np.pi * 220 * t_2) + 0.1 * np.random.randn(len(t_2)) * 0.1).astype(np.float32)
+        audio_samples.append(audio_2)
+        print(f"Audio 2: {duration_2}s ({len(audio_2)} samples)")
+        
+        # Audio 3: 10 seconds
+        duration_3 = 10.0
+        t_3 = np.linspace(0, duration_3, int(16000 * duration_3))
+        audio_3 = (0.5 * np.sin(2 * np.pi * 880 * t_3) + 0.1 * np.random.randn(len(t_3)) * 0.1).astype(np.float32)
+        audio_samples.append(audio_3)
+        print(f"Audio 3: {duration_3}s ({len(audio_3)} samples)")
+        
+        # Process all audios to mel-spectrograms (with fixed max length)
+        print("\n--- Processing audio to mel-spectrograms ---")
+        mel_specs_list = []
+        mel_lengths = []
+        
+        for i, audio in enumerate(audio_samples):
+            mel_spec, actual_frames = processor(audio, return_length=True)
+            mel_specs_list.append(mel_spec)
+            mel_lengths.append(actual_frames)
+            print(f"Audio {i+1}: mel-spec shape {mel_spec.shape}, actual frames {actual_frames}")
+        
+        # Stack into batch
+        mel_specs_batch = torch.stack(mel_specs_list)  # (3, 80, max_frames)
+        print(f"\nBatched mel-specs shape: {mel_specs_batch.shape}")
+        
+        # Create attention masks
+        mel_mask = torch.zeros(len(audio_samples), processor.max_frames, dtype=torch.bool)
+        for i, length in enumerate(mel_lengths):
+            mel_mask[i, :length] = True
+        print(f"Mel mask shape: {mel_mask.shape}")
+        print(f"Mel mask (valid frames per sample): {mel_lengths}")
+        
+        # Create variable-length tokens
+        tokens_list = [
+            torch.tensor([1, 2, 3, 4, 5]),
+            torch.tensor([10, 20, 30, 40, 50, 60, 70]),
+            torch.tensor([100, 110, 120])
+        ]
+        
+        # Pad tokens to same length
+        max_token_len = max(len(t) for t in tokens_list)
+        tokens_batch = torch.zeros(len(tokens_list), max_token_len, dtype=torch.long)
+        token_lengths = []
+        for i, tokens in enumerate(tokens_list):
+            tokens_batch[i, :len(tokens)] = tokens
+            token_lengths.append(len(tokens))
+        
+        print(f"Tokens batch shape: {tokens_batch.shape}")
+        print(f"Token lengths: {token_lengths}")
+        
+        # Create token mask
+        token_mask = torch.zeros_like(tokens_batch, dtype=torch.bool)
+        for i, length in enumerate(token_lengths):
+            token_mask[i, :length] = True
+        
+        # Forward pass with masks
+        print("\n--- Forward pass with masks ---")
+        with torch.no_grad():
+            logits = model(mel_specs_batch, tokens_batch, mel_mask, token_mask)
+            print(f"Output logits shape: {logits.shape}")
+            print(f"Expected: (3, {max_token_len}, {config['vocab_size']})")
+            
+            # Predicted tokens (where mask is True)
+            predicted_tokens = torch.argmax(logits, dim=-1)
+            print(f"\nPredicted tokens shape: {predicted_tokens.shape}")
+            
+            # Show masked predictions
+            for i in range(len(audio_samples)):
+                valid_preds = predicted_tokens[i, :token_lengths[i]]
+                print(f"Sample {i+1} predictions: {valid_preds}")
+        
+        # Calculate loss with masking
+        print("\n--- Loss calculation with masking ---")
+        loss_fn = nn.CrossEntropyLoss(reduction='none')
+        losses = loss_fn(logits.view(-1, config['vocab_size']), tokens_batch.view(-1))
+        losses = losses.view(tokens_batch.shape)
+        
+        # Mask losses
+        losses = losses * token_mask.float()
+        
+        # Average only over valid tokens
+        total_valid_tokens = token_mask.sum()
+        avg_loss = losses.sum() / total_valid_tokens
+        
+        print(f"Total valid tokens: {total_valid_tokens}")
+        print(f"Masked average loss: {avg_loss.item():.4f}")
+        
+        print("\n✓ Variable-length audio batch processing successful!")
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    print("\n" + "=" * 80)
+    print("Example completed successfully!")
+    print("=" * 80)
+
+
+
+# 1. Tạo model
+model = SambaASR(vocab_size=128, d_model=256)
+
+# 2. Load audio (hoặc tạo synthetic)
+audio = np.random.randn(16000 * 3)  # 3 giây
+
+# 3. Convert to mel-spectrogram
+processor = MelSpectrogramProcessor(sample_rate=16000)
+mel_spec = processor(audio)  # (80, 400)
+
+# 4. Forward pass
+mel_spec_batch = mel_spec.unsqueeze(0)  # (1, 80, 400)
+tokens = torch.tensor([[1, 2, 3, 4, 5]])  # (1, 5)
+logits = model(mel_spec_batch, tokens)  # (1, 5, 128)
+
+processor = MelSpectrogramProcessor(
+    max_duration=30.0  # Max 30 seconds
+)
+
+mel_spec, actual_frames = processor(audio, return_length=True)
+
+collator = AudioCollator(processor)
+batch = collator([(audio1, tokens1), (audio2, tokens2)])
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
 from einops import rearrange, repeat
 from typing import Optional, Tuple, List
 
