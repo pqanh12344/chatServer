@@ -1,3 +1,625 @@
+!pip install underthesea
+
+import os
+import pandas as pd
+import numpy as np
+import torch
+from torch import nn, optim
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoModel, AutoTokenizer
+from underthesea import word_tokenize
+from sklearn.metrics import classification_report, f1_score, precision_recall_fscore_support, accuracy_score
+from tqdm import tqdm
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_NAME = "vinai/phobert-base"
+MAX_LEN = 128
+BATCH_SIZE = 16
+EPOCHS = 10
+LR = 1e-5
+
+# ==========================================
+# 2. ĐỌC DỮ LIỆU VSFC (0: Neg, 1: Neu, 2: Pos)
+# ==========================================
+def load_vsfc_data(folder_path):
+    sents_file = os.path.join(folder_path, 'sents.txt')
+    labels_file = os.path.join(folder_path, 'sentiments.txt')
+    
+    with open(sents_file, 'r', encoding='utf-8') as f:
+        sentences = [line.strip() for line in f.readlines()]
+    with open(labels_file, 'r', encoding='utf-8') as f:
+        labels = [int(line.strip()) for line in f.readlines()]
+        
+    return pd.DataFrame({'text': sentences, 'label': labels})
+
+# Giả sử các folder đặt trong cùng thư mục chạy code
+try:
+    df_train = load_vsfc_data('/kaggle/input/uit-vsfc/UIT-VSFC/train')
+    df_dev = load_vsfc_data('/kaggle/input/uit-vsfc/UIT-VSFC/dev')
+    df_test = load_vsfc_data('/kaggle/input/uit-vsfc/UIT-VSFC/test')
+    print(f"Dữ liệu đã sẵn sàng: Train({len(df_train)}), Test({len(df_test)})")
+    print("Phân bổ nhãn Train (Lớp 1 là Neutral - Hiếm):\n", df_train['label'].value_counts())
+except Exception as e:
+    print(f"Lỗi: Hãy đảm bảo các folder 'train', 'dev', 'test' có đủ file sents.txt và sentiments.txt")
+
+# ==========================================
+# 3. ĐỊNH NGHĨA DATASET
+# ==========================================
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+class VSFCDataset(Dataset):
+    def __init__(self, df):
+        # Word Segmentation cho tiếng Việt
+        self.texts = [word_tokenize(t, format="text").lower() for t in df['text']]
+        self.labels = df['label'].values
+
+    def __len__(self): return len(self.labels)
+
+    def __getitem__(self, i):
+        encoding = tokenizer(self.texts[i], truncation=True, max_length=MAX_LEN, 
+                             padding='max_length', return_tensors='pt')
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'labels': torch.tensor(self.labels[i], dtype=torch.long)
+        }
+
+train_loader = DataLoader(VSFCDataset(df_train), batch_size=BATCH_SIZE, shuffle=True)
+dev_loader = DataLoader(VSFCDataset(df_dev), batch_size=BATCH_SIZE)
+test_loader = DataLoader(VSFCDataset(df_test), batch_size=BATCH_SIZE)
+
+class PhoBERT_Contrastive(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.phobert = AutoModel.from_pretrained(MODEL_NAME)
+        self.dropout = nn.Dropout(0.1)
+        # Projection Head để tối ưu hóa không gian vector cho Contrastive
+        self.projection_head = nn.Sequential(
+            nn.Linear(768, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128)
+        )
+        self.classifier = nn.Linear(768, 3)
+        
+    def forward(self, input_ids, attention_mask):
+        out = self.phobert(input_ids, attention_mask=attention_mask)
+        cls_emb = out.last_hidden_state[:, 0, :] # Vector [CLS]
+        
+        logits = self.classifier(self.dropout(cls_emb))
+        proj_emb = self.projection_head(cls_emb) 
+        return logits, proj_emb
+
+# ==========================================
+# 5. SUPCON LOSS & METRIC CALCULATOR
+# ==========================================
+class SupConLoss(nn.Module):
+    def __init__(self, temperature=0.1):
+        super().__init__()
+        self.temp = temperature
+
+    def forward(self, features, labels):
+        features = nn.functional.normalize(features, p=2, dim=1)
+        batch_size = features.shape[0]
+        labels = labels.view(-1, 1)
+        mask = torch.eq(labels, labels.T).float().to(DEVICE)
+        
+        logits = torch.matmul(features, features.T) / self.temp
+        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+        logits = logits - logits_max.detach() 
+        
+        exp_logits = torch.exp(logits) * (1 - torch.eye(batch_size).to(DEVICE))
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-9)
+        
+        mask_pos = mask * (1 - torch.eye(batch_size).to(DEVICE))
+        denom = mask_pos.sum(1)
+        mean_log_prob_pos = (mask_pos * log_prob).sum(1) / (denom + 1e-9)
+        return -mean_log_prob_pos[denom > 0].mean()
+
+def compute_detailed_metrics(model, loader):
+    model.eval()
+    y_true, y_pred = [], []
+    with torch.no_grad():
+        for b in loader:
+            l, _ = model(b['input_ids'].to(DEVICE), b['attention_mask'].to(DEVICE))
+            y_pred.extend(torch.argmax(l, dim=1).cpu().numpy())
+            y_true.extend(b['labels'].numpy())
+    
+    # Tính Precision, Recall, F1 cho từng lớp
+    p, r, f, _ = precision_recall_fscore_support(y_true, y_pred, labels=[0, 1, 2], zero_division=0)
+    acc = accuracy_score(y_true, y_pred)
+    macro_f1 = f1_score(y_true, y_pred, average='macro')
+    
+    return acc, macro_f1, p, r, f, y_true, y_pred
+
+model = PhoBERT_Contrastive().to(DEVICE)
+optimizer = optim.AdamW(model.parameters(), lr=LR)
+
+# Class Weights tập trung vào Neutral (1)
+weights = torch.tensor([1.0, 8.0, 1.0], dtype=torch.float).to(DEVICE)
+criterion_cls = nn.CrossEntropyLoss(weight=weights)
+criterion_con = SupConLoss(temperature=0.1)
+
+best_f1 = 0
+for epoch in range(EPOCHS):
+    model.train()
+    total_loss = 0
+    for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+        ids, mask, labels = batch['input_ids'].to(DEVICE), batch['attention_mask'].to(DEVICE), batch['labels'].to(DEVICE)
+        
+        optimizer.zero_grad()
+        logits, projs = model(ids, mask)
+        
+        loss = 0.5 * criterion_con(projs, labels) + 0.5 * criterion_cls(logits, labels)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+
+    # Đánh giá sau mỗi epoch
+    acc, m_f1, p, r, f, _, _ = compute_detailed_metrics(model, dev_loader)
+    print(f"\n[Val] Acc: {acc:.4f} | Macro F1: {m_f1:.4f}")
+    print(f"--- Lớp Neutral (1): P: {p[1]:.4f}, R: {r[1]:.4f}, F1: {f[1]:.4f}")
+
+    if m_f1 > best_f1:
+        best_f1 = m_f1
+        torch.save(model.state_dict(), "best_contrastive_vsfc.pt")
+
+print("\n" + "="*30 + "\nKẾT QUẢ CUỐI CÙNG TRÊN TEST SET\n" + "="*30)
+model.load_state_dict(torch.load("best_contrastive_vsfc.pt"))
+acc, m_f1, p, r, f, y_true, y_pred = compute_detailed_metrics(model, test_loader)
+
+# Xuất bảng báo cáo chi tiết cho Paper
+print(classification_report(y_true, y_pred, target_names=['Negative', 'Neutral', 'Positive']))
+
+# In riêng bộ Precision, Recall cho lớp Neutral để bạn dễ copy
+print(f"Neutral Class Details: Precision={p[1]:.4f}, Recall={r[1]:.4f}, F1={f[1]:.4f}")
+print(acc)
+
+print(m_f1)
+p_macro, r_macro, f1_macro, _ = precision_recall_fscore_support(y_true, y_pred, average='macro')
+print(f"--- : P: {p_macro:.4f}, R: {r_macro:.4f}, F1: {f1_macro:.4f}")
+
+
+
+
+
+import os
+import pandas as pd
+import numpy as np
+import torch
+from torch import nn, optim
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoModel, AutoTokenizer
+from sklearn.metrics import classification_report, f1_score, accuracy_score, precision_recall_fscore_support, confusion_matrix
+import seaborn as sns
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+# ==========================================
+# 1. CẤU HÌNH HỆ THỐNG
+# ==========================================
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_NAME = "xlm-roberta-base" 
+MAX_LEN = 128
+BATCH_SIZE = 16
+EPOCHS = 10
+LR = 1e-5
+
+# ==========================================
+# 2. ĐỌC DỮ LIỆU TỪ FOLDER VSFC
+# ==========================================
+def load_vsfc_data(folder_path):
+    sents_file = os.path.join(folder_path, 'sents.txt')
+    labels_file = os.path.join(folder_path, 'sentiments.txt')
+    
+    with open(sents_file, 'r', encoding='utf-8') as f:
+        sentences = [line.strip() for line in f.readlines()]
+    with open(labels_file, 'r', encoding='utf-8') as f:
+        labels = [int(line.strip()) for line in f.readlines()]
+        
+    return pd.DataFrame({'text': sentences, 'label': labels})
+
+# Giả sử cấu trúc folder: ./train/, ./dev/, ./test/
+try:
+    df_train = load_vsfc_data('/kaggle/input/uit-vsfc/UIT-VSFC/train')
+    df_dev = load_vsfc_data('/kaggle/input/uit-vsfc/UIT-VSFC/dev')
+    df_test = load_vsfc_data('/kaggle/input/uit-vsfc/UIT-VSFC/test')
+    print(f"Sử dụng thiết bị: {DEVICE}")
+    print(f"Số lượng mẫu Train: {len(df_train)}")
+except Exception as e:
+    print(f"Lỗi đọc file: {e}. Vui lòng kiểm tra lại folder train/dev/test.")
+
+# ==========================================
+# 3. DATASET & TOKENIZER (XLM-R chuẩn)
+# ==========================================
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+class VSFCDataset(Dataset):
+    def __init__(self, df):
+        self.texts = df['text'].astype(str).values
+        self.labels = df['label'].values
+
+    def __len__(self): return len(self.labels)
+
+    def __getitem__(self, i):
+        encoding = tokenizer(self.texts[i], truncation=True, max_length=MAX_LEN, 
+                             padding='max_length', return_tensors='pt')
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'labels': torch.tensor(self.labels[i], dtype=torch.long)
+        }
+
+train_loader = DataLoader(VSFCDataset(df_train), batch_size=BATCH_SIZE, shuffle=True)
+dev_loader = DataLoader(VSFCDataset(df_dev), batch_size=BATCH_SIZE)
+test_loader = DataLoader(VSFCDataset(df_test), batch_size=BATCH_SIZE)
+
+# ==========================================
+# 4. KIẾN TRÚC MÔ HÌNH XLM-R + SUPCON
+# ==========================================
+class XLMR_SupCon(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.xlmr = AutoModel.from_pretrained(MODEL_NAME)
+        self.dropout = nn.Dropout(0.1)
+        # Projection Head để học representation tốt hơn cho lớp hiếm
+        self.projection_head = nn.Sequential(
+            nn.Linear(768, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128)
+        )
+        self.classifier = nn.Linear(768, 3)
+        
+    def forward(self, input_ids, attention_mask):
+        out = self.xlmr(input_ids, attention_mask=attention_mask)
+        # Lấy token <s> (tương tự [CLS])
+        cls_emb = out.last_hidden_state[:, 0, :] 
+        
+        logits = self.classifier(self.dropout(cls_emb))
+        proj_emb = self.projection_head(cls_emb) 
+        return logits, proj_emb
+
+# ==========================================
+# 5. SUPERVISED CONTRASTIVE LOSS
+# ==========================================
+class SupConLoss(nn.Module):
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temp = temperature
+
+    def forward(self, features, labels):
+        features = nn.functional.normalize(features, p=2, dim=1)
+        batch_size = features.shape[0]
+        labels = labels.view(-1, 1)
+        mask = torch.eq(labels, labels.T).float().to(DEVICE)
+        
+        logits = torch.matmul(features, features.T) / self.temp
+        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+        logits = logits - logits_max.detach() 
+        
+        exp_logits = torch.exp(logits) * (1 - torch.eye(batch_size).to(DEVICE))
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-9)
+        
+        mask_pos = mask * (1 - torch.eye(batch_size).to(DEVICE))
+        denom = mask_pos.sum(1)
+        mean_log_prob_pos = (mask_pos * log_prob).sum(1) / (denom + 1e-9)
+        return -mean_log_prob_pos[denom > 0].mean()
+
+# ==========================================
+# 6. HUẤN LUYỆN
+# ==========================================
+model = XLMR_SupCon().to(DEVICE)
+optimizer = optim.AdamW(model.parameters(), lr=LR)
+
+# Phạt nặng nếu sai lớp Neutral (nhãn 1)
+weights = torch.tensor([1.0, 8.0, 1.0], dtype=torch.float).to(DEVICE) 
+criterion_cls = nn.CrossEntropyLoss(weight=weights)
+criterion_con = SupConLoss(temperature=0.1)
+
+best_f1 = 0
+print("\n--- Bắt đầu Training XLM-R + SupCon ---")
+
+for epoch in range(EPOCHS):
+    model.train()
+    total_loss = 0
+    for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+        ids, mask, labels = batch['input_ids'].to(DEVICE), batch['attention_mask'].to(DEVICE), batch['labels'].to(DEVICE)
+        
+        optimizer.zero_grad()
+        logits, projs = model(ids, mask)
+        
+        loss_con = criterion_con(projs, labels)
+        loss_cls = criterion_cls(logits, labels)
+        
+        # Loss kết hợp: 0.5 Contrastive + 0.5 Classification
+        loss = 0.5 * loss_con + 0.5 * loss_cls
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+
+    # Validation
+    model.eval()
+    y_true, y_pred = [], []
+    with torch.no_grad():
+        for b in dev_loader:
+            l, _ = model(b['input_ids'].to(DEVICE), b['attention_mask'].to(DEVICE))
+            y_pred.extend(torch.argmax(l, dim=1).cpu().numpy())
+            y_true.extend(b['labels'].numpy())
+    
+    val_f1 = f1_score(y_true, y_pred, average='macro')
+    print(f"Loss: {total_loss/len(train_loader):.4f} | Val Macro F1: {val_f1:.4f}")
+    
+    if val_f1 > best_f1:
+        best_f1 = val_f1
+        torch.save(model.state_dict(), "best_xlmr_vsfc.pt")
+
+# ==========================================
+# 7. ĐÁNH GIÁ CUỐI CÙNG (FULL METRICS)
+# ==========================================
+print("\n--- Đang đánh giá trên tập Test ---")
+model.load_state_dict(torch.load("best_xlmr_vsfc.pt"))
+model.eval()
+
+all_preds = []
+all_true = df_test['label'].values
+
+with torch.no_grad():
+    for b in test_loader:
+        l, _ = model(b['input_ids'].to(DEVICE), b['attention_mask'].to(DEVICE))
+        all_preds.extend(torch.argmax(l, dim=1).cpu().numpy())
+
+# Tính toán các chỉ số chi tiết cho Paper
+acc = accuracy_score(all_true, all_preds)
+p_macro, r_macro, f1_macro, _ = precision_recall_fscore_support(all_true, all_preds, average='macro')
+p_weighted, r_weighted, f1_weighted, _ = precision_recall_fscore_support(all_true, all_preds, average='weighted')
+
+print("\n" + "="*65)
+print(f"{'CHỈ SỐ (METRIC)':<20} | {'MACRO AVG':<15} | {'WEIGHTED AVG':<15}")
+print("-"*65)
+print(f"{'Precision':<20} | {p_macro*100:>14.2f}% | {p_weighted*100:>14.2f}%")
+print(f"{'Recall':<20} | {r_macro*100:>14.2f}% | {r_weighted*100:>14.2f}%")
+print(f"{'F1-score':<20} | {f1_macro*100:>14.2f}% | {f1_weighted*100:>14.2f}%")
+print("-"*65)
+print(f"{'Overall Accuracy':<20} | {acc*100:>36.2f}%")
+print("="*65)
+
+# Report chi tiết từng lớp
+print("\nBÁO CÁO CHI TIẾT TỪNG LỚP:")
+print(classification_report(all_true, all_preds, target_names=['Negative', 'Neutral', 'Positive'], digits=4))
+
+# Vẽ Confusion Matrix
+cm = confusion_matrix(all_true, all_preds)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+            xticklabels=['Neg', 'Neu', 'Pos'], 
+            yticklabels=['Neg', 'Neu', 'Pos'])
+plt.xlabel('Predicted Label')
+plt.ylabel('True Label')
+plt.title('Confusion Matrix - XLM-R + SupCon (UIT-VSFC)')
+plt.show()
+
+
+
+
+!pip install mamba-ssm causal-conv1d>=1.2.0
+
+import os
+import pandas as pd
+import numpy as np
+import torch
+from torch import nn, optim
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoTokenizer
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from sklearn.metrics import classification_report, f1_score, accuracy_score, precision_recall_fscore_support, confusion_matrix
+import seaborn as sns
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+# ==========================================
+# 1. CẤU HÌNH
+# ==========================================
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_NAME = "state-spaces/mamba-130m" 
+MAX_LEN = 128
+BATCH_SIZE = 16
+LR = 1e-5
+EPOCHS = 10
+
+# ==========================================
+# 2. ĐỌC DỮ LIỆU & TOKENIZER
+# ==========================================
+def load_vsfc_data(folder_path):
+    sents_file = os.path.join(folder_path, 'sents.txt')
+    labels_file = os.path.join(folder_path, 'sentiments.txt')
+    with open(sents_file, 'r', encoding='utf-8') as f:
+        sentences = [line.strip() for line in f.readlines()]
+    with open(labels_file, 'r', encoding='utf-8') as f:
+        labels = [int(line.strip()) for line in f.readlines()]
+    return pd.DataFrame({'text': sentences, 'label': labels})
+
+# Khởi tạo Tokenizer (Mamba dùng bộ GPT-NeoX)
+tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+tokenizer.pad_token = tokenizer.eos_token
+
+class VSFCDataset(Dataset):
+    def __init__(self, df):
+        self.texts = df['text'].astype(str).values
+        self.labels = df['label'].values
+
+    def __len__(self): return len(self.labels)
+
+    def __getitem__(self, i):
+        encoding = tokenizer(self.texts[i], truncation=True, max_length=MAX_LEN, 
+                             padding='max_length', return_tensors='pt')
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'labels': torch.tensor(self.labels[i], dtype=torch.long)
+        }
+
+# Load Data
+df_train = load_vsfc_data('train')
+df_dev = load_vsfc_data('dev')
+df_test = load_vsfc_data('test')
+
+train_loader = DataLoader(VSFCDataset(df_train), batch_size=BATCH_SIZE, shuffle=True)
+dev_loader = DataLoader(VSFCDataset(df_dev), batch_size=BATCH_SIZE)
+test_loader = DataLoader(VSFCDataset(df_test), batch_size=BATCH_SIZE)
+
+# ==========================================
+# 3. KIẾN TRÚC MAMBA CHÍNH CHỦ + SUPCON
+# ==========================================
+class MambaOfficial_SupCon(nn.Module):
+    def __init__(self, model_name):
+        super().__init__()
+        self.mamba_lm = MambaLMHeadModel.from_pretrained(model_name, device=DEVICE)
+        d_model = self.mamba_lm.config.d_model
+        
+        self.dropout = nn.Dropout(0.1)
+        self.projection_head = nn.Sequential(
+            nn.Linear(d_model, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128)
+        )
+        self.classifier = nn.Linear(d_model, 3)
+
+    def forward(self, input_ids):
+        # Mamba backbone output: (batch, seq_len, d_model)
+        outputs = self.mamba_lm.backbone(input_ids)
+        # Last Token Pooling
+        last_hidden = outputs[:, -1, :] 
+        
+        logits = self.classifier(self.dropout(last_hidden))
+        proj_emb = self.projection_head(last_hidden)
+        return logits, proj_emb
+
+# ==========================================
+# 4. SUPERVISED CONTRASTIVE LOSS
+# ==========================================
+class SupConLoss(nn.Module):
+    def __init__(self, temperature=0.1):
+        super().__init__()
+        self.temp = temperature
+
+    def forward(self, features, labels):
+        features = nn.functional.normalize(features, p=2, dim=1)
+        batch_size = features.shape[0]
+        labels = labels.view(-1, 1)
+        mask = torch.eq(labels, labels.T).float().to(DEVICE)
+        
+        logits = torch.matmul(features, features.T) / self.temp
+        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+        logits = logits - logits_max.detach() 
+        
+        exp_logits = torch.exp(logits) * (1 - torch.eye(batch_size).to(DEVICE))
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-9)
+        
+        mask_pos = mask * (1 - torch.eye(batch_size).to(DEVICE))
+        denom = mask_pos.sum(1)
+        mean_log_prob_pos = (mask_pos * log_prob).sum(1) / (denom + 1e-9)
+        return -mean_log_prob_pos[denom > 0].mean()
+
+# ==========================================
+# 5. HUẤN LUYỆN
+# ==========================================
+model = MambaOfficial_SupCon(MODEL_NAME).to(DEVICE)
+optimizer = optim.AdamW(model.parameters(), lr=LR)
+weights = torch.tensor([1.0, 8.0, 1.0], dtype=torch.float).to(DEVICE) 
+
+criterion_cls = nn.CrossEntropyLoss(weight=weights)
+criterion_con = SupConLoss()
+
+best_f1 = 0
+print(f"Bắt đầu huấn luyện Mamba 130M trên {DEVICE}...")
+
+for epoch in range(EPOCHS):
+    model.train()
+    total_loss = 0
+    for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+        ids, labels = batch['input_ids'].to(DEVICE), batch['labels'].to(DEVICE)
+        optimizer.zero_grad()
+        logits, projs = model(ids)
+        
+        loss = 0.5 * criterion_con(projs, labels) + 0.5 * criterion_cls(logits, labels)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+
+    # Val
+    model.eval()
+    y_true, y_pred = [], []
+    with torch.no_grad():
+        for b in dev_loader:
+            l, _ = model(b['input_ids'].to(DEVICE))
+            y_pred.extend(torch.argmax(l, dim=1).cpu().numpy())
+            y_true.extend(b['labels'].numpy())
+    
+    val_f1 = f1_score(y_true, y_pred, average='macro')
+    print(f"Loss: {total_loss/len(train_loader):.4f} | Val F1: {val_f1:.4f}")
+    
+    if val_f1 > best_f1:
+        best_f1 = val_f1
+        torch.save(model.state_dict(), "best_mamba_official.pt")
+
+# ==========================================
+# 6. ĐÁNH GIÁ CUỐI CÙNG (FINAL EVALUATION)
+# ==========================================
+print("\n--- ĐÁNH GIÁ TRÊN TẬP TEST (MAMBA 130M + SUPCON) ---")
+model.load_state_dict(torch.load("best_mamba_official.pt"))
+model.eval()
+
+test_preds = []
+test_true = df_test['label'].values
+
+with torch.no_grad():
+    for b in test_loader:
+        l, _ = model(b['input_ids'].to(DEVICE))
+        test_preds.extend(torch.argmax(l, dim=1).cpu().numpy())
+
+# Tính các chỉ số
+acc = accuracy_score(test_true, test_preds)
+p_macro, r_macro, f1_macro, _ = precision_recall_fscore_support(test_true, test_preds, average='macro')
+p_weighted, r_weighted, f1_weighted, _ = precision_recall_fscore_support(test_true, test_preds, average='weighted')
+
+print("\n" + "="*60)
+print(f"Accuracy: {acc*100:.2f}%")
+print(f"Macro    - Precision: {p_macro*100:.2f}% | Recall: {r_macro*100:.2f}% | F1: {f1_macro*100:.2f}%")
+print(f"Weighted - Precision: {p_weighted*100:.2f}% | Recall: {r_weighted*100:.2f}% | F1: {f1_weighted*100:.2f}%")
+print("="*60)
+
+print("\nBÁO CÁO CHI TIẾT:")
+print(classification_report(test_true, test_preds, target_names=['Neg', 'Neu', 'Pos'], digits=4))
+
+# Vẽ Confusion Matrix
+cm = confusion_matrix(test_true, test_preds)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Oranges', 
+            xticklabels=['Neg', 'Neu', 'Pos'], 
+            yticklabels=['Neg', 'Neu', 'Pos'])
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.title('Confusion Matrix - Mamba 130M SupCon')
+plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
