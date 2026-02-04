@@ -1,3 +1,96 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.cuda.amp import autocast, GradScaler
+
+class SambaASR_PhoBERT_Style(nn.Module):
+    def __init__(self, input_dim=80, hidden_dim=512, vocab_size=64000):
+        super().__init__()
+        # 1. Projector đầu vào: Giảm chiều Mel-spec về hidden_dim
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        
+        # 2. Samba Backbone (Thay bằng model thật của bạn)
+        # Giả sử Samba trả về (Batch, Seq, Hidden)
+        self.samba = nn.LSTM(hidden_dim, hidden_dim, num_layers=2, batch_first=True)
+        
+        # 3. Layer quan trọng nhất: Chống nổ Logits cho Vocab 64k
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        
+        # Dùng Weight Standardization hoặc đơn giản là Linear
+        self.output_head = nn.Linear(hidden_dim, vocab_size, bias=False)
+        
+        # Soft-capping value
+        self.soft_cap = 30.0
+
+    def forward(self, x):
+        # x shape: (Batch: 54, Seq: 2594, Feat: 80)
+        x = self.input_proj(x)
+        
+        # Qua lõi Samba
+        x, _ = self.samba(x)
+        
+        # Normalize trước khi ra head để giá trị không quá lớn
+        x = self.final_norm(x)
+        
+        # Tính Logits
+        logits = self.output_head(x)
+        
+        # FIX NaN: Ép logits về khoảng an toàn [-30, 30]
+        logits = self.soft_cap * torch.tanh(logits / self.soft_cap)
+        
+        return logits
+
+# ==========================================
+# CẤU HÌNH TRAIN AN TOÀN
+# ==========================================
+BATCH_SIZE = 54
+SEQ_LEN = 2594
+VOCAB_SIZE = 64000
+INPUT_FEAT = 80 # Giả định Mel-spec của bạn có 80 bins
+
+device = "cuda"
+model = SambaASR_PhoBERT_Style(input_dim=INPUT_FEAT, vocab_size=VOCAB_SIZE).to(device)
+
+# 1. Sử dụng Label Smoothing để làm mượt Loss, tránh phạt quá nặng gây nổ Grad
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1, ignore_index=0)
+
+# 2. AdamW với LR thấp hơn cho Vocab lớn
+optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+scaler = GradScaler()
+
+# Dữ liệu giả lập theo shape thực tế của bạn
+inputs = torch.randn(BATCH_SIZE, SEQ_LEN, INPUT_FEAT).to(device)
+targets = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN)).to(device)
+
+model.train()
+for epoch in range(5):
+    optimizer.zero_grad()
+    
+    # Bắt buộc dùng bfloat16 nếu train với Vocab 64k để tránh tràn số
+    with autocast(dtype=torch.bfloat16):
+        logits = model(inputs) # (54, 2594, 64000)
+        
+        # Flatten để tính Loss: (Batch * Seq, Vocab)
+        loss = criterion(logits.view(-1, VOCAB_SIZE), targets.view(-1))
+    
+    if torch.isnan(loss):
+        print("Loss NaN detected! Kiểm tra lại initialization.")
+        break
+        
+    scaler.scale(loss).backward()
+    
+    # Clip Gradient thật chặt (0.5 là ngưỡng an toàn nhất cho SSM)
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+    
+    scaler.step(optimizer)
+    scaler.update()
+    
+    print(f"Epoch {epoch} | Loss: {loss.item():.4f}")
+
+
+
+
 pip install yt-dlp torch torchaudio speechbrain faster-whisper pedalboard audiomentations pydub tqdm
 
 
