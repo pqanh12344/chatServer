@@ -1,3 +1,170 @@
+pip install yt-dlp torch torchaudio speechbrain faster-whisper pedalboard audiomentations pydub tqdm
+
+
+import os
+import csv
+import torch
+import torchaudio
+import shutil
+from pathlib import Path
+from tqdm import tqdm
+from yt_dlp import YoutubeDL
+from pydub import AudioSegment, silence
+from pedalboard import Pedalboard, Reverb, PitchShift, TimeStretch
+from pedalboard.io import AudioFile
+from audiomentations import Compose, AddGaussianNoise, TimeMask
+from speechbrain.inference.speaker import EncoderClassifier
+from faster_whisper import WhisperModel
+
+# ==========================================
+# CẤU HÌNH HỆ THỐNG PRO (16000Hz Mono)
+# ==========================================
+CONFIG = {
+    "URLS": ["https://www.youtube.com/watch?v=ID_VIDEO"], 
+    "REF_FILE": "mau_giong_chuan.wav",
+    "OUTPUT_DIR": "dataset_16k_mono",
+    "THRESHOLD": 0.82,            # Độ gắt nhận diện giọng nói
+    "SAMPLE_RATE": 16000,         # ÉP VỀ 16000Hz
+    "WHISPER_MODEL": "large-v3",
+    "DEVICE": "cuda" if torch.cuda.is_available() else "cpu"
+}
+
+# ==========================================
+# 1. LUYỆN VÂN TAY KHÁNG NHIỄU
+# ==========================================
+def create_pro_centroid(classifier):
+    print(f"🧬 Đang luyện vân tay mẫu tại {CONFIG['DEVICE']}...")
+    with AudioFile(CONFIG['REF_FILE']) as f:
+        audio = f.read(f.frames)
+        sr = f.sample_rate
+
+    augment = Compose([
+        AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.01, p=0.5),
+        TimeMask(p=0.5)
+    ])
+
+    all_embs = []
+    # Tạo 5 biến thể để lấy trọng tâm giọng nói
+    for i in range(5):
+        # Biến đổi nhẹ về Pitch và Speed bằng Pedalboard
+        board = Pedalboard([
+            PitchShift(semitones=np.random.uniform(-1, 1)),
+            TimeStretch(playback_rate=np.random.uniform(0.9, 1.1))
+        ])
+        processed = board(audio, sr)
+        noisy = augment(samples=processed, sample_rate=sr)
+        
+        t = torch.from_numpy(noisy).to(CONFIG['DEVICE'])
+        if t.ndim > 1: t = t.mean(0, keepdim=True) # Ép Mono cho embedding
+        else: t = t.unsqueeze(0)
+        
+        with torch.no_grad():
+            all_embs.append(classifier.encode_batch(t).squeeze(0))
+            
+    return torch.stack(all_embs).mean(0)
+
+# ==========================================
+# 2. XỬ LÝ AUDIO CHUẨN ĐẦU RA (16k, Mono)
+# ==========================================
+def process_to_standard(input_path, output_path):
+    """Ép audio về chuẩn Mono, 16000Hz"""
+    sig, fs = torchaudio.load(input_path)
+    
+    # 1. Chuyển sang Mono (nếu là Stereo)
+    if sig.shape[0] > 1:
+        sig = sig.mean(0, keepdim=True)
+    
+    # 2. Resample về 16000Hz
+    if fs != CONFIG['SAMPLE_RATE']:
+        resampler = torchaudio.transforms.Resample(fs, CONFIG['SAMPLE_RATE'])
+        sig = resampler(sig)
+    
+    # 3. Lưu file
+    torchaudio.save(output_path, sig, CONFIG['SAMPLE_RATE'], bits_per_sample=16)
+
+# ==========================================
+# 3. QUY TRÌNH TỔNG THỂ
+# ==========================================
+def run_factory():
+    out_dir = Path(CONFIG['OUTPUT_DIR'])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Load Models
+    spk_model = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", run_opts={"device": CONFIG['DEVICE']})
+    whisper = WhisperModel(CONFIG['WHISPER_MODEL'], device=CONFIG['DEVICE'], compute_type="float16")
+    cos_sim = torch.nn.CosineSimilarity(dim=1)
+
+    # B1: Lấy vân tay
+    centroid = create_pro_centroid(spk_model)
+
+    # B2: Download YT & Cắt (Tạm thời dùng pydub để cắt silence)
+    temp_raw = Path("temp_raw"); temp_raw.mkdir(exist_ok=True)
+    temp_chunks = Path("temp_chunks"); temp_chunks.mkdir(exist_ok=True)
+    
+    print("📺 Đang tải nhạc từ YouTube...")
+    ydl_opts = {'format': 'bestaudio/best', 'outtmpl': 'temp_raw/%(id)s.%(ext)s', 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'wav'}]}
+    with YoutubeDL(ydl_opts) as ydl: ydl.download(CONFIG['URLS'])
+
+    print("✂️ Đang phân tách câu nói...")
+    for f in temp_raw.glob("*.wav"):
+        sound = AudioSegment.from_wav(str(f))
+        chunks = silence.split_on_silence(sound, min_silence_len=700, silence_thresh=-45, keep_silence=300)
+        for i, chunk in enumerate(chunks):
+            if 3000 <= len(chunk) <= 15000:
+                chunk.export(temp_chunks / f"{f.stem}_{i}.wav", format="wav")
+
+    # B3: Sàng lọc và Gỡ băng
+    metadata = []
+    chunk_files = list(temp_chunks.glob("*.wav"))
+    print(f"🚀 Đang lọc {len(chunk_files)} file về chuẩn 16k Mono...")
+
+    for cp in tqdm(chunk_files):
+        try:
+            # Kiểm tra identity trước khi xử lý nặng
+            sig, fs = torchaudio.load(str(cp))
+            if sig.shape[0] > 1: sig = sig.mean(0, keepdim=True)
+            with torch.no_grad():
+                emb = spk_model.encode_batch(sig.to(CONFIG['DEVICE']))
+                score = cos_sim(centroid, emb[0]).item()
+
+            if score >= CONFIG['THRESHOLD']:
+                # Đúng giọng -> Ép về 16k Mono và lưu
+                target_audio = out_dir / cp.name
+                process_to_standard(str(cp), str(target_audio))
+                
+                # Gỡ băng
+                segs, _ = whisper.transcribe(str(target_audio), language="vi")
+                text = " ".join([s.text for s in segs]).strip()
+                
+                if text:
+                    with open(out_dir / f"{cp.stem}.txt", "w", encoding="utf-8") as tf:
+                        tf.write(text)
+                    metadata.append(f"{cp.name}|{text}")
+        except: continue
+
+    # B4: Lưu Metadata cuối cùng
+    with open(out_dir / "metadata.csv", "w", encoding="utf-8") as f:
+        f.write("\n".join(metadata))
+
+    # Dọn dẹp
+    shutil.rmtree(temp_raw); shutil.rmtree(temp_chunks)
+    print(f"✨ HOÀN TẤT! Dữ liệu 16kHz Mono đã sẵn sàng tại: {CONFIG['OUTPUT_DIR']}")
+
+import numpy as np # Bổ sung cho hàm random trong centroid
+if __name__ == "__main__":
+    run_factory()
+
+
+
+
+
+
+
+
+
+
+
+
 pip install yt-dlp torch torchaudio speechbrain faster-whisper pedalboard pydub tqdm
 
 
@@ -146,12 +313,6 @@ def run_tool():
 
 if __name__ == "__main__":
     run_tool()
-
-
-
-
-
-
 
 
 
