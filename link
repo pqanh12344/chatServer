@@ -1,3 +1,342 @@
+pip install yt-dlp torch torchaudio speechbrain faster-whisper pedalboard pydub tqdm
+
+
+import os
+import csv
+import torch
+import torchaudio
+import shutil
+from pathlib import Path
+from tqdm import tqdm
+from yt_dlp import YoutubeDL
+from pydub import AudioSegment, silence
+from pedalboard import Pedalboard, Reverb, PitchShift
+from pedalboard.io import AudioFile
+from speechbrain.inference.speaker import EncoderClassifier
+from faster_whisper import WhisperModel
+
+# ==========================================
+# 1. CẤU HÌNH (Sửa thông tin ở đây)
+# ==========================================
+YOUTUBE_URLS = [
+    "https://www.youtube.com/watch?v=EXAMPLE1", # Thay link của bạn vào đây
+    "https://www.youtube.com/watch?v=EXAMPLE2"
+]
+REF_FILE = "mau_giong_chuan.wav"       # File mẫu (bạn tự cắt 1 đoạn 15s từ YT trước)
+WHISPER_CKPT = "./whisper_v3_ct2"      # Đường dẫn checkpoint Faster-Whisper
+OUTPUT_DIR = "f5tts_dataset"           # Thư mục kết quả cuối cùng
+
+# Thông số kỹ thuật
+THRESHOLD = 0.75                       # Độ khớp giọng (0.7 - 0.8)
+MIN_SILENCE_LEN = 500                  # Độ dài khoảng lặng để cắt (ms)
+SILENCE_THRESH = -40                   # Ngưỡng âm lượng để coi là khoảng lặng (dB)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ==========================================
+# 2. CÁC HÀM TRỢ LÝ
+# ==========================================
+
+# Hàm tải âm thanh từ YouTube
+def download_audio(urls):
+    print("📺 Đang tải audio từ YouTube...")
+    temp_dir = Path("temp_yt")
+    temp_dir.mkdir(exist_ok=True)
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': 'temp_yt/%(id)s.%(ext)s',
+        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'wav', 'preferredquality': '192'}],
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        ydl.download(urls)
+    return temp_dir
+
+# Hàm tạo "Vân tay siêu cấp" (Centroid) từ giọng mẫu
+def get_centroid(ref_path, classifier):
+    print("🧬 Đang tạo vân tay mẫu (Centroid)...")
+    with AudioFile(ref_path) as f:
+        audio = f.read(f.frames)
+        sr = f.sample_rate
+
+    # Tạo biến thể: Gốc, Vang, Cao, Trầm để tăng độ phủ nhận diện
+    boards = [Pedalboard([]), Pedalboard([Reverb()]), Pedalboard([PitchShift(semitones=1)]), Pedalboard([PitchShift(semitones=-1)])]
+    embs = []
+    for b in boards:
+        aug = b(audio, sr)
+        t = torch.from_numpy(aug).to(DEVICE)
+        if t.ndim > 1: t = t.mean(0, keepdim=True)
+        else: t = t.unsqueeze(0)
+        with torch.no_grad():
+            embs.append(classifier.encode_batch(t).squeeze(0))
+    return torch.stack(embs).mean(0)
+
+# ==========================================
+# 3. QUY TRÌNH CHÍNH (MAIN)
+# ==========================================
+def run_tool():
+    # Khởi tạo thư mục
+    final_out = Path(OUTPUT_DIR)
+    final_out.mkdir(parents=True, exist_ok=True)
+    temp_chunks = Path("temp_chunks")
+    temp_chunks.mkdir(exist_ok=True)
+
+    # Load AI Models
+    print(f"🚀 Khởi động AI trên {DEVICE}...")
+    spk_model = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", run_opts={"device": DEVICE})
+    whisper = WhisperModel(WHISPER_CKPT, device=DEVICE, compute_type="float16" if DEVICE=="cuda" else "int8")
+    cos_sim = torch.nn.CosineSimilarity(dim=1)
+
+    # Bước 1: Lấy vân tay mẫu
+    if not os.path.exists(REF_FILE):
+        print(f"❌ Cảnh báo: Không tìm thấy file {REF_FILE}. Hãy chuẩn bị 1 file mẫu trước!")
+        return
+    centroid = get_centroid(REF_FILE, spk_model)
+
+    # Bước 2: Tải video từ YouTube
+    yt_temp_dir = download_audio(YOUTUBE_URLS)
+
+    # Bước 3: Cắt nhỏ audio dài thành các đoạn (chunks) dựa trên khoảng lặng
+    print("✂️ Đang cắt nhỏ audio dài thành các đoạn hội thoại...")
+    for audio_file in yt_temp_dir.glob("*.wav"):
+        sound = AudioSegment.from_wav(str(audio_file))
+        # Cắt theo khoảng lặng để tránh cắt giữa câu
+        chunks = silence.split_on_silence(sound, min_silence_len=MIN_SILENCE_LEN, silence_thresh=SILENCE_THRESH, keep_silence=200)
+        
+        for i, chunk in enumerate(chunks):
+            # Chỉ lấy các đoạn từ 3s đến 15s (chuẩn F5-TTS)
+            if 3000 <= len(chunk) <= 15000:
+                chunk.export(temp_chunks / f"{audio_file.stem}_c{i}.wav", format="wav")
+
+    # Bước 4: Lọc đúng giọng và Gỡ băng (Transcribe)
+    print(f"🔍 Bắt đầu lọc giọng và gỡ băng...")
+    chunk_files = list(temp_chunks.glob("*.wav"))
+    metadata = []
+
+    for c_path in tqdm(chunk_files):
+        try:
+            # So sánh vân tay
+            sig, fs = torchaudio.load(str(c_path))
+            if sig.shape[0] > 1: sig = sig.mean(0, keepdim=True)
+            with torch.no_grad():
+                emb = spk_model.encode_batch(sig.to(DEVICE))
+                score = cos_sim(centroid, emb[0]).item()
+
+            if score >= THRESHOLD:
+                # Nếu đúng giọng -> Transcribe
+                segs, _ = whisper.transcribe(str(c_path), language="vi")
+                text = " ".join([s.text for s in segs]).strip()
+                
+                if text:
+                    # Lưu kết quả cuối cùng
+                    shutil.move(str(c_path), final_out / c_path.name)
+                    with open(final_out / f"{c_path.stem}.txt", "w", encoding="utf-8") as tf:
+                        tf.write(text)
+                    metadata.append([c_path.name, text])
+        except:
+            continue
+
+    # Bước 5: Ghi file Metadata
+    with open(final_out / "metadata.csv", "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f, delimiter="|")
+        writer.writerows(metadata)
+
+    # Dọn dẹp rác
+    shutil.rmtree(yt_temp_dir)
+    shutil.rmtree(temp_chunks)
+    print(f"\n✨ XONG! Đã thu hoạch {len(metadata)} câu vào thư mục: {OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    run_tool()
+
+
+
+
+
+
+
+
+
+
+
+pip install audiomentations
+
+import os
+import librosa
+import soundfile as sf
+import numpy as np
+from audiomentations import Compose, TimeStretch, PitchShift, Gain
+
+# ==========================================
+# CẤU HÌNH AUGMENTATION
+# ==========================================
+INPUT_FILE = "mau_giong_chuan.wav"
+OUTPUT_FOLDER = "mau_giong_augmented"
+
+# Định nghĩa các kiểu biến đổi
+augmenter = Compose([
+    # 1. Thay đổi tốc độ (0.8 là chậm, 1.2 là nhanh)
+    TimeStretch(min_rate=0.8, max_rate=1.3, p=1.0), 
+    
+    # 2. Thay đổi cao độ (Pitch) một chút để đa dạng (đơn vị: semitones)
+    PitchShift(min_semitones=-1, max_semitones=1, p=0.5),
+    
+    # 3. Thay đổi âm lượng (Gain)
+    Gain(min_gain_db=-6, max_gain_db=6, p=0.5)
+])
+
+def augment_speaker_data(input_path, output_dir, num_variants=5):
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        
+    # Load audio gốc
+    y, sr = librosa.load(input_path, sr=None)
+    
+    print(f"🚀 Đang tạo {num_variants} phiên bản biến thể cho giọng mẫu...")
+    
+    # Lưu file gốc vào folder output trước
+    shutil_copy = shutil.copy2(input_path, os.path.join(output_dir, "original.wav"))
+
+    for i in range(num_variants):
+        # Thực hiện biến đổi
+        augmented_samples = augmenter(samples=y, sample_rate=sr)
+        
+        # Tạo tên file mới
+        out_name = f"variant_{i+1}.wav"
+        out_path = os.path.join(output_dir, out_name)
+        
+        # Lưu file
+        sf.write(out_path, augmented_samples, sr)
+        print(f"✅ Đã tạo: {out_name}")
+
+if __name__ == "__main__":
+    import shutil
+    augment_speaker_data(INPUT_FILE, OUTPUT_FOLDER, num_variants=10)
+
+
+# Thư viện xử lý Audio và AI
+pip install torch torchaudio 
+pip install speechbrain faster-whisper tqdm
+
+
+
+import os
+import shutil
+import csv
+import torch
+import torchaudio
+from speechbrain.inference.speaker import EncoderClassifier
+from faster_whisper import WhisperModel
+from tqdm import tqdm
+
+# ==========================================
+# CẤU HÌNH HỆ THỐNG
+# ==========================================
+# 1. Đường dẫn
+REF_AUDIO_PATH = "mau_giong_chuan.wav"       # File mẫu chuẩn
+INPUT_DIR = "data_tho"                       # Đầu vào (audio lộn xộn)
+OUTPUT_DIR = "dataset_f5tts"                 # Đầu ra (audio sạch)
+WHISPER_CKPT = "path/to/your/whisper_ckpt"   # Checkpoint Faster-Whisper của bạn
+METADATA_FILE = "metadata.csv"
+
+# 2. Tham số AI
+SIMILARITY_THRESHOLD = 0.75                  # Độ giống giọng mẫu (>0.75 là giữ)
+WHISPER_BEAM_SIZE = 5
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+COMPUTE_TYPE = "float16" if torch.cuda.is_available() else "int8"
+
+# ==========================================
+# KHỞI TẠO CÁC MODEL
+# ==========================================
+print(f"--- Đang khởi tạo hệ thống trên {DEVICE} ---")
+
+# Model Speaker Identification (SpeechBrain)
+spk_model = EncoderClassifier.from_hparams(
+    source="speechbrain/spkrec-ecapa-voxceleb", 
+    run_opts={"device": DEVICE}
+)
+
+# Model Faster-Whisper
+whisper_model = WhisperModel(WHISPER_CKPT, device=DEVICE, compute_type=COMPUTE_TYPE)
+
+cos_sim = torch.nn.CosineSimilarity(dim=1)
+
+# ==========================================
+# HÀM BỔ TRỢ
+# ==========================================
+def get_speaker_embedding(path):
+    signal, fs = torchaudio.load(path)
+    if signal.shape[0] > 1:
+        signal = torch.mean(signal, dim=0, keepdim=True)
+    return spk_model.encode_batch(signal.to(DEVICE))
+
+def main():
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+
+    # 1. Trích xuất đặc trưng giọng mẫu
+    print(f"⭐ Đang phân tích giọng mẫu: {REF_AUDIO_PATH}")
+    ref_emb = get_speaker_embedding(REF_AUDIO_PATH)
+
+    # 2. Quét thư mục đầu vào
+    audio_files = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith(('.wav', '.mp3', '.flac'))]
+    print(f"📂 Tìm thấy {len(audio_files)} file. Bắt đầu xử lý...")
+
+    # 3. Tiến hành Lọc và Gỡ băng
+    results = []
+    
+    for filename in tqdm(audio_files, desc="Processing"):
+        file_path = os.path.join(INPUT_DIR, filename)
+        
+        try:
+            # BƯỚC A: Kiểm tra danh tính người nói
+            curr_emb = get_speaker_embedding(file_path)
+            score = cos_sim(ref_emb[0], curr_emb[0]).item()
+
+            if score < SIMILARITY_THRESHOLD:
+                continue # Bỏ qua nếu không phải giọng người cần lấy
+
+            # BƯỚC B: Gỡ băng (Transcribe) bằng Faster-Whisper
+            segments, _ = whisper_model.transcribe(file_path, beam_size=WHISPER_BEAM_SIZE, language="vi")
+            text = "".join([s.text for s in segments]).strip()
+
+            if not text:
+                continue # Bỏ qua nếu không nghe được chữ nào
+
+            # BƯỚC C: Lưu kết quả
+            # Copy audio sang folder mới
+            target_path = os.path.join(OUTPUT_DIR, filename)
+            shutil.copy2(file_path, target_path)
+
+            # Lưu file txt riêng lẻ
+            txt_name = os.path.splitext(filename)[0] + ".txt"
+            with open(os.path.join(OUTPUT_DIR, txt_name), "w", encoding="utf-8") as f:
+                f.write(text)
+
+            # Lưu vào list để ghi CSV
+            results.append([filename, text])
+
+        except Exception as e:
+            print(f"\n❌ Lỗi tại file {filename}: {e}")
+
+    # 4. Ghi file Metadata tổng
+    with open(os.path.join(OUTPUT_DIR, METADATA_FILE), "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f, delimiter="|")
+        writer.writerows(results)
+
+    print(f"\n✅ HOÀN TẤT! Đã thu hoạch được {len(results)} mẫu sạch.")
+    print(f"📍 Kết quả nằm trong: {OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
 import torch
 from transformers import MambaForCausalLM, AutoTokenizer, TrainingArguments, Trainer
 from datasets import load_dataset
