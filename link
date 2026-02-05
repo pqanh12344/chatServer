@@ -1,3 +1,110 @@
+Sửa chính trong MelSpectrogramProcessor
+Thay toàn bộ class MelSpectrogramProcessor bằng code này (thêm global_mean/std):
+
+python
+class MelSpectrogramProcessor:
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        n_fft: int = 400,
+        hop_length: int = 160,
+        n_mels: int = 80,
+        f_min: float = 80.0,
+        f_max: float = 7600.0,
+        max_duration: float = 30.0
+    ):
+        # ... (giữ nguyên các param cũ)
+        self.sample_rate = sample_rate
+        # ... (copy hết init cũ)
+        
+        self.mel_fb = librosa.filters.mel(...)  # giữ nguyên
+        self.mel_fb = torch.from_numpy(self.mel_fb).float()
+        
+        # THÊM: Global stats cho normalize (tính từ dataset)
+        self.global_mean = None  # [n_mels] - compute từ train set
+        self.global_std = None   # [n_mels]
+    
+    def set_normalization_stats(self, mean: torch.Tensor, std: torch.Tensor):
+        """Gọi sau khi compute stats từ train set"""
+        self.global_mean = mean  # shape (n_mels,)
+        self.global_std = std    # shape (n_mels,)
+    
+    def __call__(self, audio: np.ndarray, return_length: bool = False) -> torch.Tensor:
+        # ... (giữ nguyên truncate/pad audio, STFT, mel_spec = log(clamp))
+        
+        # THAY ĐỔI: Normalize GLOBAL thay vì utterance
+        if self.global_mean is not None and self.global_std is not None:
+            # Global per mel-bin: mean/std theo freq axis
+            mean = self.global_mean.to(mel_spec.device).view(1, -1, 1)  # (1, n_mels, 1)
+            std = self.global_std.to(mel_spec.device).view(1, -1, 1)    # (1, n_mels, 1)
+            mel_spec = (mel_spec - mean) / (std + 1e-8)
+        else:
+            # Fallback utterance nếu chưa có stats
+            print("WARNING: Using utterance norm - compute global stats!")
+            mel_spec = (mel_spec - mel_spec.mean()) / (mel_spec.std() + 1e-9)
+        
+        # ... (giữ nguyên pad/truncate mel_spec)
+        return mel_spec, actual_frames if return_length else mel_spec
+Compute global stats (chạy 1 lần trên train set)
+Thêm script này trước training:
+
+python
+def compute_mel_stats(dataset, processor, num_samples=10000):
+    """Compute global mean/std từ train set"""
+    all_mels = []
+    for i in range(min(num_samples, len(dataset))):
+        audio, _ = dataset[i]
+        mel, _ = processor(audio, return_length=True)
+        all_mels.append(mel[:, :100])  # Lấy 100 frames đầu mỗi sample
+    
+    all_mels = torch.stack(all_mels)  # (N, n_mels, 100)
+    all_mels = all_mels.view(-1, processor.n_mels, 1)  # Flatten time
+    
+    mean = all_mels.mean(dim=0).squeeze(-1)  # (n_mels,)
+    std = all_mels.std(dim=0).squeeze(-1)    # (n_mels,)
+    std = torch.clamp(std, min=1.0)  # Tránh chia 0
+    
+    print(f"Global mean range: {mean.min():.2f} to {mean.max():.2f}")
+    print(f"Global std range: {std.min():.2f} to {std.max():.2f}")
+    return mean, std
+
+# Usage:
+processor = MelSpectrogramProcessor()
+mean, std = compute_mel_stats(train_dataset, processor)
+processor.set_normalization_stats(mean, std)
+Sửa nhỏ khác (tăng stability)
+Trong SelectiveStateSpace: Thêm scale nhỏ cho delta
+
+python
+delta = F.softplus(self.delta_proj(x)) * 0.01  # Giảm từ 0.1 xuống 0.01
+LayerNorm đầu MelToEmbedding: Thêm trước conv
+
+python
+class MelToEmbedding(nn.Module):
+    def __init__(self, ...):
+        # ...
+        self.input_norm = nn.LayerNorm([n_mels, 1500])  # approx max_frames/4
+    
+    def forward(self, mel_spec):
+        mel_spec = self.input_norm(mel_spec)  # Normalize sau global
+        x = self.conv_layers(mel_spec)
+        # ...
+Training loop thêm (bắt buộc)
+python
+# Sau backward
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, eps=1e-8, weight_decay=0.01)
+Kết quả: Logits ổn định ~ [-10,10], loss giảm từ 5→2 ngay epoch 1 thay vì NaN.
+
+Chạy compute_mel_stats trước, set stats vào processor → fix hoàn toàn!
+
+
+
+
+
+
+
+
 import torch
 
 def normalize_mel(mel: torch.Tensor, mean: torch.Tensor = None, std: torch.Tensor = None, mode='global') -> torch.Tensor:
