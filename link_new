@@ -1,3 +1,16 @@
+Đây là danh sách 50 cặp Subcategory-Keyword viết liền mạch trên một hàng, phân cách bằng dấu phẩy theo đúng yêu cầu của bạn:
+
+Đây là 50 cặp Subcategory-Keyword về Học sâu, tất cả nằm trên cùng một hàng và cách nhau bởi dấu phẩy:
+
+Mạng thần kinh-Perceptron đa lớp, Thị giác máy tính-Phân đoạn hình ảnh, Xử lý ngôn ngữ-Mô hình ngôn ngữ lớn, Mạng tích chập-Lớp lọc tích chập, Mạng hồi quy-Bộ nhớ dài ngắn, Học tăng cường-Thuật toán học quy, Mô hình tạo lập-Mạng đối nghịch, Kiến trúc chuyển đổi-Cơ chế tự chú ý, Tối ưu hóa-Thuật toán giảm đạo hàm, Hàm kích hoạt-Đơn vị chỉnh tuyến tính, Lan truyền ngược-Tính toán đạo hàm, Thư viện lập trình-Mã nguồn mở chuyên sâu, Khung làm việc-Đồ thị tính toán, Phần cứng-Bộ xử lý đồ họa, Tiền xử lý-Chuẩn hóa dữ liệu, Nhận diện khuôn mặt-Đặc điểm sinh trắc học, Xe tự hành-Cảm biến laze, Phân tích cảm xúc-Phân loại văn bản, Dịch máy-Chuyển đổi ngôn ngữ, Nhận diện giọng nói-Văn bản hóa âm thanh, Y tế thông minh-Ảnh chụp y khoa, Hệ thống gợi ý-Lọc cộng tác, Nén mô hình-Kỹ thuật cắt tỉa, Học chuyển tiếp-Tri thức học sẵn, Quá khớp-Kỹ thuật loại bỏ, Gán nhãn-Dữ liệu đầu vào, Tạo hình ảnh-Khuếch tán dữ liệu, Phát hiện vật thể-Xác định vị trí, Dữ liệu lớn-Tập hợp hình ảnh, Đạo đức máy tính-Định kiến thuật toán, Tài chính-Dự báo chứng khoán, Trợ lý ảo-Đối thoại tự động, An ninh mạng-Phát hiện xâm nhập, Tham số-Điều chỉnh cấu hình, Hàm mất mát-Sai số bình quân, Học không giám sát-Mã hóa tự động, Phân tích video-Nhận diện hành động, Trí tuệ di động-Tối ưu dung lượng, Xử lý âm thanh-Phân loại nhạc, Trí tuệ biên-Thiết bị đầu cuối, Giải thích mô hình-Độ minh bạch, Điện toán đám mây-Máy chủ ảo, Người máy-Cánh tay tự hành, Đồ thị mạng-Liên kết dữ liệu, Nông nghiệp-Sâu bệnh lá cây, Khoa học dữ liệu-Quy trình đào tạo, Chuỗi thời gian-Dự báo thời tiết, Nghiên cứu thuốc-Cấu trúc phân tử, Trò chơi-Trí tuệ nhân tạo, Tương lai-Trí tuệ tổng quát
+
+
+
+
+
+
+
+
 #!/usr/bin/env python3
 """
 PRODUCTION ASR PLATFORM - COMPLETE IMPLEMENTATION
