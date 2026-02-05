@@ -1,4 +1,28 @@
 import torch
+
+def normalize_mel(mel: torch.Tensor, mean: torch.Tensor = None, std: torch.Tensor = None, mode='global') -> torch.Tensor:
+    # mel: [B, n_mels, T], log-scale đã có
+    if mode == 'utterance':
+        mean_u = mel.mean(dim=-1, keepdim=True)
+        std_u = mel.std(dim=-1, keepdim=True)
+        return (mel - mean_u) / (std_u + 1e-5)
+    elif mode == 'global':
+        assert mean is not None and std is not None  # Pre-computed [n_mels]
+        mean = mean.to(mel.device).view(1, -1, 1)
+        std = std.to(mel.device).view(1, -1, 1)
+        return (mel - mean) / (std + 1e-8)
+    return mel
+
+# Usage: mel_spec = log_mel(...)  # raw log
+norm_mel = normalize_mel(mel_spec, mean=global_mean, std=global_std)
+logits = model(norm_mel, token)  # Đưa norm_mel vào embedding
+
+
+
+
+
+
+import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
