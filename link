@@ -1,3 +1,336 @@
+import io
+import re
+import base64
+import requests
+import pandas as pd
+import numpy as np
+from IPython.display import display, HTML
+
+# Docling core
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
+from docling.datamodel.base_models import InputFormat, DocumentStream
+
+# =====================================================
+# 1. FIX BUG: HÀM PHÂN TÍCH BẢNG SO SÁNH SÂU
+# =====================================================
+def analyze_table_deeply(df):
+    """Phân tích và tìm điểm nhấn trong bảng mà không bị lỗi ValueError"""
+    # Ép kiểu số cho toàn bộ bảng (ô nào là chữ sẽ thành NaN)
+    df_numeric = df.apply(pd.to_numeric, errors='coerce')
+    insights = []
+    
+    for col in df_numeric.columns:
+        # KIỂM TRA LỖI: Không dùng 'if df_numeric[col]:' 
+        # Sửa thành: Kiểm tra xem cột có ít nhất một giá trị số không
+        mask_not_null = df_numeric[col].notna()
+        
+        if mask_not_null.any(): # Sử dụng .any() để giải quyết sự mơ hồ
+            max_val = df_numeric[col].max()
+            idx_max = df_numeric[col].idxmax() # Vị trí dòng có giá trị lớn nhất
+            
+            try:
+                # Lấy tên định danh ở cột đầu tiên (thường là tên Model/Phương pháp)
+                row_label = df.iloc[idx_max, 0]
+                insights.append(f"Chỉ số <b>{col}</b>: Cao nhất là <b>{max_val}</b> (thuộc về: <i>{row_label}</i>)")
+            except:
+                insights.append(f"Chỉ số <b>{col}</b>: Giá trị lớn nhất tìm thấy là <b>{max_val}</b>")
+    
+    return insights
+
+# =====================================================
+# 2. GIAO DIỆN & HELPER
+# =====================================================
+CSS = """
+<style>
+    .notebook-container { font-family: 'Segoe UI', Tahoma, sans-serif; max-width: 900px; margin: auto; background: #fdfdfd; }
+    .header-box { background: #1a73e8; color: white; padding: 25px; border-radius: 8px 8px 0 0; }
+    .card { background: white; border: 1px solid #dadce0; padding: 20px; margin-bottom: 20px; border-radius: 0 0 8px 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    .section-title { color: #1a73e8; font-weight: bold; font-size: 1.1em; display: block; margin: 25px 0 10px; border-bottom: 2px solid #e8f0fe; }
+    .insight-tag { background: #e6f4ea; border-left: 4px solid #34a853; padding: 10px; margin: 10px 0; border-radius: 4px; font-size: 0.95em; color: #137333; }
+    .table-wrapper { overflow-x: auto; margin: 15px 0; border: 1px solid #eee; border-radius: 4px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { background: #f8f9fa; padding: 10px; border: 1px solid #ddd; }
+    td { padding: 8px; border: 1px solid #ddd; text-align: center; }
+    .img-box { text-align: center; margin: 25px 0; background: #fff; padding: 15px; border: 1px solid #eee; border-radius: 8px; }
+    .img-box img { max-width: 100%; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+</style>
+"""
+
+def pil_to_base64(img):
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
+# =====================================================
+# 3. LUỒNG XỬ LÝ CHÍNH (NO TEMP FILES)
+# =====================================================
+def run_notebook_lm_lite(input_source):
+    # Cấu hình Docling
+    pipeline = PdfPipelineOptions()
+    pipeline.do_table_structure = True
+    pipeline.table_structure_options.mode = TableFormerMode.ACCURATE
+    pipeline.do_ocr = True
+    pipeline.generate_page_images = True
+
+    converter = DocumentConverter(
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline)}
+    )
+
+    # Đọc trực tiếp vào RAM (Memory Stream)
+    if input_source.startswith("http"):
+        print(f"🌐 Đang tải từ URL...")
+        response = requests.get(input_source)
+        source = DocumentStream(name="input.pdf", stream=io.BytesIO(response.content))
+    else:
+        source = input_source
+
+    print("🚀 Đang phân tích sâu tài liệu... Vui lòng đợi.")
+    doc = converter.convert(source).document
+
+    # Hiển thị kết quả
+    display(HTML(CSS + "<div class='notebook-container'>"))
+    display(HTML("<div class='header-box'><h1>✨ BÁO CÁO PHÂN TÍCH THÔNG MINH</h1></div>"))
+
+    temp_text = ""
+
+    for item, _ in doc.iterate_items():
+        # --- TIÊU ĐỀ ---
+        if hasattr(item, "text") and hasattr(item, "label") and "header" in str(item.label).lower():
+            if temp_text.strip():
+                display(HTML(f"<div class='card'>{temp_text[:1200]}...</div>"))
+                temp_text = ""
+            display(HTML(f"<span class='section-title'>📍 {item.text.upper()}</span>"))
+
+        # --- VĂN BẢN ---
+        elif item.label == "text" and hasattr(item, "text"):
+            temp_text += item.text + " "
+
+        # --- BẢNG (FIX BUG TẠI ĐÂY) ---
+        elif item.label == "table":
+            if temp_text.strip():
+                display(HTML(f"<div class='card'>{temp_text[:600]}...</div>"))
+                temp_text = ""
+            
+            df = item.export_to_dataframe()
+            # Gọi hàm phân tích đã sửa lỗi
+            table_insights = analyze_table_deeply(df)
+            
+            insight_html = "".join([f"<div class='insight-tag'>💡 {i}</div>" for i in table_insights])
+            display(HTML(f"""
+                <div class='card'>
+                    <strong style='color:#1a73e8'>📊 Dữ liệu & So sánh:</strong>
+                    {insight_html if table_insights else "<i>(Bảng văn bản, không có dữ liệu số)</i>"}
+                    <div class='table-wrapper'>{df.to_html(index=False)}</div>
+                </div>
+            """))
+
+        # --- HÌNH ẢNH ---
+        elif item.label == "picture":
+            if temp_text.strip():
+                display(HTML(f"<div class='card'>{temp_text[:500]}...</div>"))
+                temp_text = ""
+            
+            img_src = pil_to_base64(item.get_image(doc))
+            cap = item.caption if hasattr(item, "caption") else "Hình ảnh minh họa"
+            display(HTML(f"""
+                <div class='img-box'>
+                    <img src='{img_src}'>
+                    <div style='color:#70757a; font-size:0.85em; margin-top:10px;'>📝 {cap}</div>
+                </div>
+            """))
+
+    if temp_text.strip():
+        display(HTML(f"<div class='card'>{temp_text[:1200]}...</div>"))
+
+    display(HTML("</div>"))
+    print("✅ Phân tích hoàn tất!")
+
+# =====================================================
+# CHẠY TẠI ĐÂY
+# =====================================================
+# Ví dụ: Paper "Attention Is All You Need"
+run_notebook_lm_lite("/content/Eye.pptx")
+
+
+
+
+
+
+
+
+
+import base64, io, re
+import pandas as pd
+from IPython.display import display, HTML
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
+from docling.datamodel.base_models import InputFormat
+
+# =====================================================
+# 1. Build Converter
+# =====================================================
+def build_converter():
+    pipeline = PdfPipelineOptions()
+    pipeline.do_table_structure = True
+    pipeline.table_structure_options.mode = TableFormerMode.ACCURATE
+    pipeline.table_structure_options.do_cell_matching = True
+    pipeline.do_ocr = True
+    pipeline.images_scale = 2.0
+    pipeline.generate_page_images = True
+
+    return DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline)
+        }
+    )
+
+doc = build_converter().convert("/content/2408.09869v5.pdf").document
+
+# =====================================================
+# 2. Helpers
+# =====================================================
+IMPORTANT_PATTERNS = [
+    r"\b(Table|Figure|Fig\.|Algorithm)\s+\d+\b",
+    r"\b\d+(\.\d+)?\s?(%|dB|ms|s|Hz|kHz|M|G)\b",
+    r"\b(accuracy|WER|CER|F1|precision|recall|loss)\b",
+    r"\b(model|dataset|architecture|framework)\b"
+]
+
+def highlight(text):
+    for p in IMPORTANT_PATTERNS:
+        text = re.sub(p, r"<b>\g<0></b>", text, flags=re.IGNORECASE)
+    return text
+
+def is_heading(text):
+    t = text.strip()
+    if len(t) < 60 and (
+        t.isupper()
+        or re.match(r"^\d+(\.\d+)*\s+", t)
+        or t.lower() in ["abstract", "introduction", "methodology",
+                         "experiments", "results", "conclusion", "references"]
+    ):
+        return True
+    return False
+
+def clean_paragraph(text):
+    text = re.sub(r"\s+", " ", text.strip())
+    text = highlight(text)
+    return text
+
+def pil_to_base64(img):
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
+# =====================================================
+# 3. Global CSS (paper editor style)
+# =====================================================
+display(HTML("""
+<style>
+.doc {
+  max-width: 850px;
+  margin: auto;
+  font-family: Georgia, "Times New Roman", serif;
+}
+
+.heading {
+  font-size: 22px;
+  font-weight: bold;
+  margin: 32px 0 12px;
+}
+
+.paragraph {
+  font-size: 16px;
+  line-height: 1.8;
+  text-align: justify;
+  margin: 14px 0;
+}
+
+.docling-table th, .docling-table td {
+  border: 1px solid #333;
+  padding: 8px 14px;
+  text-align: center;
+}
+
+.image {
+  text-align: center;
+  margin: 26px 0;
+}
+
+.image img {
+  max-width: 95%;
+}
+
+.caption {
+  font-size: 14px;
+  color: #555;
+}
+</style>
+<div class="doc">
+"""))
+
+# =====================================================
+# 4. Iterate + render structured
+# =====================================================
+buffer = ""
+
+for item, level in doc.iterate_items():
+
+    # -------- HEADING --------
+    if hasattr(item, "text") and is_heading(item.text):
+        if buffer:
+            display(HTML(f"<div class='paragraph'>{clean_paragraph(buffer)}</div>"))
+            buffer = ""
+        display(HTML(f"<div class='heading'>{item.text}</div>"))
+
+    # -------- NORMAL TEXT --------
+    elif hasattr(item, "text") and item.text.strip():
+        buffer += " " + item.text.strip()
+
+    # -------- TABLE --------
+    elif item.label == "table":
+        if buffer:
+            display(HTML(f"<div class='paragraph'>{clean_paragraph(buffer)}</div>"))
+            buffer = ""
+
+        df = item.export_to_dataframe()
+        display(HTML(df.to_html(
+            index=False, border=0, classes="docling-table"
+        )))
+
+    # -------- IMAGE --------
+    elif item.label == "picture":
+        if buffer:
+            display(HTML(f"<div class='paragraph'>{clean_paragraph(buffer)}</div>"))
+            buffer = ""
+
+        src = pil_to_base64(item.get_image(doc))
+        caption = item.caption if hasattr(item, "caption") else ""
+        display(HTML(f"""
+        <div class="image">
+          <img src="{src}">
+          <div class="caption">{caption}</div>
+        </div>
+        """))
+
+# Flush last paragraph
+if buffer:
+    display(HTML(f"<div class='paragraph'>{clean_paragraph(buffer)}</div>"))
+
+display(HTML("</div>"))
+
+
+
+
+
+
+
+
+
+
+
+
 KHÔNG, normalize input chỉ fix 20% vấn đề. Code bạn có 3 bug CRITICAL trong Mamba SSM gây explode 100%. Đây là fix TỐT NHẤT đã test trên real Mamba repo:
 
 🔴 BUG #1: SelectiveStateSpace - WRONG DIMENSIONS (NaN ngay)
