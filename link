@@ -1,3 +1,154 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ============================================================
+# 1. CAUSAL CROSS ATTENTION (STEP-WISE, KHÔNG LEAK)
+# ============================================================
+
+class CausalCrossAttention(nn.Module):
+    """
+    Cross-attention cho decoder autoregressive
+    Query: (B, D) tại timestep t
+    Key/Value: encoder output (B, S, D)
+    """
+
+    def __init__(self, d_model: int, n_heads: int = 4):
+        super().__init__()
+        assert d_model % n_heads == 0
+
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x_t: torch.Tensor, encoder_out: torch.Tensor):
+        """
+        x_t: (B, D)         - decoder hidden tại timestep t
+        encoder_out: (B, S, D)
+        """
+
+        B, S, D = encoder_out.shape
+
+        # Project
+        Q = self.q_proj(x_t).view(B, self.n_heads, self.head_dim)          # (B, H, Dh)
+        K = self.k_proj(encoder_out).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        V = self.v_proj(encoder_out).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # Attention
+        scores = torch.matmul(Q.unsqueeze(2), K.transpose(-2, -1))
+        scores = scores / math.sqrt(self.head_dim)
+        attn = F.softmax(scores, dim=-1)
+
+        out = torch.matmul(attn, V).squeeze(2)  # (B, H, Dh)
+        out = out.reshape(B, D)
+
+        return self.out_proj(out)
+
+
+# ============================================================
+# 2. AUTOREGRESSIVE MAMBA DECODER (100% CAUSAL)
+# ============================================================
+
+class MambaDecoder(nn.Module):
+    """
+    Decoder dùng Mamba, autoregressive thật:
+    - Mỗi step chỉ nhận 1 token
+    - Không bao giờ thấy token tương lai
+    - Đúng tinh thần paper Mamba ASR
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 256,
+        n_layers: int = 4,
+        d_state: int = 16,
+        n_heads: int = 4,
+    ):
+        super().__init__()
+
+        self.embedding = nn.Embedding(vocab_size, d_model)
+
+        self.blocks = nn.ModuleList([
+            MambaBlock(
+                d_model=d_model,
+                d_state=d_state,
+                layer_idx=i
+            )
+            for i in range(n_layers)
+        ])
+
+        self.cross_attns = nn.ModuleList([
+            CausalCrossAttention(d_model, n_heads)
+            for _ in range(n_layers)
+        ])
+
+        self.norm = nn.LayerNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size)
+
+    def forward_step(
+        self,
+        token_t: torch.Tensor,
+        encoder_out: torch.Tensor,
+    ):
+        """
+        token_t: (B,)  token tại timestep t
+        encoder_out: (B, S, D)
+        """
+
+        # Embed token
+        x = self.embedding(token_t)  # (B, D)
+
+        # Mamba + Cross-attn
+        for block, cross_attn in zip(self.blocks, self.cross_attns):
+            x = block(x)                    # causal by design
+            x = x + cross_attn(x, encoder_out)
+
+        x = self.norm(x)
+        logits = self.lm_head(x)            # (B, vocab)
+
+        return logits
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        encoder_out: torch.Tensor,
+    ):
+        """
+        Teacher-forcing loop
+        tokens: (B, T)  -- input tokens (shifted)
+        """
+
+        B, T = tokens.shape
+        logits = []
+
+        for t in range(T):
+            logit_t = self.forward_step(tokens[:, t], encoder_out)
+            logits.append(logit_t.unsqueeze(1))
+
+        return torch.cat(logits, dim=1)  # (B, T, vocab)
+
+
+
+# tokens: <sos> y1 y2 ... y_{T-1}
+# targets: y1 y2 y3 ... y_T
+
+logits = decoder(tokens[:, :-1], encoder_out)
+
+loss = F.cross_entropy(
+    logits.reshape(-1, vocab_size),
+    targets[:, 1:].reshape(-1)
+)
+
+
+
+
+
 import io
 import re
 import base64
