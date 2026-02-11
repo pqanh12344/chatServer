@@ -1,3 +1,21 @@
+from torch.cuda.amp import autocast
+
+scaler = torch.cuda.amp.GradScaler() # Lưu ý: BF16 thường không cần Scaler, nhưng FP16 thì cần.
+
+for inputs, targets in dataloader:
+    optimizer.zero_grad()
+    
+    # Kích hoạt autocast cho BF16
+    with autocast(dtype=torch.bfloat16):
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+    
+    # Nếu là BF16, bạn có thể gọi thẳng loss.backward()
+    loss.backward()
+    optimizer.step()
+
+
+
 def forward(
         self,
         tgt,
