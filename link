@@ -1,3 +1,36 @@
+import torch
+import torchaudio
+from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
+
+model_name = "alefiury/wav2vec2-large-xlsr-53-gender-recognition-librispeech"
+
+feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
+model = AutoModelForAudioClassification.from_pretrained(model_name)
+
+# load audio
+waveform, sr = torchaudio.load("/content/1.wav")
+
+if sr != 16000:
+    waveform = torchaudio.functional.resample(waveform, sr, 16000)
+
+inputs = feature_extractor(
+    waveform.squeeze().numpy(),
+    sampling_rate=16000,
+    return_tensors="pt"
+)
+
+with torch.no_grad():
+    logits = model(**inputs).logits
+
+pred = torch.argmax(logits, dim=-1).item()
+print(model.config.id2label[pred])
+
+
+
+
+
+
+
 from torch.cuda.amp import autocast
 
 scaler = torch.cuda.amp.GradScaler() # Lưu ý: BF16 thường không cần Scaler, nhưng FP16 thì cần.
