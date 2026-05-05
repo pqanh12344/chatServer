@@ -1,3 +1,268 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from torch_geometric.data import Data
+from torch_geometric.loader import LinkNeighborLoader
+from torch_geometric.nn import GATConv
+from torch_geometric.utils import degree
+
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import f1_score
+
+# ======================
+# 1. LOAD DATA
+# ======================
+df = pd.read_csv("HI-Small_Trans.csv")
+acc_df = pd.read_csv("HI-Small_accounts.csv")
+
+# ======================
+# 2. PREPROCESS
+# ======================
+df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+df = df.sort_values('Timestamp')
+
+df['hour'] = df['Timestamp'].dt.hour
+df['weekday'] = df['Timestamp'].dt.weekday
+df['log_amount'] = np.log1p(df['Amount Paid'])
+
+# behavior features
+mean_amt = df.groupby('Account')['log_amount'].transform('mean')
+std_amt  = df.groupby('Account')['log_amount'].transform('std')
+df['zscore_amt'] = (df['log_amount'] - mean_amt) / (std_amt + 1e-6)
+
+df['time_diff'] = df.groupby('Account')['Timestamp'].diff().dt.total_seconds().fillna(0)
+
+# encode currency
+le_cur = LabelEncoder()
+df['currency_enc'] = le_cur.fit_transform(df['Payment Currency'])
+
+# ======================
+# 3. NODE MAPPING
+# ======================
+all_accounts = pd.concat([df['Account'], df['Account.1']]).unique()
+id_map = {acc: i for i, acc in enumerate(all_accounts)}
+num_nodes = len(id_map)
+
+# ======================
+# 4. EDGE INDEX
+# ======================
+src = df['Account'].map(id_map).values
+dst = df['Account.1'].map(id_map).values
+edge_index = torch.tensor([src, dst], dtype=torch.long)
+
+# ======================
+# 5. EDGE FEATURES
+# ======================
+edge_features = [
+    'log_amount', 'hour', 'weekday',
+    'zscore_amt', 'time_diff', 'currency_enc'
+]
+
+edge_attr = torch.tensor(df[edge_features].values, dtype=torch.float)
+edge_attr = (edge_attr - edge_attr.mean(0)) / edge_attr.std(0)
+
+# ======================
+# 6. EDGE LABEL
+# ======================
+y = torch.tensor(df['Is Laundering'].values, dtype=torch.float)
+
+# ======================
+# 7. NODE FEATURES
+# ======================
+in_deg = degree(edge_index[1], num_nodes=num_nodes)
+out_deg = degree(edge_index[0], num_nodes=num_nodes)
+
+le_bank = LabelEncoder()
+acc_df['Bank ID'] = le_bank.fit_transform(acc_df['Bank ID'])
+bank_map = dict(zip(acc_df['Account Number'], acc_df['Bank ID']))
+
+total_sent = df.groupby('Account')['Amount Paid'].sum().to_dict()
+
+x = torch.zeros((num_nodes, 4))
+
+for acc, idx in id_map.items():
+    x[idx] = torch.tensor([
+        bank_map.get(acc, 0),
+        in_deg[idx],
+        out_deg[idx],
+        total_sent.get(acc, 0)
+    ])
+
+x = (x - x.mean(0)) / x.std(0)
+
+# ======================
+# 8. BUILD GRAPH
+# ======================
+data = Data(
+    x=x,
+    edge_index=edge_index,
+    edge_attr=edge_attr
+)
+
+# ======================
+# 9. TEMPORAL SPLIT
+# ======================
+num_edges = edge_index.shape[1]
+
+train_end = int(0.7 * num_edges)
+val_end   = int(0.85 * num_edges)
+
+train_edge_index = edge_index[:, :train_end]
+val_edge_index   = edge_index[:, train_end:val_end]
+test_edge_index  = edge_index[:, val_end:]
+
+train_y = y[:train_end]
+val_y   = y[train_end:val_end]
+test_y  = y[val_end:]
+
+# ======================
+# 10. DATALOADER
+# ======================
+train_loader = LinkNeighborLoader(
+    data,
+    num_neighbors=[15, 10],
+    batch_size=1024,
+    edge_label_index=train_edge_index,
+    edge_label=train_y,
+)
+
+val_loader = LinkNeighborLoader(
+    data,
+    num_neighbors=[15, 10],
+    batch_size=1024,
+    edge_label_index=val_edge_index,
+    edge_label=val_y,
+)
+
+test_loader = LinkNeighborLoader(
+    data,
+    num_neighbors=[15, 10],
+    batch_size=1024,
+    edge_label_index=test_edge_index,
+    edge_label=test_y,
+)
+
+# ======================
+# 11. MODEL
+# ======================
+class EdgeGAT(torch.nn.Module):
+    def __init__(self, in_dim, hidden_dim):
+        super().__init__()
+        self.gat1 = GATConv(in_dim, hidden_dim)
+        self.gat2 = GATConv(hidden_dim, hidden_dim)
+        self.lin = torch.nn.Linear(hidden_dim * 2, 1)
+
+    def forward(self, x, edge_index):
+        h = F.relu(self.gat1(x, edge_index))
+        h = F.relu(self.gat2(h, edge_index))
+        return h
+
+model = EdgeGAT(x.shape[1], 64)
+
+# ======================
+# 12. TRAIN SETUP
+# ======================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+data = data.to(device)
+
+pos_weight = (len(y) - y.sum()) / y.sum()
+criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
+optimizer = torch.optim.Adam(model.parameters(), lr=0.003)
+
+# ======================
+# 13. TRAIN FUNCTION
+# ======================
+def train():
+    model.train()
+    total_loss = 0
+
+    for batch in train_loader:
+        batch = batch.to(device)
+        optimizer.zero_grad()
+
+        h = model(batch.x, batch.edge_index)
+
+        src, dst = batch.edge_label_index
+        edge_feat = torch.cat([h[src], h[dst]], dim=1)
+
+        logits = model.lin(edge_feat).squeeze()
+
+        loss = criterion(logits, batch.edge_label)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss
+
+# ======================
+# 14. EVAL FUNCTION
+# ======================
+def evaluate(loader):
+    model.eval()
+    all_pred, all_y = [], []
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+
+            h = model(batch.x, batch.edge_index)
+            src, dst = batch.edge_label_index
+
+            edge_feat = torch.cat([h[src], h[dst]], dim=1)
+            logits = model.lin(edge_feat).squeeze()
+
+            prob = torch.sigmoid(logits)
+            pred = (prob > 0.05).float()
+
+            all_pred.append(pred.cpu())
+            all_y.append(batch.edge_label.cpu())
+
+    all_pred = torch.cat(all_pred)
+    all_y = torch.cat(all_y)
+
+    return f1_score(all_y, all_pred, zero_division=0)
+
+# ======================
+# 15. TRAIN LOOP + EARLY STOP
+# ======================
+best_val = 0
+patience = 5
+counter = 0
+
+for epoch in range(30):
+    loss = train()
+    val_f1 = evaluate(val_loader)
+
+    print(f"Epoch {epoch} | Loss {loss:.4f} | Val F1 {val_f1:.4f}")
+
+    if val_f1 > best_val:
+        best_val = val_f1
+        counter = 0
+        torch.save(model.state_dict(), "best_model.pt")
+    else:
+        counter += 1
+        if counter >= patience:
+            print("Early stopping")
+            break
+
+# ======================
+# 16. TEST
+# ======================
+model.load_state_dict(torch.load("best_model.pt"))
+test_f1 = evaluate(test_loader)
+
+print("Test F1:", test_f1)
+
+
+
+
+
+
+
 https://arxiv.org/pdf/2604.02899
 https://dl.acm.org/doi/epdf/10.1145/3768292.3770410
 https://arxiv.org/pdf/2601.21446
