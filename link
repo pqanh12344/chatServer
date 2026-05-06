@@ -218,6 +218,372 @@ print(classification_report(ts_y, (ts_probs > ckpt['thresh']).float(), digits=4)
 
 
 
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch_geometric.data import Data
+from torch_geometric.loader import LinkNeighborLoader
+from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import degree
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import f1_score, precision_recall_curve, classification_report
+
+# =============================================================================
+# 1. TIỀN XỬ LÝ DỮ LIỆU & CHUẨN HÓA
+# =============================================================================
+df = pd.read_csv("HI-Small_Trans.csv")
+acc_df = pd.read_csv("HI-Small_accounts.csv")
+
+df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+df = df.sort_values('Timestamp')
+
+# Feature Engineering
+df['out_port'] = df.groupby('Account').cumcount()
+df['in_port'] = df.groupby('Account.1').cumcount()
+df['log_amount'] = np.log1p(df['Amount Paid'])
+df['hour'] = df['Timestamp'].dt.hour
+df['time_diff'] = df.groupby('Account')['Timestamp'].diff().dt.total_seconds().fillna(0)
+
+le_cur = LabelEncoder()
+df['currency_enc'] = le_cur.fit_transform(df['Payment Currency'])
+
+# Mapping
+all_accounts = pd.unique(df[['Account', 'Account.1']].values.ravel())
+id_map = {acc: i for i, acc in enumerate(all_accounts)}
+num_nodes = len(id_map)
+
+# Norm Edge Features
+edge_features = ['log_amount', 'hour', 'time_diff', 'currency_enc', 'out_port', 'in_port']
+scaler_edge = StandardScaler()
+edge_attr = torch.tensor(scaler_edge.fit_transform(df[edge_features].values), dtype=torch.float)
+
+edge_index = torch.tensor(np.vstack([df['Account'].map(id_map).values, 
+                                     df['Account.1'].map(id_map).values]), dtype=torch.long)
+y = torch.tensor(df['Is Laundering'].values, dtype=torch.float)
+
+# Norm Node Features
+in_deg = degree(edge_index[1], num_nodes=num_nodes)
+out_deg = degree(edge_index[0], num_nodes=num_nodes)
+le_bank = LabelEncoder()
+acc_df['Bank ID'] = le_bank.fit_transform(acc_df['Bank ID'])
+bank_map = dict(zip(acc_df['Account Number'], acc_df['Bank ID']))
+
+x_list = [[bank_map.get(acc, -1), in_deg[idx].item(), out_deg[idx].item()] for acc, idx in id_map.items()]
+scaler_node = StandardScaler()
+x = torch.tensor(scaler_node.fit_transform(x_list), dtype=torch.float)
+
+data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
+
+# =============================================================================
+# 2. CHIA DỮ LIỆU & DATALOADER
+# =============================================================================
+num_edges = edge_index.shape[1]
+train_idx = torch.arange(0, int(0.7 * num_edges))
+val_idx = torch.arange(int(0.7 * num_edges), int(0.85 * num_edges))
+test_idx = torch.arange(int(0.85 * num_edges), num_edges)
+
+loader_kwargs = {'num_neighbors': [20, 10], 'batch_size': 512}
+train_loader = LinkNeighborLoader(data, edge_label_index=edge_index[:, train_idx], 
+                                  edge_label=y[train_idx], shuffle=True, **loader_kwargs)
+val_loader = LinkNeighborLoader(data, edge_label_index=edge_index[:, val_idx], 
+                                edge_label=y[val_idx], shuffle=False, **loader_kwargs)
+test_loader = LinkNeighborLoader(data, edge_label_index=edge_index[:, test_idx], 
+                                 edge_label=y[test_idx], shuffle=False, **loader_kwargs)
+
+# =============================================================================
+# 3. KIẾN TRÚC MÔ HÌNH (MESSAGE PASSING)
+# =============================================================================
+class FraudMPNNLayer(MessagePassing):
+    def __init__(self, node_in, edge_in, hidden_dim):
+        super().__init__(aggr='add')
+        self.msg_mlp = torch.nn.Sequential(
+            torch.nn.Linear(node_in * 2 + edge_in, hidden_dim),
+            torch.nn.BatchNorm1d(hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.update_mlp = torch.nn.Sequential(
+            torch.nn.Linear(node_in + hidden_dim, hidden_dim),
+            torch.nn.ReLU()
+        )
+
+    def forward(self, x, edge_index, edge_attr):
+        return self.propagate(edge_index, x=x, edge_attr=edge_attr)
+
+    def message(self, x_i, x_j, edge_attr):
+        return self.msg_mlp(torch.cat([x_i, x_j, edge_attr], dim=-1))
+
+    def update(self, aggr_out, x):
+        return self.update_mlp(torch.cat([x, aggr_out], dim=-1))
+
+class AdvancedFraudGNN(torch.nn.Module):
+    def __init__(self, node_in, edge_in, hidden_dim):
+        super().__init__()
+        self.mp1_fwd = FraudMPNNLayer(node_in, edge_in, hidden_dim)
+        self.mp1_rev = FraudMPNNLayer(node_in, edge_in, hidden_dim)
+        self.mp2_fwd = FraudMPNNLayer(hidden_dim, edge_in, hidden_dim)
+        self.mp2_rev = FraudMPNNLayer(hidden_dim, edge_in, hidden_dim)
+
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim * 2 + edge_in, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.4),
+            torch.nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, x, edge_index, edge_attr, label_index, target_edge_attr):
+        # Reverse Message Passing
+        h1 = F.relu(self.mp1_fwd(x, edge_index, edge_attr) + 
+                    self.mp1_rev(x, edge_index[[1, 0]], edge_attr))
+        h2 = F.relu(self.mp2_fwd(h1, edge_index, edge_attr) + 
+                    self.mp2_rev(h1, edge_index[[1, 0]], edge_attr))
+
+        src, dst = label_index
+        combined = torch.cat([h2[src], h2[dst], target_edge_attr], dim=1)
+        return self.classifier(combined).squeeze()
+
+# =============================================================================
+# 4. HUẤN LUYỆN VỚI BCE LOSS & POS_WEIGHT
+# =============================================================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = AdvancedFraudGNN(node_in=4, edge_in=6, hidden_dim=64).to(device)
+
+# Tính toán trọng số cho lớp 1 (Fraud) dựa trên tập huấn luyện
+# Thường là: (số mẫu 0 / số mẫu 1)
+pos_count = y[train_idx].sum().item()
+neg_count = len(train_idx) - pos_count
+weight_val = neg_count / (pos_count + 1e-8)
+# Dùng 0.25 * weight_val là một trick để không làm Recall bị "vọt" quá cao gây loãng Precision
+pos_weight = torch.tensor([weight_val * 0.25]).to(device)
+
+criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+
+def run_epoch(loader, is_train=True):
+    model.train() if is_train else model.eval()
+    all_probs, all_labels = [], []
+    total_loss = 0
+    
+    for batch in loader:
+        batch = batch.to(device)
+        
+        # Ego-ID
+        ego_id = torch.zeros((batch.x.size(0), 1), device=device)
+        target_nodes = batch.edge_label_index.unique()
+        ego_id[target_nodes] = 1.0
+        x_with_ego = torch.cat([batch.x, ego_id], dim=-1)
+
+        if is_train: optimizer.zero_grad()
+        
+        target_edge_attr = batch.edge_attr[:batch.edge_label.size(0)]
+        out = model(x_with_ego, batch.edge_index, batch.edge_attr, 
+                    batch.edge_label_index, target_edge_attr)
+        
+        loss = criterion(out, batch.edge_label)
+        
+        if is_train:
+            loss.backward()
+            optimizer.step()
+            
+        total_loss += loss.item()
+        all_probs.append(torch.sigmoid(out).detach().cpu())
+        all_labels.append(batch.edge_label.cpu())
+        
+    return total_loss/len(loader), torch.cat(all_probs), torch.cat(all_labels)
+
+# =============================================================================
+# 5. LOOP CHÍNH
+# =============================================================================
+best_f1 = 0
+final_thresh = 0.5
+
+for epoch in range(20):
+    train_loss, _, _ = run_epoch(train_loader, is_train=True)
+    val_probs, val_y = run_epoch(val_loader, is_train=False)
+    
+    # Threshold Tuning
+    prec, rec, thresholds = precision_recall_curve(val_y, val_probs)
+    f1_scores = 2 * (prec * rec) / (prec + rec + 1e-8)
+    max_f1 = np.max(f1_scores)
+    best_thresh = thresholds[np.argmax(f1_scores)]
+    
+    print(f"Epoch {epoch:02d} | Loss: {train_loss:.4f} | Val F1: {max_f1:.4f} | Thresh: {best_thresh:.4f}")
+    
+    if max_f1 > best_f1:
+        best_f1 = max_f1
+        final_thresh = best_thresh
+        torch.save({'state': model.state_dict(), 'thresh': final_thresh}, "model_bce.pt")
+
+# Test
+ckpt = torch.load("model_bce.pt")
+model.load_state_dict(ckpt['state'])
+_, test_probs, test_y = run_epoch(test_loader, is_train=False)
+print("\n--- TEST REPORT (BCE) ---")
+print(classification_report(test_y, (test_probs > ckpt['thresh']).float(), digits=4))
+
+
+
+
+
+
+import pandas as pd
+import numpy as np
+import torch
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from torch_geometric.data import Data
+from torch_geometric.utils import degree
+
+# ======================
+# SAFE SCALE FUNCTION
+# ======================
+def safe_scale(x):
+    x = np.array(x, dtype=np.float32)
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+    scaler = StandardScaler()
+    x = scaler.fit_transform(x)
+
+    # cứu cháy lần cuối
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    return x
+
+# ======================
+# LOAD DATA
+# ======================
+df = pd.read_csv("/content/HI-Small_Trans.csv")
+acc_df = pd.read_csv("/content/HI-Small_accounts.csv")
+
+# ======================
+# CLEAN BASIC
+# ======================
+df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
+df = df.dropna(subset=['Timestamp'])
+
+df['Amount Paid'] = pd.to_numeric(df['Amount Paid'], errors='coerce')
+df['Amount Paid'] = df['Amount Paid'].fillna(0)
+
+# tránh log NaN
+df['Amount Paid'] = df['Amount Paid'].clip(lower=0)
+
+df['Payment Currency'] = df['Payment Currency'].astype(str).fillna('UNK')
+df['Is Laundering'] = df['Is Laundering'].fillna(0)
+
+df = df.sort_values('Timestamp')
+
+# ======================
+# PORT NUMBERING
+# ======================
+df['out_port'] = df.groupby('Account').cumcount()
+df['in_port'] = df.groupby('Account.1').cumcount()
+
+# ======================
+# FEATURE ENGINEERING
+# ======================
+df['hour'] = df['Timestamp'].dt.hour
+df['weekday'] = df['Timestamp'].dt.weekday
+
+df['log_amount'] = np.log1p(df['Amount Paid'])
+
+df['time_diff'] = df.groupby('Account')['Timestamp'].diff().dt.total_seconds()
+df['time_diff'] = df['time_diff'].fillna(0)
+
+# encode currency
+le_cur = LabelEncoder()
+df['currency_enc'] = le_cur.fit_transform(df['Payment Currency'])
+
+# ======================
+# NODE MAPPING
+# ======================
+df = df.dropna(subset=['Account', 'Account.1'])
+
+all_accounts = pd.unique(df[['Account', 'Account.1']].values.ravel())
+id_map = {acc: i for i, acc in enumerate(all_accounts)}
+num_nodes = len(id_map)
+
+# ======================
+# EDGE FEATURES
+# ======================
+edge_features = [
+    'log_amount', 'hour', 'weekday',
+    'time_diff', 'currency_enc',
+    'out_port', 'in_port'
+]
+
+edge_df = df[edge_features].astype(float)
+
+# drop cột constant (tránh std=0)
+edge_df = edge_df.loc[:, edge_df.nunique() > 1]
+
+edge_attr = torch.tensor(safe_scale(edge_df.values), dtype=torch.float)
+
+# ======================
+# EDGE INDEX
+# ======================
+src = df['Account'].map(id_map)
+dst = df['Account.1'].map(id_map)
+
+mask = src.notna() & dst.notna()
+
+edge_index = torch.tensor(
+    np.vstack([src[mask].astype(int).values,
+               dst[mask].astype(int).values]),
+    dtype=torch.long
+)
+
+# ======================
+# LABEL
+# ======================
+y = torch.tensor(df.loc[mask, 'Is Laundering'].values, dtype=torch.float)
+
+# ======================
+# NODE FEATURES
+# ======================
+in_deg = degree(edge_index[1], num_nodes=num_nodes)
+out_deg = degree(edge_index[0], num_nodes=num_nodes)
+
+# bank
+acc_df['Bank ID'] = acc_df['Bank ID'].astype(str)
+le_bank = LabelEncoder()
+acc_df['Bank ID'] = le_bank.fit_transform(acc_df['Bank ID'])
+
+bank_map = dict(zip(acc_df['Account Number'], acc_df['Bank ID']))
+
+x_list = []
+for acc, idx in id_map.items():
+    bank = bank_map.get(acc, np.nan)
+    x_list.append([
+        bank,
+        in_deg[idx].item(),
+        out_deg[idx].item()
+    ])
+
+x_df = pd.DataFrame(x_list, columns=['bank', 'in_deg', 'out_deg'])
+
+# fill missing bank
+x_df['bank'] = x_df['bank'].fillna(x_df['bank'].median())
+
+# drop constant
+x_df = x_df.loc[:, x_df.nunique() > 1]
+
+x = torch.tensor(safe_scale(x_df.values), dtype=torch.float)
+
+# ======================
+# FINAL DATA
+# ======================
+data = Data(
+    x=x,
+    edge_index=edge_index,
+    edge_attr=edge_attr,
+    y=y
+)
+
+print("✅ DONE - No NaN guaranteed")
+print(data)
+
+
+
+
 
 
 
