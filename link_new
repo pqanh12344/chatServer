@@ -1,3 +1,910 @@
+import os
+import pandas as pd
+import numpy as np
+
+import torch
+import torch.nn.functional as F
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+from torch_geometric.data import Data
+from torch_geometric.loader import LinkNeighborLoader
+from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import degree
+
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import (
+    f1_score,
+    precision_recall_curve,
+    classification_report
+)
+
+from tqdm import tqdm
+
+# =========================================================
+# PERFORMANCE
+# =========================================================
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
+
+# =========================================================
+# DDP SETUP
+# =========================================================
+
+def setup(rank, world_size):
+
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+
+    dist.init_process_group(
+        backend='nccl',
+        rank=rank,
+        world_size=world_size
+    )
+
+    torch.cuda.set_device(rank)
+
+
+def cleanup():
+    dist.destroy_process_group()
+
+
+# =========================================================
+# LOAD DATA
+# =========================================================
+
+def load_data():
+
+    df = pd.read_csv("/content/HI-Small_Trans.csv")
+    acc_df = pd.read_csv("/content/HI-Small_accounts.csv")
+
+    df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+    df = df.sort_values('Timestamp')
+
+    # -----------------------------------------------------
+    # BASIC FEATURES
+    # -----------------------------------------------------
+
+    df['log_amount'] = np.log1p(df['Amount Paid'])
+
+    df['hour'] = df['Timestamp'].dt.hour
+    df['weekday'] = df['Timestamp'].dt.weekday
+
+    df['time_diff'] = (
+        df.groupby('Account')['Timestamp']
+        .diff()
+        .dt.total_seconds()
+        .fillna(0)
+    )
+
+    # -----------------------------------------------------
+    # PORT NUMBERING
+    # -----------------------------------------------------
+
+    df['out_port'] = df.groupby('Account').cumcount()
+    df['in_port'] = df.groupby('Account.1').cumcount()
+
+    # -----------------------------------------------------
+    # ENCODING
+    # -----------------------------------------------------
+
+    e_cur = LabelEncoder()
+
+    df['currency_enc'] = e_cur.fit_transform(
+        df['Payment Currency']
+    )
+
+    # -----------------------------------------------------
+    # NODE MAPPING
+    # -----------------------------------------------------
+
+    all_accounts = pd.unique(
+        df[['Account', 'Account.1']]
+        .values
+        .ravel()
+    )
+
+    id_map = {
+        acc: i
+        for i, acc in enumerate(all_accounts)
+    }
+
+    num_nodes = len(id_map)
+
+    # -----------------------------------------------------
+    # EDGE FEATURES
+    # -----------------------------------------------------
+
+    edge_features = [
+        'log_amount',
+        'hour',
+        'weekday',
+        'time_diff',
+        'currency_enc',
+        'out_port',
+        'in_port'
+    ]
+
+    scaler_edge = StandardScaler()
+
+    edge_attr = torch.tensor(
+        scaler_edge.fit_transform(
+            df[edge_features].values
+        ),
+        dtype=torch.float
+    )
+
+    # -----------------------------------------------------
+    # EDGE INDEX
+    # -----------------------------------------------------
+
+    edge_index = torch.tensor(
+        np.vstack([
+            df['Account'].map(id_map).values,
+            df['Account.1'].map(id_map).values
+        ]),
+        dtype=torch.long
+    )
+
+    # -----------------------------------------------------
+    # LABELS
+    # -----------------------------------------------------
+
+    y = torch.tensor(
+        df['Is Laundering'].values,
+        dtype=torch.float
+    )
+
+    # -----------------------------------------------------
+    # NODE FEATURES
+    # -----------------------------------------------------
+
+    in_deg = degree(
+        edge_index[1],
+        num_nodes=num_nodes
+    )
+
+    out_deg = degree(
+        edge_index[0],
+        num_nodes=num_nodes
+    )
+
+    le_bank = LabelEncoder()
+
+    acc_df['Bank ID'] = le_bank.fit_transform(
+        acc_df['Bank ID']
+    )
+
+    bank_map = dict(
+        zip(
+            acc_df['Account Number'],
+            acc_df['Bank ID']
+        )
+    )
+
+    x_list = []
+
+    for acc, idx in id_map.items():
+
+        x_list.append([
+            bank_map.get(acc, -1),
+            in_deg[idx].item(),
+            out_deg[idx].item()
+        ])
+
+    scaler_node = StandardScaler()
+
+    x = torch.tensor(
+        scaler_node.fit_transform(x_list),
+        dtype=torch.float
+    )
+
+    # -----------------------------------------------------
+    # GRAPH DATA
+    # -----------------------------------------------------
+
+    data = Data(
+        x=x,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        y=y
+    )
+
+    return data
+
+
+# =========================================================
+# MODEL
+# =========================================================
+
+class MultiPNALayer(MessagePassing):
+
+    def __init__(
+        self,
+        node_in,
+        edge_in,
+        hidden_dim,
+        avg_deg
+    ):
+
+        super().__init__(aggr=None)
+
+        self.avg_deg = avg_deg
+
+        self.msg_mlp = torch.nn.Sequential(
+
+            torch.nn.Linear(
+                node_in * 2 + edge_in,
+                hidden_dim
+            ),
+
+            torch.nn.ReLU(),
+
+            torch.nn.Linear(
+                hidden_dim,
+                hidden_dim
+            )
+        )
+
+        self.post_mlp = torch.nn.Sequential(
+
+            torch.nn.Linear(
+                hidden_dim * 12 + node_in,
+                hidden_dim
+            ),
+
+            torch.nn.ReLU(),
+
+            torch.nn.Linear(
+                hidden_dim,
+                hidden_dim
+            )
+        )
+
+    def forward(
+        self,
+        x,
+        edge_index,
+        edge_attr
+    ):
+
+        deg = degree(
+            edge_index[1],
+            x.size(0),
+            dtype=x.dtype
+        ).view(-1, 1)
+
+        return self.propagate(
+            edge_index,
+            x=x,
+            edge_attr=edge_attr,
+            deg=deg
+        )
+
+    def message(
+        self,
+        x_i,
+        x_j,
+        edge_attr
+    ):
+
+        return self.msg_mlp(
+            torch.cat([
+                x_i,
+                x_j,
+                edge_attr
+            ], dim=-1)
+        )
+
+    def aggregate(
+        self,
+        inputs,
+        index,
+        deg=None
+    ):
+
+        count = deg.clamp(min=1)
+
+        mean = (
+            torch.zeros(
+                deg.size(0),
+                inputs.size(1),
+                device=inputs.device
+            )
+            .index_add_(0, index, inputs)
+            / count
+        )
+
+        max_v = torch.zeros_like(mean)
+
+        max_v.index_reduce_(
+            0,
+            index,
+            inputs,
+            reduce='amax'
+        )
+
+        min_v = torch.zeros_like(mean)
+
+        min_v.index_reduce_(
+            0,
+            index,
+            inputs,
+            reduce='amin'
+        )
+
+        sq = (
+            torch.zeros_like(mean)
+            .index_add_(0, index, inputs**2)
+            / count
+        )
+
+        std = torch.sqrt(
+            (sq - mean**2).clamp(min=1e-6)
+        )
+
+        stack = torch.cat([
+            mean,
+            max_v,
+            min_v,
+            std
+        ], dim=-1)
+
+        scaler = (
+            torch.log(deg + 1)
+            /
+            np.log(self.avg_deg + 1)
+        )
+
+        return torch.cat([
+            stack,
+            stack * scaler,
+            stack / scaler.clamp(min=0.1)
+        ], dim=-1)
+
+    def update(
+        self,
+        aggr_out,
+        x
+    ):
+
+        return self.post_mlp(
+            torch.cat([
+                x,
+                aggr_out
+            ], dim=-1)
+        )
+
+
+class AdvancedPNA_AML(torch.nn.Module):
+
+    def __init__(
+        self,
+        node_in,
+        edge_in,
+        hidden_dim,
+        avg_deg
+    ):
+
+        super().__init__()
+
+        self.fwd1 = MultiPNALayer(
+            node_in,
+            edge_in,
+            hidden_dim,
+            avg_deg
+        )
+
+        self.rev1 = MultiPNALayer(
+            node_in,
+            edge_in,
+            hidden_dim,
+            avg_deg
+        )
+
+        self.fwd2 = MultiPNALayer(
+            hidden_dim,
+            edge_in,
+            hidden_dim,
+            avg_deg
+        )
+
+        self.rev2 = MultiPNALayer(
+            hidden_dim,
+            edge_in,
+            hidden_dim,
+            avg_deg
+        )
+
+        self.fusion = torch.nn.Sequential(
+
+            torch.nn.Linear(
+                hidden_dim * 2,
+                hidden_dim
+            ),
+
+            torch.nn.ReLU()
+        )
+
+        self.classifier = torch.nn.Sequential(
+
+            torch.nn.Linear(
+                hidden_dim * 2 + edge_in,
+                hidden_dim
+            ),
+
+            torch.nn.ReLU(),
+
+            torch.nn.Dropout(0.3),
+
+            torch.nn.Linear(
+                hidden_dim,
+                1
+            )
+        )
+
+    def forward(
+        self,
+        x,
+        edge_index,
+        edge_attr,
+        label_index,
+        target_edge_attr
+    ):
+
+        h_fwd = self.fwd1(
+            x,
+            edge_index,
+            edge_attr
+        )
+
+        h_rev = self.rev1(
+            x,
+            edge_index.flip(0),
+            edge_attr
+        )
+
+        h = self.fusion(
+            torch.cat([
+                h_fwd,
+                h_rev
+            ], dim=-1)
+        )
+
+        h_fwd = self.fwd2(
+            h,
+            edge_index,
+            edge_attr
+        )
+
+        h_rev = self.rev2(
+            h,
+            edge_index.flip(0),
+            edge_attr
+        )
+
+        h = self.fusion(
+            torch.cat([
+                h_fwd,
+                h_rev
+            ], dim=-1)
+        )
+
+        src, dst = label_index
+
+        edge_rep = torch.cat([
+            h[src],
+            h[dst],
+            target_edge_attr
+        ], dim=-1)
+
+        return self.classifier(
+            edge_rep
+        ).squeeze()
+
+
+# =========================================================
+# EGO IDs
+# =========================================================
+
+def inject_ego_ids(batch):
+
+    num_nodes = batch.x.size(0)
+
+    ego_src = torch.zeros(
+        (num_nodes, 1),
+        device=batch.x.device
+    )
+
+    ego_dst = torch.zeros(
+        (num_nodes, 1),
+        device=batch.x.device
+    )
+
+    src_nodes = batch.edge_label_index[0]
+    dst_nodes = batch.edge_label_index[1]
+
+    ego_src[src_nodes] = 1.0
+    ego_dst[dst_nodes] = 1.0
+
+    return torch.cat([
+        batch.x,
+        ego_src,
+        ego_dst
+    ], dim=-1)
+
+
+def get_target_edge_attr(batch):
+
+    num_target = batch.edge_label.size(0)
+
+    return batch.edge_attr[:num_target]
+
+
+# =========================================================
+# TRAIN LOOP
+# =========================================================
+
+def run_epoch(
+    model,
+    loader,
+    optimizer,
+    criterion,
+    scaler,
+    device,
+    is_train=True
+):
+
+    if is_train:
+        model.train()
+    else:
+        model.eval()
+
+    total_loss = 0
+
+    all_probs = []
+    all_labels = []
+
+    context = (
+        torch.enable_grad()
+        if is_train
+        else torch.no_grad()
+    )
+
+    with context:
+
+        for batch in tqdm(loader):
+
+            batch = batch.to(device)
+
+            x_with_ego = inject_ego_ids(batch)
+
+            target_edge_attr = get_target_edge_attr(batch)
+
+            with torch.cuda.amp.autocast():
+
+                out = model(
+                    x_with_ego,
+                    batch.edge_index,
+                    batch.edge_attr,
+                    batch.edge_label_index,
+                    target_edge_attr
+                )
+
+                loss = criterion(
+                    out,
+                    batch.edge_label
+                )
+
+            if is_train:
+
+                optimizer.zero_grad()
+
+                scaler.scale(loss).backward()
+
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    1.0
+                )
+
+                scaler.step(optimizer)
+
+                scaler.update()
+
+            total_loss += loss.item()
+
+            probs = torch.sigmoid(out)
+
+            all_probs.append(
+                probs.detach().cpu()
+            )
+
+            all_labels.append(
+                batch.edge_label.detach().cpu()
+            )
+
+    avg_loss = total_loss / len(loader)
+
+    probs = torch.cat(all_probs)
+    labels = torch.cat(all_labels)
+
+    return avg_loss, probs, labels
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main(rank, world_size):
+
+    setup(rank, world_size)
+
+    device = torch.device(f'cuda:{rank}')
+
+    # -----------------------------------------------------
+    # LOAD GRAPH
+    # -----------------------------------------------------
+
+    data = load_data()
+
+    edge_index = data.edge_index
+    y = data.y
+
+    num_edges = edge_index.shape[1]
+
+    train_idx = torch.arange(
+        0,
+        int(0.6 * num_edges)
+    )
+
+    val_idx = torch.arange(
+        int(0.6 * num_edges),
+        int(0.8 * num_edges)
+    )
+
+    test_idx = torch.arange(
+        int(0.8 * num_edges),
+        num_edges
+    )
+
+    # -----------------------------------------------------
+    # SPLIT FOR EACH GPU
+    # -----------------------------------------------------
+
+    train_idx = train_idx.chunk(world_size)[rank]
+    val_idx = val_idx.chunk(world_size)[rank]
+    test_idx = test_idx.chunk(world_size)[rank]
+
+    # -----------------------------------------------------
+    # LOADERS
+    # -----------------------------------------------------
+
+    loader_kwargs = {
+        'num_neighbors': [25, 15],
+        'batch_size': 512,
+        'num_workers': 4,
+        'persistent_workers': True,
+        'pin_memory': True
+    }
+
+    train_loader = LinkNeighborLoader(
+        data,
+        edge_label_index=edge_index[:, train_idx],
+        edge_label=y[train_idx],
+        shuffle=True,
+        **loader_kwargs
+    )
+
+    val_loader = LinkNeighborLoader(
+        data,
+        edge_label_index=edge_index[:, val_idx],
+        edge_label=y[val_idx],
+        shuffle=False,
+        **loader_kwargs
+    )
+
+    test_loader = LinkNeighborLoader(
+        data,
+        edge_label_index=edge_index[:, test_idx],
+        edge_label=y[test_idx],
+        shuffle=False,
+        **loader_kwargs
+    )
+
+    # -----------------------------------------------------
+    # MODEL
+    # -----------------------------------------------------
+
+    avg_deg = degree(
+        edge_index[1, train_idx],
+        data.num_nodes
+    ).mean().item()
+
+    NODE_DIM = data.x.size(1) + 2
+
+    model = AdvancedPNA_AML(
+        node_in=NODE_DIM,
+        edge_in=data.edge_attr.size(1),
+        hidden_dim=64,
+        avg_deg=avg_deg
+    ).to(device)
+
+    model = DDP(
+        model,
+        device_ids=[rank],
+        output_device=rank
+    )
+
+    # -----------------------------------------------------
+    # LOSS
+    # -----------------------------------------------------
+
+    weight_val = (
+        (len(train_idx) - y[train_idx].sum())
+        /
+        (y[train_idx].sum() + 1e-8)
+    )
+
+    criterion = torch.nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor(
+            [weight_val * 0.25]
+        ).to(device)
+    )
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=3e-4
+    )
+
+    scaler = torch.cuda.amp.GradScaler()
+
+    # -----------------------------------------------------
+    # TRAIN
+    # -----------------------------------------------------
+
+    best_f1 = 0
+
+    for epoch in range(20):
+
+        train_loss, _, _ = run_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            scaler,
+            device,
+            is_train=True
+        )
+
+        val_loss, v_probs, v_y = run_epoch(
+            model,
+            val_loader,
+            optimizer,
+            criterion,
+            scaler,
+            device,
+            is_train=False
+        )
+
+        prec, rec, thresholds = precision_recall_curve(
+            v_y.numpy(),
+            v_probs.numpy()
+        )
+
+        f1_scores = (
+            2 * prec * rec
+            /
+            (prec + rec + 1e-8)
+        )
+
+        best_idx = np.argmax(f1_scores)
+
+        max_f1 = f1_scores[best_idx]
+
+        best_thresh = (
+            thresholds[best_idx]
+            if best_idx < len(thresholds)
+            else 0.5
+        )
+
+        if rank == 0:
+
+            print(
+                f"Epoch {epoch:02d} | "
+                f"Train Loss: {train_loss:.4f} | "
+                f"Val F1: {max_f1:.4f}"
+            )
+
+        if max_f1 > best_f1:
+
+            best_f1 = max_f1
+
+            if rank == 0:
+
+                torch.save({
+
+                    'state':
+                    model.module.state_dict(),
+
+                    'thresh':
+                    best_thresh
+
+                }, "best_pna.pt")
+
+    # -----------------------------------------------------
+    # TEST
+    # -----------------------------------------------------
+
+    if rank == 0:
+
+        ckpt = torch.load("best_pna.pt")
+
+        model.module.load_state_dict(
+            ckpt['state']
+        )
+
+        test_loss, ts_probs, ts_y = run_epoch(
+            model,
+            test_loader,
+            optimizer,
+            criterion,
+            scaler,
+            device,
+            is_train=False
+        )
+
+        preds = (
+            ts_probs > ckpt['thresh']
+        ).float()
+
+        print("\n--- FINAL TEST REPORT ---")
+
+        print(
+            classification_report(
+                ts_y.numpy(),
+                preds.numpy(),
+                digits=4
+            )
+        )
+
+    cleanup()
+
+
+# =========================================================
+# ENTRY
+# =========================================================
+
+if __name__ == "__main__":
+
+    world_size = torch.cuda.device_count()
+
+    print(f"Using {world_size} GPUs")
+
+    mp.spawn(
+        main,
+        args=(world_size,),
+        nprocs=world_size,
+        join=True
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import pandas as pd
 import numpy as np
 import torch
