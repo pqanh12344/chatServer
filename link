@@ -1,3 +1,665 @@
+import os
+import torch
+os.environ['TORCH'] = torch.__version__
+print(torch.__version__)
+
+!pip install pyg-lib -f https://data.pyg.org/whl/torch-${TORCH}.html
+!pip install git+https://github.com/pyg-team/pytorch_geometric.git
+
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from torch_geometric.data import Data
+from torch_geometric.loader import LinkNeighborLoader
+from torch_geometric.nn import PNAConv, BatchNorm
+from torch_geometric.utils import degree
+
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import f1_score, precision_recall_curve, classification_report
+from tqdm import tqdm
+
+df = pd.read_csv("/content/HI-Small_Trans.csv")
+acc_df = pd.read_csv("/content/HI-Small_accounts.csv")
+
+df['log_amount'] = np.log1p(df['Amount Paid'])
+df['hour'] = df['Timestamp'].dt.hour
+df['weekday'] = df['Timestamp'].dt.weekday
+df['time_diff'] = df.groupby('Account')['Timestamp'].diff().dt.total_seconds().fillna(0)
+e_cur = LabelEncoder()
+df['currency_enc'] = e_cur.fit_transform(df['Payment Currency'])
+
+all_accounts = pd.unique(df[['Account', 'Account.1']].values.ravel())
+id_map = {acc: i for i, acc in enumerate(all_accounts)}
+num_nodes = len(id_map)
+
+edge_features = ['log_amount', 'hour', 'weekday', 'time_diff', 'currency_enc']
+scaler_edge = StandardScaler()
+edge_attr = torch.tensor(scaler_edge.fit_transform(df[edge_features].values), dtype=torch.float)
+
+edge_index = torch.tensor(np.vstack([df['Account'].map(id_map).values,
+                                     df['Account.1'].map(id_map).values]), dtype=torch.long)
+y = torch.tensor(df['Is Laundering'].values, dtype=torch.float)
+
+def compute_port_numbering(edge_index, timestamp):
+    row, col = edge_index
+    E = row.size(0)
+
+    in_order = torch.argsort(col * (timestamp.max() + 1) + timestamp)
+    in_port = torch.empty(E, dtype=torch.long)
+    sorted_col = col[in_order]
+    unique_nodes, counts = torch.unique_consecutive(sorted_col, return_counts=True)
+
+    start = 0
+    for c in tqdm(counts):
+        in_port[in_order[start:start + c]] = torch.arange(c)
+        start += c
+
+    out_order = torch.argsort(row * (timestamp.max() + 1) + timestamp)
+    out_port = torch.empty(E, dtype=torch.long)
+    sorted_row = row[out_order]
+    unique_nodes, counts = torch.unique_consecutive(sorted_row, return_counts=True)
+
+    start = 0
+    for c in tqdm(counts):
+        out_port[out_order[start:start + c]] = torch.arange(c)
+        start += c
+
+    return in_port, out_port
+
+df['ts_enc'] = df['Timestamp'].astype('int64') // 10**9
+timestamp = torch.tensor(df['ts_enc'].values, dtype=torch.long)
+in_port, out_port = compute_port_numbering(edge_index, timestamp)
+
+in_deg = degree(edge_index[1], num_nodes=num_nodes)
+out_deg = degree(edge_index[0], num_nodes=num_nodes)
+le_bank = LabelEncoder()
+acc_df['Bank ID'] = le_bank.fit_transform(acc_df['Bank ID'])
+bank_map = dict(zip(acc_df['Account Number'], acc_df['Bank ID']))
+
+x_list = [[bank_map.get(acc, -1), in_deg[idx].item(), out_deg[idx].item()] for acc, idx in id_map.items()]
+scaler_node = StandardScaler()
+x = torch.tensor(scaler_node.fit_transform(x_list), dtype=torch.float)
+
+port_feat = torch.stack([in_port, out_port], dim=1).float()
+edge_attr = torch.cat([edge_attr, torch.tensor(scaler_edge.fit_transform(port_feat), dtype=torch.float)], dim=-1)
+
+data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
+
+df['delta_t'] = (
+    df.groupby('Account')['Timestamp']
+      .diff()
+      .dt.total_seconds()
+      .fillna(0)
+)
+
+df['td_short'] = df['delta_t']
+df['td_log'] = np.log1p(df['delta_t'])
+df['td_sqrt'] = np.sqrt(df['delta_t'] + 1)
+
+all_accounts = pd.unique(df[['Account', 'Account.1']].values.ravel())
+id_map = {acc: i for i, acc in enumerate(all_accounts)}
+num_nodes = len(id_map)
+
+src = df['Account'].map(id_map).values
+dst = df['Account.1'].map(id_map).values
+
+df['ts'] = (
+    df['Timestamp']
+      .astype(np.int64) // 10**9
+)
+
+def sinusoidal_encoding(timestamps, d_pos=16):
+    timestamps = np.array(timestamps)
+    pe = np.zeros((len(timestamps), d_pos))
+    for k in range(d_pos // 2):
+        div_term = 10000 ** (2 * k / d_pos)
+        pe[:, 2 * k] = np.sin(
+            timestamps / div_term
+        )
+
+        pe[:, 2 * k + 1] = np.cos(
+            timestamps / div_term
+        )
+    return pe
+
+periodic_feat = sinusoidal_encoding(
+    df['ts'].values,
+    d_pos=16
+)
+
+delta_feat = df[['delta_t']].values
+multi_scale_feat = df[['td_short', 'td_log', 'td_sqrt']].values
+
+delta_feat = StandardScaler().fit_transform(delta_feat)
+multi_scale_feat = StandardScaler().fit_transform(multi_scale_feat)
+periodic_feat = StandardScaler().fit_transform(periodic_feat)
+
+delta_feat = torch.tensor(delta_feat, dtype=torch.float)
+multi_scale_feat = torch.tensor(multi_scale_feat, dtype=torch.float)
+periodic_feat = torch.tensor(periodic_feat, dtype=torch.float)
+
+data = Data(
+    x=x,
+    edge_index=edge_index,
+    edge_attr=edge_attr,
+    y=y,
+    delta_feat=delta_feat,
+    multi_scale_feat=multi_scale_feat,
+    periodic_feat=periodic_feat
+)
+
+train_idx = torch.arange(0, int(0.6 * data.edge_index.shape[1]))
+val_idx = torch.arange(int(0.6 * data.edge_index.shape[1]), int(0.8 * data.edge_index.shape[1]))
+test_idx  = torch.arange(int(0.8 * data.edge_index.shape[1]), int(data.edge_index.shape[1]))
+
+
+# Tính histogram trên tập train để tránh data leakage
+row, _ = data.edge_index[:, train_idx]
+deg = torch.bincount(row, minlength=data.num_nodes)
+deg_hist = torch.bincount(deg).to(torch.float)
+
+loader_kwargs = {'batch_size': 1024, 'num_neighbors': [20, 10], 'num_workers': 2, 'pin_memory': True}
+train_loader = LinkNeighborLoader(data, edge_label_index=data.edge_index[:, train_idx],
+                                 edge_label=data.y[train_idx], shuffle=True, **loader_kwargs)
+val_loader = LinkNeighborLoader(data, edge_label_index=data.edge_index[:, val_idx],
+                                edge_label=data.y[val_idx], shuffle=False, **loader_kwargs)
+test_loader = LinkNeighborLoader(data, edge_label_index=data.edge_index[:, test_idx],
+                                edge_label=data.y[test_idx], shuffle=False, **loader_kwargs)
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.5, gamma=2):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        pt = torch.exp(-BCE_loss)
+        F_loss = self.alpha * (1 - pt)**self.gamma * BCE_loss
+        return F_loss.mean()
+
+class EdgeAttention(nn.Module):
+    def __init__(self, hidden):
+        super().__init__()
+        self.mlp = nn.Linear(hidden*2, 1)
+
+    def forward(self, h_src, h_dst):
+        w = torch.sigmoid(self.mlp(torch.cat([h_src, h_dst], dim=-1)))
+        return w*h_src + (1-w)*h_dst
+
+class ReversePNAFull(nn.Module):
+    def __init__(self, in_dim, edge_dim, hidden_dim, deg):
+        super().__init__()
+        # Thêm 'std' để bắt các giao dịch bất thường
+        aggr = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+
+        self.node_proj = nn.Linear(in_dim, hidden_dim)
+        self.edge_proj = nn.Linear(edge_dim, hidden_dim)
+
+        self.conv = PNAConv(
+            in_channels=hidden_dim, out_channels=hidden_dim,
+            aggregators=aggr, scalers=scalers, deg=deg,
+            edge_dim=hidden_dim, towers=2, # Tăng tower để học sâu hơn
+            pre_layers=1, post_layers=1, divide_input=False
+        )
+        self.norm = BatchNorm(hidden_dim)
+        self.act = nn.LeakyReLU(0.2)
+
+    def forward(self, x, edge_index, rev_edge_index, e_attr):
+        h = self.act(self.node_proj(x))
+        e = self.act(self.edge_proj(e_attr))
+
+        # Luồng thông tin 2 chiều: Quan trọng trong phát hiện rửa tiền
+        h_out = self.conv(h, edge_index, e)
+        h_in = self.conv(h, rev_edge_index, e)
+
+        return self.norm(h_out + h_in)
+
+class AMLModel(nn.Module):
+    def __init__(self, node_dim, edge_dim, hidden, deg):
+        super().__init__()
+
+        self.gnn1 = ReversePNAFull(node_dim, edge_dim, hidden, deg)
+        self.gnn2 = ReversePNAFull(hidden, edge_dim, hidden, deg)
+
+        self.att = EdgeAttention(hidden)
+
+        self.delta_proj = nn.Linear(1, hidden)
+        self.ms_proj = nn.Linear(3, hidden)
+
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(hidden*2 + edge_dim + hidden*2, hidden),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden, 1)
+        )
+
+    def forward(self, x, edge_index, edge_attr, label_idx, label_attr, delta, ms):
+
+        rev_idx = edge_index[[1,0]]
+
+        h = self.gnn1(x, edge_index, rev_idx, edge_attr)
+        h = self.gnn2(h, edge_index, rev_idx, edge_attr)
+
+        src, dst = label_idx
+
+        # ===== structure =====
+        h_edge = self.att(h[src], h[dst])
+
+        # ===== temporal =====
+        t1 = self.delta_proj(delta)
+        t2 = self.ms_proj(ms)
+        t = t1 + t2
+
+        edge_repr = torch.cat([
+            h_edge,
+            label_attr,
+            t
+        ], dim=-1)
+
+        return self.edge_mlp(edge_repr).squeeze(-1)
+
+class TemporalEmbedding(nn.Module):
+
+    def __init__(self, hidden_dim=64):
+        super().__init__()
+
+        self.delta_proj = nn.Linear(1, hidden_dim)
+        self.ms_proj = nn.Linear(3, hidden_dim)
+
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, delta, ms):
+
+        d = self.delta_proj(delta)
+        m = self.ms_proj(ms)
+
+        return self.fusion(torch.cat([d, m], dim=-1))
+
+
+# =========================================================
+# REVERSE PNA
+# =========================================================
+class ReversePNAFull(nn.Module):
+
+    def __init__(self, in_dim, edge_dim, hidden_dim, deg):
+        super().__init__()
+
+        self.node_proj = nn.Linear(in_dim, hidden_dim)
+        self.edge_proj = nn.Linear(edge_dim, hidden_dim)
+
+        self.conv = PNAConv(
+            in_channels=hidden_dim,
+            out_channels=hidden_dim,
+            aggregators=['mean', 'min', 'max', 'std'],
+            scalers=['identity', 'amplification', 'attenuation'],
+            deg=deg,
+            edge_dim=hidden_dim,
+            towers=2,
+            pre_layers=1,
+            post_layers=1,
+            divide_input=False
+        )
+
+        self.norm = BatchNorm(hidden_dim)
+        self.act = nn.LeakyReLU(0.2)
+
+    def forward(self, x, edge_index, rev_edge_index, edge_attr):
+
+        h = self.act(self.node_proj(x))
+        e = self.act(self.edge_proj(edge_attr))
+
+        h_out = self.conv(h, edge_index, e)
+        h_in = self.conv(h, rev_edge_index, e)
+
+        return self.norm(h_out + h_in)
+
+
+# =========================================================
+# EDGE ATTENTION
+# =========================================================
+class EdgeAttention(nn.Module):
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+
+        self.att = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, h_src, h_dst):
+
+        w = torch.sigmoid(
+            self.att(torch.cat([h_src, h_dst], dim=-1))
+        )
+
+        return w * h_src + (1 - w) * h_dst
+
+
+# =========================================================
+# AML MODEL
+# =========================================================
+class AMLModel(nn.Module):
+
+    def __init__(self, node_dim, edge_dim, hidden_dim, deg):
+        super().__init__()
+
+        # =====================
+        # GNN BACKBONE
+        # =====================
+        self.gnn1 = ReversePNAFull(
+            node_dim,
+            edge_dim,
+            hidden_dim,
+            deg
+        )
+
+        self.gnn2 = ReversePNAFull(
+            hidden_dim,
+            edge_dim,
+            hidden_dim,
+            deg
+        )
+
+        # =====================
+        # EDGE ATTENTION
+        # =====================
+        self.att = EdgeAttention(hidden_dim)
+
+        # =====================
+        # TEMPORAL
+        # =====================
+        self.temporal_encoder = TemporalEmbedding(hidden_dim)
+
+        # =====================
+        # EDGE CLASSIFIER
+        # =====================
+        #
+        # h_edge      = hidden
+        # temporal    = hidden
+        # edge_attr   = edge_dim
+        #
+        # TOTAL = hidden*2 + edge_dim
+        #
+        input_dim = hidden_dim * 2 + edge_dim
+
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+    def forward(
+        self,
+        x,
+        edge_index,
+        edge_attr,
+        label_idx,
+        label_attr,
+        delta,
+        ms
+    ):
+
+        rev_idx = edge_index[[1, 0]]
+
+        # =====================
+        # GNN
+        # =====================
+        h = self.gnn1(
+            x,
+            edge_index,
+            rev_idx,
+            edge_attr
+        )
+
+        h = self.gnn2(
+            h,
+            edge_index,
+            rev_idx,
+            edge_attr
+        )
+
+        src, dst = label_idx
+
+        # =====================
+        # EDGE ATTENTION
+        # =====================
+        h_edge = self.att(h[src], h[dst])
+
+        # =====================
+        # TEMPORAL EMBEDDING
+        # =====================
+        t_emb = self.temporal_encoder(delta, ms)
+
+        # =====================
+        # EDGE REPRESENTATION
+        # =====================
+        edge_repr = torch.cat([
+            h_edge,
+            t_emb,
+            label_attr
+        ], dim=-1)
+
+        # =====================
+        # CLASSIFICATION
+        # =====================
+        return self.edge_mlp(edge_repr).squeeze(-1)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+model = AMLModel(data.x.size(1)+1, data.edge_attr.size(1), 64, deg_hist).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+criterion = FocalLoss(alpha=0.75, gamma=2) # alpha > 0.5 để ưu tiên Recall cho Fraud
+
+def run_step(loader, is_train=True):
+
+    model.train() if is_train else model.eval()
+
+    total_loss = 0.0
+
+    all_probs = []
+    all_labels = []
+
+    context = (
+        torch.enable_grad()
+        if is_train
+        else torch.no_grad()
+    )
+
+    with context:
+
+        for batch in tqdm(
+            loader,
+            desc="Train" if is_train else "Eval"
+        ):
+
+            batch = batch.to(device)
+
+            # =====================================
+            # SAFE EGO FEATURE
+            # =====================================
+            ego_id = torch.zeros(
+                (batch.x.size(0), 1),
+                device=device
+            )
+
+            idx = batch.edge_label_index.view(-1).unique()
+            idx = idx[idx < batch.x.size(0)]
+
+            ego_id[idx] = 1.0
+
+            x_in = torch.cat([
+                batch.x,
+                ego_id
+            ], dim=-1)
+
+            # =====================================
+            # LABEL ALIGNMENT
+            # =====================================
+            label_idx = batch.edge_label_index
+
+            num_target = batch.edge_label.size(0)
+
+            label_attr = batch.edge_attr[:num_target]
+
+            delta = batch.delta_feat[:num_target]
+
+            ms = batch.multi_scale_feat[:num_target]
+
+            # =====================================
+            # FORWARD
+            # =====================================
+            out = model(
+                x_in,
+                batch.edge_index,
+                batch.edge_attr,
+                label_idx,
+                label_attr,
+                delta,
+                ms
+            )
+
+            loss = criterion(
+                out,
+                batch.edge_label.float()
+            )
+
+            # =====================================
+            # TRAIN
+            # =====================================
+            if is_train:
+
+                optimizer.zero_grad(set_to_none=True)
+
+                loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    1.0
+                )
+
+                optimizer.step()
+
+            else:
+
+                all_probs.append(
+                    torch.sigmoid(out).detach().cpu()
+                )
+
+                all_labels.append(
+                    batch.edge_label.detach().cpu()
+                )
+
+            total_loss += loss.item()
+
+            del batch
+
+    if not is_train:
+
+        return (
+            torch.cat(all_probs),
+            torch.cat(all_labels),
+            total_loss / len(loader)
+        )
+
+    return None, None, total_loss / len(loader)
+
+best_f1 = 0.0
+
+for epoch in range(1, 51):
+
+    # =====================
+    # TRAIN
+    # =====================
+    _, _, train_loss = run_step(
+        train_loader,
+        is_train=True
+    )
+
+    # =====================
+    # VALIDATE
+    # =====================
+    probs, labels, val_loss = run_step(
+        val_loader,
+        is_train=False
+    )
+
+    y_true = labels.numpy()
+    y_score = probs.numpy()
+
+    precision, recall, thresholds = precision_recall_curve(
+        y_true,
+        y_score
+    )
+
+    f1_scores = (
+        2 * precision * recall
+        / (precision + recall + 1e-8)
+    )
+
+    # remove invalid last point
+    f1_scores = f1_scores[:-1]
+
+    best_idx = np.argmax(f1_scores)
+
+    current_f1 = f1_scores[best_idx]
+
+    best_thresh = thresholds[best_idx]
+
+    print(
+        f"Epoch {epoch:02d} | "
+        f"Train Loss: {train_loss:.4f} | "
+        f"Val Loss: {val_loss:.4f} | "
+        f"F1: {current_f1:.4f}"
+    )
+
+    # =====================
+    # SAVE BEST
+    # =====================
+    if current_f1 > best_f1:
+
+        best_f1 = current_f1
+
+        torch.save(
+            {
+                'model': model.state_dict(),
+                'thresh': best_thresh
+            },
+            'best_model.pt'
+        )
+
+    torch.cuda.empty_cache()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import pandas as pd
 import numpy as np
 import torch
