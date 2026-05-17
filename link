@@ -1,3 +1,1517 @@
+!apt-get install git-lfs
+!pip install datatable
+!pip install pybind11
+
+
+cd /kaggle/input/datasets/qucanhphan/mega-gnn/
+
+!c++ -O3 -Wall -shared -std=c++17 -fPIC \
+$(python3.12 -m pybind11 --includes) \
+ports_cpp.cpp \
+-o ports_cpp$(python3.12-config --extension-suffix)
+
+!c++ -O3 -Wall -shared -std=c++17 -fPIC \
+$(python3.12 -m pybind11 --includes) \
+negative_sampling.cpp \
+-o negative_sampling$(python3.12-config --extension-suffix)
+
+import os
+import torch
+os.environ['TORCH'] = torch.__version__
+print(torch.__version__)
+
+!pip install pyg-lib -f https://data.pyg.org/whl/torch-${TORCH}.html
+!pip install git+https://github.com/pyg-team/pytorch_geometric.git
+!pip install torch_scatter -f https://data.pyg.org/whl/torch-${TORCH}.html
+
+import torch
+from torch_geometric.data import Data, HeteroData
+from torch_geometric.typing import OptTensor
+import numpy as np
+import multiprocessing as mp
+import pandas as pd
+import ports_cpp
+import pandas as pd
+import numpy as np
+import torch
+import logging
+import itertools
+from types import SimpleNamespace
+import torch
+import tqdm
+from torch_geometric.transforms import BaseTransform
+from typing import Union
+from torch_geometric.data import Data, HeteroData
+from torch_geometric.loader import LinkNeighborLoader
+from sklearn.metrics import f1_score
+import json
+import os
+import numpy as np
+import sklearn.metrics
+import negative_sampling
+from torch_geometric.transforms import BaseTransform
+from torch_geometric.utils import degree
+from torch_scatter import scatter
+import torch.nn as nn
+from torch_geometric.nn import GINEConv, BatchNorm, Linear, GATConv, PNAConv, RGCNConv, to_hetero
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+import torch.nn.functional as F
+# from genagg.MLPAutoencoder import MLPAutoencoder
+from tqdm import tqdm
+from sklearn.metrics import f1_score
+import json
+import os
+import numpy as np
+import sklearn.metrics
+from sklearn.metrics import f1_score, precision_recall_curve, classification_report
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch_geometric.utils import softmax
+import math
+scaler_edge = StandardScaler()
+
+def assign_ports_with_cpp(graph, process_batch=True):
+    if isinstance(graph, HeteroGraphData):
+        if process_batch:
+            '''
+                If we have a Hetero Graph then merge the edge indices of forward and reverse edges for consistent port_id assignment.
+            '''
+            edge_index = torch.cat([graph['node', 'to', 'node'].edge_index, graph['node', 'rev_to', 'node'].edge_index], dim=1)
+            timestamp = torch.cat([graph['node', 'to', 'node'].timestamps, graph['node', 'rev_to', 'node'].timestamps], dim=0)
+        else:
+            edge_index = graph['node', 'to', 'node'].edge_index
+            timestamp = graph['node', 'to', 'node'].timestamps
+    else:
+        edge_index = graph.edge_index
+        timestamp = graph.timestamps
+
+    edges = torch.cat([edge_index.T, timestamp.reshape((-1,1))], dim=1).numpy().astype('int')
+    ports_1, ports_2 = ports_cpp.assign_ports(edges,edge_index.numpy().astype('int'), graph.num_nodes)
+    ports_arr = torch.stack([torch.tensor(ports_1), torch.tensor(ports_2)], dim=1)
+
+    if isinstance(graph, HeteroGraphData):
+        if process_batch:
+            cut_point = graph['node', 'to', 'node'].num_edges
+            graph['node', 'to', 'node'].edge_attr = torch.cat([graph['node', 'to', 'node'].edge_attr, ports_arr[:cut_point, :]], dim=1)
+            graph['node', 'rev_to', 'node'].edge_attr = torch.cat([graph['node', 'rev_to', 'node'].edge_attr, ports_arr[cut_point:, :]], dim=1)
+        else:
+            graph['node', 'to', 'node'].edge_attr = torch.cat([graph['node', 'to', 'node'].edge_attr, ports_arr], dim=1)
+    else:
+        graph.edge_attr = torch.cat([graph.edge_attr, ports_arr], dim=1)
+
+    return
+
+
+def to_adj_nodes_with_times(data):
+    num_nodes = data.num_nodes
+    timestamps = torch.zeros((data.edge_index.shape[1], 1)) if data.timestamps is None else data.timestamps.reshape((-1,1))
+    edges = torch.cat((data.edge_index.T, timestamps), dim=1) if not isinstance(data, HeteroData) else torch.cat((data['node', 'to', 'node'].edge_index.T, timestamps), dim=1)
+    adj_list_out = dict([(i, []) for i in range(num_nodes)])
+    adj_list_in = dict([(i, []) for i in range(num_nodes)])
+    for u,v,t in edges:
+        u,v,t = int(u), int(v), int(t)
+        adj_list_out[u] += [(v, t)]
+        adj_list_in[v] += [(u, t)]
+    return adj_list_in, adj_list_out
+
+def to_adj_edges_with_times(data):
+    num_nodes = data.num_nodes
+    timestamps = torch.zeros((data.edge_index.shape[1], 1)) if data.timestamps is None else data.timestamps.reshape((-1,1))
+    edges = torch.cat((data.edge_index.T, timestamps), dim=1)
+    # calculate adjacent edges with times per node
+    adj_edges_out = dict([(i, []) for i in range(num_nodes)])
+    adj_edges_in = dict([(i, []) for i in range(num_nodes)])
+    for i, (u,v,t) in enumerate(edges):
+        u,v,t = int(u), int(v), int(t)
+        adj_edges_out[u] += [(i, v, t)]
+        adj_edges_in[v] += [(i, u, t)]
+    return adj_edges_in, adj_edges_out
+
+def ports(edge_index, adj_list):
+    ports = torch.zeros(edge_index.shape[1], 1)
+    ports_dict = {}
+    for v, nbs in adj_list.items():
+        if len(nbs) < 1: continue
+        a = np.array(nbs)
+        a = a[a[:, -1].argsort()]
+        _, idx = np.unique(a[:,[0]],return_index=True,axis=0)
+        nbs_unique = a[np.sort(idx)][:,0]
+        for i, u in enumerate(nbs_unique):
+            ports_dict[(u,v)] = i
+    for i, e in enumerate(edge_index.T):
+        ports[i] = ports_dict[tuple(e.numpy())]
+    return ports
+
+def time_deltas(data, adj_edges_list):
+    time_deltas = torch.zeros(data.edge_index.shape[1], 1)
+    if data.timestamps is None:
+        return time_deltas
+    for v, edges in adj_edges_list.items():
+        if len(edges) < 1: continue
+        a = np.array(edges)
+        a = a[a[:, -1].argsort()]
+        a_tds = [0] + [a[i+1,-1] - a[i,-1] for i in range(a.shape[0]-1)]
+        tds = np.hstack((a[:,0].reshape(-1,1), np.array(a_tds).reshape(-1,1)))
+        for i,td in tds:
+            time_deltas[i] = td
+    return time_deltas
+
+class GraphData(Data):
+    '''This is the homogenous graph object we use for GNN training if reverse MP is not enabled'''
+    def __init__(
+        self, x: OptTensor = None, edge_index: OptTensor = None, edge_attr: OptTensor = None, y: OptTensor = None, pos: OptTensor = None,
+        readout: str = 'edge',
+        num_nodes: int = None,
+        timestamps: OptTensor = None,
+        node_timestamps: OptTensor = None,
+        **kwargs
+        ):
+        super().__init__(x, edge_index, edge_attr, y, pos, **kwargs)
+        self.readout = readout
+        self.loss_fn = 'ce'
+        self.num_nodes = int(self.x.shape[0])
+        self.node_timestamps = node_timestamps
+        if timestamps is not None:
+            self.timestamps = timestamps
+        elif edge_attr is not None:
+            self.timestamps = edge_attr[:,0].clone()
+        else:
+            self.timestamps = None
+
+    def add_ports(self):
+        '''Adds port numberings to the edge features'''
+        reverse_ports = True
+        adj_list_in, adj_list_out = to_adj_nodes_with_times(self)
+        in_ports = ports(self.edge_index, adj_list_in)
+        out_ports = [ports(self.edge_index.flipud(), adj_list_out)] if reverse_ports else []
+        self.edge_attr = torch.cat([self.edge_attr, in_ports] + out_ports, dim=1)
+        return self
+
+    def add_time_deltas(self):
+        '''Adds time deltas (i.e. the time between subsequent transactions) to the edge features'''
+        reverse_tds = True
+        adj_list_in, adj_list_out = to_adj_edges_with_times(self)
+        in_tds = time_deltas(self, adj_list_in)
+        out_tds = [time_deltas(self, adj_list_out)] if reverse_tds else []
+        self.edge_attr = torch.cat([self.edge_attr, in_tds] + out_tds, dim=1)
+        return self
+
+class HeteroGraphData(HeteroData):
+    '''This is the heterogenous graph object we use for GNN training if reverse MP is enabled'''
+    def __init__(
+        self,
+        readout: str = 'edge',
+        **kwargs
+        ):
+        super().__init__(**kwargs)
+        self.readout = readout
+
+    @property
+    def num_nodes(self):
+        return self['node'].x.shape[0]
+
+    @property
+    def timestamps(self):
+        return self['node', 'to', 'node'].timestamps
+
+    def add_ports(self):
+        '''Adds port numberings to the edge features'''
+        adj_list_in, adj_list_out = to_adj_nodes_with_times(self)
+        in_ports = ports(self['node', 'to', 'node'].edge_index, adj_list_in)
+        out_ports = ports(self['node', 'rev_to', 'node'].edge_index, adj_list_out)
+        self['node', 'to', 'node'].edge_attr = torch.cat([self['node', 'to', 'node'].edge_attr, in_ports], dim=1)
+        self['node', 'rev_to', 'node'].edge_attr = torch.cat([self['node', 'rev_to', 'node'].edge_attr, out_ports], dim=1)
+        return self
+
+    def add_time_deltas(self):
+        '''Adds time deltas (i.e. the time between subsequent transactions) to the edge features'''
+        adj_list_in, adj_list_out = to_adj_edges_with_times(self)
+        in_tds = time_deltas(self, adj_list_in)
+        out_tds = time_deltas(self, adj_list_out)
+        self['node', 'to', 'node'].edge_attr = torch.cat([self['node', 'to', 'node'].edge_attr, in_tds], dim=1)
+        self['node', 'rev_to', 'node'].edge_attr = torch.cat([self['node', 'rev_to', 'node'].edge_attr, out_tds], dim=1)
+        return self
+
+def z_norm(data):
+    std = data.std(0).unsqueeze(0)
+    std = torch.where(std == 0, torch.tensor(1, dtype=torch.float32).cpu(), std)
+    return (data - data.mean(0).unsqueeze(0)) / std
+
+def create_hetero_obj(x,  y,  edge_index,  edge_attr, timestamps, simp_edge_batch=None, batch=None):
+    '''Creates a heterogenous graph object for reverse message passing'''
+    data = HeteroGraphData()
+
+    data['node'].x = x
+
+    data['node', 'to', 'node'].y = y
+    data['node', 'to', 'node'].edge_index = edge_index
+    data['node', 'rev_to', 'node'].edge_index = edge_index.flipud()
+    data['node', 'to', 'node'].edge_attr = edge_attr
+    data['node', 'rev_to', 'node'].edge_attr = edge_attr
+
+    data['node', 'to', 'node'].simp_edge_batch = simp_edge_batch
+    data['node', 'rev_to', 'node'].simp_edge_batch = simp_edge_batch
+
+    data['node', 'rev_to', 'node'].edge_attr[:, [-1, -2]] = data['node', 'rev_to', 'node'].edge_attr[:, [-2, -1]]
+    data['node', 'to', 'node'].timestamps = timestamps
+    data['node', 'rev_to', 'node'].timestamps = timestamps
+
+    return data
+
+def find_parallel_edges(edge_index):
+    simplified_edge_mapping = {}
+    simplified_edge_batch = []
+    i = 0
+    for edge in edge_index.T:
+        tuple_edge = tuple(edge.tolist())
+        if tuple_edge not in simplified_edge_mapping:
+            simplified_edge_mapping[tuple_edge] = i
+            i += 1
+        simplified_edge_batch.append(simplified_edge_mapping[tuple_edge])
+    simplified_edge_batch = torch.LongTensor(simplified_edge_batch)
+
+    return simplified_edge_batch
+
+transaction_file = '/kaggle/input/datasets/qucanhphan/dataset-aml/formatted_transactions.csv'
+df_edges = pd.read_csv(transaction_file)
+
+df_edges['Timestamp'] = df_edges['Timestamp'] - df_edges['Timestamp'].min()
+max_n_id = df_edges.loc[:, ['from_id', 'to_id']].to_numpy().max() + 1
+df_nodes = pd.DataFrame({'NodeID': np.arange(max_n_id), 'Feature': np.ones(max_n_id)})
+timestamps = torch.Tensor(df_edges['Timestamp'].to_numpy())
+y = torch.LongTensor(df_edges['Is Laundering'].to_numpy())
+edge_features = ['Timestamp', 'Amount Received', 'Received Currency', 'Payment Format']
+node_features = ['Feature']
+x = torch.tensor(df_nodes.loc[:, node_features].to_numpy()).float()
+edge_index = torch.LongTensor(df_edges.loc[:, ['from_id', 'to_id']].to_numpy().T)
+edge_attr = torch.tensor(df_edges.loc[:, edge_features].to_numpy()).float()
+
+from tqdm import tqdm
+import networkx as nx
+from networkx.algorithms.community import louvain_communities
+
+
+def compute_community_features(edge_index):
+
+    device = edge_index.device
+
+    src = edge_index[0]
+    dst = edge_index[1]
+
+    E = edge_index.shape[1]
+
+    # =====================================================
+    # BUILD GRAPH
+    # =====================================================
+
+    print("Building graph...")
+
+    edges = edge_index.T.cpu().numpy()
+
+    G = nx.Graph()
+
+    G.add_edges_from(edges)
+
+    # =====================================================
+    # COMMUNITY DETECTION
+    # =====================================================
+
+    print("Running Louvain community detection...")
+
+    communities = louvain_communities(
+        G,
+        seed=42
+    )
+
+    print(f"Found {len(communities)} communities")
+
+    # =====================================================
+    # BUILD FAST LOOKUP TABLES
+    # =====================================================
+
+    num_nodes = int(edge_index.max()) + 1
+
+    node_to_comm = torch.full(
+        (num_nodes,),
+        -1,
+        dtype=torch.long
+    )
+
+    comm_sizes = torch.zeros(
+        len(communities),
+        dtype=torch.float
+    )
+
+    print("Building node-community mapping...")
+
+    for cid, comm in tqdm(
+        enumerate(communities),
+        total=len(communities),
+        desc="Processing Communities"
+    ):
+
+        comm = list(comm)
+
+        comm_size = len(comm)
+
+        comm_sizes[cid] = np.log1p(comm_size)
+
+        node_to_comm[
+            torch.tensor(comm, dtype=torch.long)
+        ] = cid
+
+    # =====================================================
+    # VECTORIZED COMMUNITY FEATURES
+    # =====================================================
+
+    print("Generating community features...")
+
+    src_comm = node_to_comm[src.cpu()]
+    dst_comm = node_to_comm[dst.cpu()]
+
+    # same community
+    same_comm = (
+        src_comm == dst_comm
+    ).float()
+
+    # community sizes
+    src_size = comm_sizes[src_comm]
+    dst_size = comm_sizes[dst_comm]
+
+    # =====================================================
+    # STACK FEATURES
+    # =====================================================
+
+    community_features = torch.stack([
+        same_comm,
+        src_size,
+        dst_size
+    ], dim=1)
+
+    return community_features.to(device)
+
+from torch_scatter import scatter_add
+from tqdm import tqdm
+
+
+def compute_flow_features_ultra_fast(
+    edge_index,
+    edge_attr,
+    timestamps
+):
+
+    device = edge_index.device
+
+    src = edge_index[0]
+    dst = edge_index[1]
+
+    amounts = torch.log1p(
+        edge_attr[:, 1].float()
+    )
+
+    times = timestamps.float()
+
+    E = edge_index.shape[1]
+    N = int(edge_index.max()) + 1
+
+    flow_features = torch.zeros(
+        (E, 5),
+        device=device
+    )
+
+    print("Sorting edges...")
+
+    # =====================================================
+    # SORT EDGES BY SOURCE
+    # =====================================================
+
+    perm = torch.argsort(src)
+
+    sorted_src = src[perm]
+    sorted_amounts = amounts[perm]
+
+    # =====================================================
+    # BUILD POINTERS
+    # =====================================================
+
+    unique_nodes, counts = torch.unique_consecutive(
+        sorted_src,
+        return_counts=True
+    )
+
+    ptr = torch.cat([
+        torch.tensor([0], device=device),
+        counts.cumsum(0)
+    ])
+
+    # =====================================================
+    # NODE STATISTICS
+    # =====================================================
+
+    print("Computing node statistics...")
+
+    out_amount = scatter_add(
+        amounts,
+        src,
+        dim=0,
+        dim_size=N
+    )
+
+    out_degree = scatter_add(
+        torch.ones_like(amounts),
+        src,
+        dim=0,
+        dim_size=N
+    )
+
+    out_time = scatter_add(
+        times,
+        src,
+        dim=0,
+        dim_size=N
+    )
+
+    out_time = out_time / (
+        out_degree + 1e-6
+    )
+
+    # =====================================================
+    # ENTROPY FAST
+    # =====================================================
+
+    print("Computing entropy...")
+
+    entropy_per_node = torch.zeros(
+        N,
+        device=device
+    )
+
+    pbar = tqdm(
+        range(len(unique_nodes)),
+        desc="Entropy"
+    )
+
+    for i in pbar:
+
+        l = ptr[i]
+        r = ptr[i + 1]
+
+        node = unique_nodes[i]
+
+        node_amounts = sorted_amounts[l:r]
+
+        probs = node_amounts / (
+            node_amounts.sum() + 1e-6
+        )
+
+        entropy = -(
+            probs * torch.log(
+                probs + 1e-9
+            )
+        ).sum()
+
+        entropy_per_node[node] = entropy
+
+    # =====================================================
+    # EDGE FEATURES
+    # =====================================================
+
+    print("Building edge features...")
+
+    fanout = torch.log1p(
+        out_degree[dst]
+    )
+
+    retention = (
+        out_amount[dst] /
+        (amounts + 1e-6)
+    ).clamp(max=10)
+
+    mean_gap = torch.log1p(
+        torch.abs(out_time[dst] - times)
+    )
+
+    entropy = entropy_per_node[dst]
+
+    two_hop_ratio = (
+        out_amount[dst] /
+        (amounts + 1e-6)
+    ).clamp(max=20)
+
+    # =====================================================
+    # STACK
+    # =====================================================
+
+    flow_features[:, 0] = retention
+    flow_features[:, 1] = fanout
+    flow_features[:, 2] = mean_gap
+    flow_features[:, 3] = entropy
+    flow_features[:, 4] = two_hop_ratio
+
+    return flow_features
+
+
+simp_edge_batch = find_parallel_edges(edge_index)
+n_days = int(timestamps.max() / (3600 * 24) + 1)
+n_samples = y.shape[0]
+
+daily_irs, weighted_daily_irs, daily_inds, daily_trans = [], [], [], []
+for day in range(n_days):
+  l = day * 24 * 3600
+  r = (day + 1) * 24 * 3600
+  day_inds = torch.where((timestamps >= l) & (timestamps < r))[0]
+  daily_irs.append(y[day_inds].float().mean())
+  weighted_daily_irs.append(y[day_inds].float().mean() * day_inds.shape[0] / n_samples)
+  daily_inds.append(day_inds)
+  daily_trans.append(day_inds.shape[0])
+
+split_per = [0.6, 0.2, 0.2]
+daily_totals = np.array(daily_trans)
+d_ts = daily_totals
+I = list(range(len(d_ts)))
+split_scores = dict()
+for i,j in itertools.combinations(I, 2):
+  if j >= i:
+    split_totals = [d_ts[:i].sum(), d_ts[i:j].sum(), d_ts[j:].sum()]
+    split_totals_sum = np.sum(split_totals)
+    split_props = [v/split_totals_sum for v in split_totals]
+    split_error = [abs(v-t)/t for v,t in zip(split_props, split_per)]
+    score = max(split_error) #- (split_totals_sum/total) + 1
+    split_scores[(i,j)] = score
+  else:
+    continue
+
+i,j = min(split_scores, key=split_scores.get)
+split = [list(range(i)), list(range(i, j)), list(range(j, len(daily_totals)))]
+
+split_inds = {k: [] for k in range(3)}
+for i in range(3):
+  for day in split[i]:
+    split_inds[i].append(daily_inds[day])
+
+tr_inds = torch.cat(split_inds[0])
+val_inds = torch.cat(split_inds[1])
+te_inds = torch.cat(split_inds[2])
+
+# tr_x, val_x, te_x = x, x, x
+# e_tr = tr_inds.numpy()
+# e_val = np.concatenate([tr_inds, val_inds])
+
+# tr_edge_index,  tr_edge_attr,  tr_y,  tr_edge_times  = edge_index[:,e_tr],  edge_attr[e_tr],  y[e_tr],  timestamps[e_tr]
+# val_edge_index, val_edge_attr, val_y, val_edge_times = edge_index[:,e_val], edge_attr[e_val], y[e_val], timestamps[e_val]
+# te_edge_index,  te_edge_attr,  te_y,  te_edge_times  = edge_index,          edge_attr,        y,        timestamps
+
+# tr_simp_edge_batch, val_simp_edge_batch, te_simp_edge_batch = simp_edge_batch[e_tr], simp_edge_batch[e_val], simp_edge_batch
+# tr_data = GraphData (x=tr_x,  y=tr_y,  edge_index=tr_edge_index,  edge_attr=tr_edge_attr,  timestamps=tr_edge_times , simp_edge_batch = tr_simp_edge_batch)
+# val_data = GraphData(x=val_x, y=val_y, edge_index=val_edge_index, edge_attr=val_edge_attr, timestamps=val_edge_times, simp_edge_batch = val_simp_edge_batch)
+# te_data = GraphData (x=te_x,  y=te_y,  edge_index=te_edge_index,  edge_attr=te_edge_attr,  timestamps=te_edge_times , simp_edge_batch = te_simp_edge_batch)
+
+
+# tr_flow_features = compute_flow_features_ultra_fast(
+#     tr_data.edge_index,
+#     tr_data.edge_attr,
+#     tr_data.timestamps
+# )
+
+# val_flow_features = compute_flow_features_ultra_fast(
+#     val_data.edge_index,
+#     val_data.edge_attr,
+#     val_data.timestamps
+# )
+
+# te_flow_features = compute_flow_features_ultra_fast(
+#     te_data.edge_index,
+#     te_data.edge_attr,
+#     te_data.timestamps
+# )
+
+# tr_comm_features = compute_community_features(
+#     tr_data.edge_index
+# )
+
+# val_comm_features = compute_community_features(
+#     val_data.edge_index
+# )
+
+# te_comm_features = compute_community_features(
+#     te_data.edge_index
+# )
+
+# tr_data.edge_attr = torch.cat(
+#     [
+#         tr_data.edge_attr,
+#         tr_flow_features,
+#         tr_comm_features
+#     ],
+#     dim=1
+# )
+
+# val_data.edge_attr = torch.cat(
+#     [
+#         val_data.edge_attr,
+#         val_flow_features,
+#         val_comm_features
+#     ],
+#     dim=1
+# )
+
+# te_data.edge_attr = torch.cat(
+#     [
+#         te_data.edge_attr,
+#         te_flow_features,
+#         te_comm_features
+#     ],
+#     dim=1
+# )
+
+# assign_ports_with_cpp(tr_data, process_batch=False)
+# assign_ports_with_cpp(val_data, process_batch=False)
+# assign_ports_with_cpp(te_data, process_batch=False)
+
+# tr_data.add_time_deltas()
+# val_data.add_time_deltas()
+# te_data.add_time_deltas()
+
+# tr_data.x = val_data.x = te_data.x = torch.tensor(scaler_edge.fit_transform(tr_data.x), dtype=torch.float)
+# tr_data.edge_attr, val_data.edge_attr, te_data.edge_attr = torch.tensor(scaler_edge.fit_transform(tr_data.edge_attr), dtype=torch.float), torch.tensor(scaler_edge.fit_transform(val_data.edge_attr), dtype=torch.float), torch.tensor(scaler_edge.fit_transform(te_data.edge_attr), dtype=torch.float)
+
+# tr_data = create_hetero_obj(tr_data.x,  tr_data.y,  tr_data.edge_index,  tr_data.edge_attr, tr_data.timestamps, tr_simp_edge_batch)
+# val_data = create_hetero_obj(val_data.x,  val_data.y,  val_data.edge_index,  val_data.edge_attr, val_data.timestamps, val_simp_edge_batch)
+# te_data = create_hetero_obj(te_data.x,  te_data.y,  te_data.edge_index,  te_data.edge_attr, te_data.timestamps, te_simp_edge_batch)
+
+tr_data = torch.load('/kaggle/input/datasets/qucanhphan/dataset-aml/tr_data_3.pt', weights_only=False)
+val_data = torch.load('/kaggle/input/datasets/qucanhphan/dataset-aml/val_data_3.pt', weights_only=False)
+te_data = torch.load('/kaggle/input/datasets/qucanhphan/dataset-aml/te_data_3.pt', weights_only=False)
+config = torch.load('/kaggle/input/datasets/qucanhphan/dataset-aml/config.pt', weights_only=False)
+
+config.num_neighs = [100, 100]
+config.batch_size=4096
+
+def get_loaders(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, transform, args):
+    if isinstance(tr_data, HeteroData):
+        tr_edge_label_index = tr_data['node', 'to', 'node'].edge_index
+        tr_edge_label = tr_data['node', 'to', 'node'].y
+
+
+        tr_loader =  LinkNeighborLoader(tr_data, num_neighbors=args.num_neighs,
+                                    edge_label_index=(('node', 'to', 'node'), tr_edge_label_index),
+                                    edge_label=tr_edge_label, batch_size=args.batch_size, shuffle=True, transform=transform)
+
+        val_edge_label_index = val_data['node', 'to', 'node'].edge_index[:,val_inds]
+        val_edge_label = val_data['node', 'to', 'node'].y[val_inds]
+
+
+        val_loader =  LinkNeighborLoader(val_data, num_neighbors=args.num_neighs,
+                                    edge_label_index=(('node', 'to', 'node'), val_edge_label_index),
+                                    edge_label=val_edge_label, batch_size=args.batch_size, shuffle=False, transform=transform)
+
+        te_edge_label_index = te_data['node', 'to', 'node'].edge_index[:,te_inds]
+        te_edge_label = te_data['node', 'to', 'node'].y[te_inds]
+
+
+        te_loader =  LinkNeighborLoader(te_data, num_neighbors=args.num_neighs,
+                                    edge_label_index=(('node', 'to', 'node'), te_edge_label_index),
+                                    edge_label=te_edge_label, batch_size=args.batch_size, shuffle=False, transform=transform)
+    else:
+        tr_loader =  LinkNeighborLoader(tr_data, num_neighbors=args.num_neighs, batch_size=args.batch_size, shuffle=True, transform=transform)
+        val_loader = LinkNeighborLoader(val_data,num_neighbors=args.num_neighs, edge_label_index=val_data.edge_index[:, val_inds],
+                                        edge_label=val_data.y[val_inds], batch_size=args.batch_size, shuffle=False, transform=transform)
+        te_loader =  LinkNeighborLoader(te_data,num_neighbors=args.num_neighs, edge_label_index=te_data.edge_index[:, te_inds],
+                                edge_label=te_data.y[te_inds], batch_size=args.batch_size, shuffle=False, transform=transform)
+
+    return tr_loader, val_loader, te_loader
+
+class AddEgoIds(BaseTransform):
+    r"""Add IDs to the centre nodes of the batch.
+    """
+    def __init__(self):
+        pass
+
+    def forward(self, data: Union[Data, HeteroData]):
+        x = data.x if not isinstance(data, HeteroData) else data['node'].x
+        device = x.device
+        ids = torch.zeros((x.shape[0], 1), device=device)
+        if not isinstance(data, HeteroData):
+            nodes = torch.unique(data.edge_label_index.view(-1)).to(device)
+        else:
+            nodes = torch.unique(data['node', 'to', 'node'].edge_label_index.view(-1)).to(device)
+        ids[nodes] = 1
+        if not isinstance(data, HeteroData):
+            data.x = torch.cat([x, ids], dim=1)
+        else:
+            data['node'].x = torch.cat([x, ids], dim=1)
+
+        return data
+
+
+def add_arange_ids(data_list):
+    '''
+    Add the index as an id to the edge features to find seed edges in training, validation and testing.
+
+    Args:
+    - data_list (str): List of tr_data, val_data and te_data.
+    '''
+    for data in data_list:
+        if isinstance(data, HeteroData):
+            data['node', 'to', 'node'].edge_attr = torch.cat([torch.arange(data['node', 'to', 'node'].edge_attr.shape[0]).view(-1, 1), data['node', 'to', 'node'].edge_attr], dim=1)
+            offset = data['node', 'to', 'node'].edge_attr.shape[0]
+            data['node', 'rev_to', 'node'].edge_attr = torch.cat([torch.arange(offset, data['node', 'rev_to', 'node'].edge_attr.shape[0] + offset).view(-1, 1), data['node', 'rev_to', 'node'].edge_attr], dim=1)
+        else:
+            data.edge_attr = torch.cat([torch.arange(data.edge_attr.shape[0]).view(-1, 1), data.edge_attr], dim=1)
+
+
+device = torch.device('cuda' if torch.cuda.is_available() else "cpu")
+transform = AddEgoIds()
+
+add_arange_ids([tr_data, val_data, te_data])
+tr_loader, val_loader, te_loader = get_loaders(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, transform, config)
+
+sample_batch = next(iter(tr_loader))
+
+if isinstance(sample_batch, HeteroData):
+  sample_batch['node', 'to', 'node'].edge_attr = sample_batch['node', 'to', 'node'].edge_attr[:, 1:]
+  sample_batch['node', 'rev_to', 'node'].edge_attr = sample_batch['node', 'rev_to', 'node'].edge_attr[:, 1:]
+else:
+  sample_batch.edge_attr = sample_batch.edge_attr[:, 1:]
+
+if isinstance(sample_batch, HeteroData):
+  sample_batch['node', 'to', 'node'].edge_attr = torch.cat([sample_batch['node', 'to', 'node'].edge_attr, torch.zeros((sample_batch['node', 'to', 'node'].edge_attr.shape[0], 2))], dim=1)
+  sample_batch['node', 'rev_to', 'node'].edge_attr = torch.cat([sample_batch['node', 'rev_to', 'node'].edge_attr, torch.zeros((sample_batch['node', 'rev_to', 'node'].edge_attr.shape[0], 2))], dim=1)
+else:
+  sample_batch.edge_attr = torch.cat([sample_batch.edge_attr, torch.zeros((sample_batch.edge_attr.shape[0], 2))], dim=1)
+
+uniq_index, inverse_indices = torch.unique(sample_batch['node', 'to', 'node'].simp_edge_batch, return_inverse=True)
+d = degree(inverse_indices, num_nodes=uniq_index.numel(), dtype=torch.long)
+deg = torch.bincount(d, minlength=1)
+
+sample_batch['node', 'to', 'node'].simp_edge_batch
+
+class FlowGate(nn.Module):
+    def __init__(self, n_hidden):
+        super().__init__()
+
+        self.gate = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden),
+            nn.Sigmoid()
+        )
+
+    def forward(self, edge_attr):
+        gate = self.gate(edge_attr)
+        return edge_attr * (1 + 0.05 * gate)
+
+
+class FlowTemporalAgg(nn.Module):
+    def __init__(self, n_hidden, deg):
+        super().__init__()
+
+        self.time_encoder = nn.Sequential(
+            nn.Linear(1, n_hidden // 4),
+            nn.ReLU(),
+            nn.Linear(n_hidden // 4, n_hidden // 4)
+        )
+
+        self.flow_gate = nn.Sequential(
+            nn.Linear(3 * n_hidden + n_hidden // 4, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, 1)
+        )
+
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+        self.pna_agg = DegreeScalerAggregation(aggregators, scalers, deg)
+
+        self.pna_lin = nn.Sequential(
+            nn.Linear(
+                len(aggregators) *
+                len(scalers) *
+                n_hidden,
+                n_hidden
+            ),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden)
+        )
+
+        self.flow_lin = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden)
+        )
+
+        self.alpha_mlp = nn.Sequential(
+            nn.Linear(n_hidden * 2, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, 1)
+        )
+
+        self.out_lin = nn.Sequential(
+            nn.Linear(n_hidden * 2, n_hidden),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(n_hidden, n_hidden)
+        )
+
+        self.norm = nn.BatchNorm1d(n_hidden)
+        self.reset_parameters()
+
+    def forward(self, edge_attr, index, timestamps):
+        if timestamps is None:
+            timestamps = torch.zeros(
+                edge_attr.size(0),
+                device=edge_attr.device,
+                dtype=edge_attr.dtype
+            )
+        # global_context = scatter(edge_attr, index, dim=0, reduce='mean')
+        global_mean = scatter(edge_attr, index, dim=0, reduce='mean')
+        global_max  = scatter(edge_attr, index, dim=0, reduce='max')
+        global_context = torch.cat([global_mean, global_max], dim=-1)
+        global_context_edge = global_context[index]
+
+        mean_time = scatter(timestamps, index, dim=0, reduce='mean')
+        mean_time_edge = mean_time[index]
+
+        delta_t = torch.abs(timestamps - mean_time_edge).unsqueeze(-1)
+        delta_t = torch.log1p(delta_t)
+        time_emb = self.time_encoder(delta_t)
+        edge_attr = F.layer_norm(edge_attr, edge_attr.shape[-1:])
+        global_context_edge = F.layer_norm(global_context_edge, global_context_edge.shape[-1:])
+        time_emb = F.layer_norm(time_emb, time_emb.shape[-1:])
+        
+        att_input = torch.cat([edge_attr, global_context_edge, time_emb], dim=-1)
+        att_input = F.layer_norm(att_input, att_input.shape[-1:])
+
+        # att_score = self.flow_gate(att_input)
+        # max_per_group = scatter(att_score.squeeze(-1), index, dim=0, reduce='max')
+        # att_score = (att_score.squeeze(-1) - max_per_group[index])
+        # att_score = torch.clamp(att_score, min=-5, max=5)
+        # att_weight = torch.exp(att_score).unsqueeze(-1)
+        # att_norm = scatter(att_weight, index, dim=0, reduce='sum')
+        # att_weight = att_weight / (att_norm[index] + 1e-6)
+
+        att_score = self.flow_gate(att_input).squeeze(-1)
+        att_score = att_score / (math.sqrt(att_score.size(-1)) + 1e-6)
+        
+        att_weight = softmax(att_score, index).unsqueeze(-1)
+                
+        # att_score = self.flow_gate(att_input)
+
+        # att_score = att_score - scatter(att_score, index, dim=0, reduce='max')[index]
+        # att_weight = torch.exp(att_score)
+        # att_norm = scatter(att_weight, index, dim=0, reduce='sum')
+        # att_weight = att_weight / (att_norm[index] + 1e-6)
+
+        flow_out = edge_attr * att_weight
+        flow_out = scatter(flow_out, index, dim=0, reduce='sum')
+        flow_out = self.flow_lin(flow_out)
+
+        pna_out = self.pna_agg(edge_attr, index)
+        pna_out = self.pna_lin(pna_out)
+        alpha = torch.sigmoid(
+            self.alpha_mlp(
+                torch.cat([flow_out, pna_out], dim=-1)
+            )
+        )
+
+        fused = alpha * flow_out + (1 - alpha) * pna_out
+
+        out = self.out_lin(
+            torch.cat([flow_out, pna_out], dim=-1)
+        )
+        
+        out = out + fused
+        out = self.norm(out)
+        return out
+
+    def reset_parameters(self):
+        for name, param in self.named_parameters():
+            if param.dim() >= 2:
+                nn.init.kaiming_normal_(param)
+    
+            elif 'bias' in name:
+                nn.init.constant_(param, 0)
+    
+            else:
+                nn.init.ones_(param)
+    # def reset_parameters(self):
+    #     for module in self.modules():
+    #         if isinstance(module, nn.Linear):
+    #             nn.init.kaiming_normal_(module.weight)
+    #             if module.bias is not None:
+    #                 nn.init.zeros_(module.bias)
+
+    #         elif isinstance(module, nn.BatchNorm1d):
+    #             module.reset_parameters()
+
+    #     if hasattr(self.pna_agg, 'reset_parameters'):
+    #         self.pna_agg.reset_parameters()
+
+class DiscreteEncoder(nn.Module):
+    def __init__(self, hidden_channels, max_num_features=10, max_num_values=500): #10
+        super().__init__()
+        self.embeddings = nn.ModuleList([nn.Embedding(max_num_values, hidden_channels)
+                    for i in range(max_num_features)])
+
+    def reset_parameters(self):
+        for embedding in self.embeddings:
+            embedding.reset_parameters()
+
+    def forward(self, x):
+        if x.dim() == 1:
+            x = x.unsqueeze(1)
+        out = 0
+        for i in range(x.size(1)):
+            out = out + self.embeddings[i](x[:, i])
+        return out
+
+class PositionalEncoding(nn.Module):
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        """
+        Arguments:
+            x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
+        """
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
+
+class TransformerAgg(nn.Module):
+    def __init__(self, d_model = 66):
+        super().__init__()
+
+        self.pos_enc = PositionalEncoding(d_model=d_model, dropout=0.05, max_len=128)
+        self.trans_enc = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=2,
+            dim_feedforward=d_model*4,
+            dropout=0.0,
+            batch_first=True, # If True, then the input and output tensors are provided as (batch, seq, feature).
+            norm_first=False
+            )
+
+    def forward(self, x, index, timestamps_):
+        # Add timestamps to the edge features to be able to sort according to them
+        x = torch.cat([timestamps_.view(-1, 1), x], dim=1)
+
+        s_pre = time.time()
+        sort_ids = torch.argsort(index)
+        dense_edge_feats, mask = to_dense_batch(x[sort_ids, :], index[sort_ids])
+        sorted_dense_edge_feats, sorted_mask = self.sort_wrt_time(dense_edge_feats, mask)
+
+        s_post = time.time()
+        sorted_dense_edge_feats = self.pos_enc(sorted_dense_edge_feats.permute(1,0,2)).permute(1,0,2)
+        sorted_dense_edge_feats = self.trans_enc(sorted_dense_edge_feats, src_key_padding_mask = ~sorted_mask)
+        sorted_dense_edge_feats[~sorted_mask.unsqueeze(-1).expand(-1, -1, sorted_dense_edge_feats.shape[-1])] = 0
+        s_res = time.time()
+
+        logging.debug(f"Preprocessing Time Transformer: {s_post - s_pre} | Transformer forward pass: {s_res - s_post}")
+
+        return sorted_dense_edge_feats.mean(dim=1).squeeze()
+
+    def sort_wrt_time(self, matt, mask):
+        first_feature = matt[:, :, 0]
+        sort_indices = torch.argsort(first_feature, dim=1)
+        sorted_matt = torch.gather(matt, 1, sort_indices.unsqueeze(-1).expand(-1, -1, matt.shape[-1]))
+        sorted_mask = torch.gather(mask, 1, sort_indices)
+        return sorted_matt[:, :, 1:], sorted_mask
+
+    def reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+class GRUAgg(nn.Module):
+    def __init__(self, d_model = 66):
+        super().__init__()
+
+        self.gru = nn.GRU(
+            d_model,
+            hidden_size=d_model,
+            num_layers=2,
+            batch_first=True
+            )
+
+    def forward(self, x, index, timestamps_):
+        # Add timestamps to the edge features to be able to sort according to them
+        x = torch.cat([timestamps_.view(-1, 1), x], dim=1)
+
+        sort_ids = torch.argsort(index)
+        dense_edge_feats, mask = to_dense_batch(x[sort_ids, :], index[sort_ids])
+        sorted_dense_edge_feats, sorted_mask = self.sort_wrt_time(dense_edge_feats, mask)
+
+        sorted_dense_edge_feats = self.gru(sorted_dense_edge_feats)[0]
+        # sorted_dense_edge_feats[~sorted_mask.unsqueeze(-1).expand(-1, -1, sorted_dense_edge_feats.shape[-1])] = 0
+
+        return sorted_dense_edge_feats.mean(dim=1).squeeze()
+
+    def sort_wrt_time(self, matt, mask):
+        first_feature = matt[:, :, 0]
+        sort_indices = torch.argsort(first_feature, dim=1)
+        sorted_matt = torch.gather(matt, 1, sort_indices.unsqueeze(-1).expand(-1, -1, matt.shape[-1]))
+        sorted_mask = torch.gather(mask, 1, sort_indices)
+        return sorted_matt[:, :, 1:], sorted_mask
+
+    def reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+class PnaAgg(nn.Module):
+    def __init__(self , n_hidden, deg):
+        super().__init__()
+
+        aggregators = ['mean', 'min', 'max', 'std']
+        self.num_aggregators = len(aggregators)
+        scalers = ['identity', 'amplification', 'attenuation']
+
+        self.agg = DegreeScalerAggregation(aggregators, scalers, deg)
+        self.lin = nn.Linear(len(scalers)*len(aggregators)*n_hidden, n_hidden)
+
+    def forward(self, x, index):
+        out = self.agg(x, index)
+        return self.lin(out)
+
+    def reset_parameters(self):
+        for name, param in self.named_parameters():
+            if 'weight' in name:
+                nn.init.kaiming_normal_(param)
+            elif 'bias' in name:
+                nn.init.constant_(param, 0)
+
+class IdentityAgg(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x, index):
+        return x
+
+class GinAgg(nn.Module):
+    def __init__(self, n_hidden):
+        super().__init__()
+        self.nn = nn.Sequential(
+                nn.Linear(n_hidden, n_hidden),
+                nn.ReLU(),
+                nn.Linear(n_hidden, n_hidden)
+                )
+    def forward(self, x, index):
+        out = scatter(x, index, dim=0, reduce='sum')
+        return self.nn(out)
+
+    def reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+class Identity(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super(Identity, self).__init__()
+
+    def forward(self, input):
+        return input
+
+    def reset_parameters(self):
+        pass
+
+class MLP(nn.Module):
+    def __init__(self, nin, nout, nlayer=2, with_final_activation=True, with_norm=True, bias=True, activation_fn="relu", LN='False'):
+        super().__init__()
+        n_hid = nout
+        self.layers = nn.ModuleList([nn.Linear(nin if i==0 else n_hid,
+                                     n_hid if i<nlayer-1 else nout,
+                                     bias=True if (i==nlayer-1 and not with_final_activation and bias) # TODO: revise later
+                                        or (not with_norm) else False) # set bias=False for BN
+                                     for i in range(nlayer)])
+        self.norms = nn.ModuleList([nn.BatchNorm1d(n_hid if i<nlayer-1 else nout) if not LN else nn.LayerNorm(n_hid) if with_norm else Identity()
+                                     for i in range(nlayer)])
+        self.nlayer = nlayer
+        self.with_final_activation = with_final_activation
+        self.residual = (nin==nout) ## TODO: test whether need this
+        self.act = getattr(F, activation_fn)
+
+    def reset_parameters(self):
+        for layer, norm in zip(self.layers, self.norms):
+            layer.reset_parameters()
+            norm.reset_parameters()
+
+    def forward(self, x):
+        for i, (layer, norm) in enumerate(zip(self.layers, self.norms)):
+            x = layer(x)
+            if i < self.nlayer-1 or self.with_final_activation:
+                x = norm(x)
+                x = self.act(x)
+
+        return x
+
+class AdammAgg(nn.Module):
+    def __init__(self, n_hidden):
+        super().__init__()
+        self.edge_transform = MLP(n_hidden, n_hidden, nlayer=1, with_final_activation=False)
+
+    def forward(self, x, index):
+        out = scatter(x, index, dim=0, reduce='sum')
+        return self.edge_transform(out)
+
+    def reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+class SumAgg(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x, index):
+        return scatter(x, index, dim=0, reduce='sum')
+
+    def reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+class MultiEdgeAggModule(nn.Module):
+    def __init__(self, n_hidden=None, agg_type=None, index=None):
+        super().__init__()
+        self.agg_type = agg_type
+
+        if agg_type == 'gin':
+            self.agg = GinAgg(n_hidden=n_hidden)
+        elif agg_type == 'pna':
+            uniq_index, inverse_indices = torch.unique(index, return_inverse=True)
+            d = degree(inverse_indices, num_nodes=uniq_index.numel(), dtype=torch.long)
+            deg = torch.bincount(d, minlength=1)
+            self.agg = PnaAgg(n_hidden=n_hidden, deg=deg)
+        elif agg_type == 'flow':
+          uniq_index, inverse_indices = torch.unique(index, return_inverse=True)
+          d = degree(inverse_indices,num_nodes=uniq_index.numel(), dtype=torch.long)
+          deg = torch.bincount(d, minlength=1)
+          self.agg = FlowTemporalAgg(n_hidden, deg)
+        elif agg_type == 'sum':
+            self.agg = SumAgg()
+        elif agg_type == 'transformer':
+            self.agg = TransformerAgg(d_model=n_hidden)
+        elif agg_type == 'gru':
+            self.agg = GRUAgg(d_model=n_hidden)
+        elif agg_type == 'adamm':
+            self.agg = AdammAgg(n_hidden)
+        else:
+            self.agg = IdentityAgg()
+
+    def forward(self, edge_index, edge_attr, simp_edge_batch, times):
+        _, inverse_indices = torch.unique(simp_edge_batch, return_inverse=True)
+        new_edge_index = scatter(edge_index, inverse_indices, dim=1, reduce='mean') if self.agg_type is not None else edge_index
+
+        if self.agg_type == 'flow':
+          new_edge_attr = self.agg(edge_attr=edge_attr, index=inverse_indices, timestamps=times)
+        elif (self.agg_type == 'transformer') or (self.agg_type == 'gru'):
+            new_edge_attr = self.agg(x= edge_attr, index=inverse_indices, timestamps_=times)
+        else:
+            new_edge_attr = self.agg(x=edge_attr, index=inverse_indices)
+        return new_edge_index, new_edge_attr, inverse_indices
+
+    def reset_parameters(self):
+        self.agg.reset_parameters()
+
+
+class GnnHelper(torch.nn.Module):
+    def __init__(self, num_gnn_layers, n_hidden=100, edge_updates=False,
+                final_dropout=0.5, index_ = None, deg = None, args=None):
+        super().__init__()
+
+        self.n_hidden = n_hidden
+        self.num_gnn_layers = num_gnn_layers
+        self.edge_updates = edge_updates
+        self.final_dropout = final_dropout
+        self.flatten_edges = True
+        # self.edge_agg_type = 'pna'
+        self.edge_agg_type = 'flow'
+        self.args = args
+
+        self.node_agg = 'sum'
+        self.edge_grus = nn.ModuleList()
+        self.edge_aggrs = nn.ModuleList()
+        self.convs = nn.ModuleList()
+        self.emlps = nn.ModuleList()
+        # self.flow_gates = nn.ModuleList()
+        self.batch_norms = nn.ModuleList()
+        for _ in range(self.num_gnn_layers):
+            aggregators = ['mean', 'min', 'max', 'std']
+            scalers = ['identity', 'amplification', 'attenuation']
+            conv = PNAConv(in_channels=n_hidden, out_channels=n_hidden,
+                           aggregators=aggregators, scalers=scalers, deg=deg,
+                           edge_dim=n_hidden, towers=5, pre_layers=1, post_layers=1,
+                           divide_input=False)
+
+            if self.edge_updates: self.emlps.append(nn.Sequential(
+                nn.Linear(4 * self.n_hidden, self.n_hidden),
+                nn.ReLU(),
+                nn.Linear(self.n_hidden, self.n_hidden),
+            ))
+            if self.flatten_edges:
+                edge_agg = MultiEdgeAggModule(n_hidden, agg_type='flow', index=index_)
+                self.edge_aggrs.append(edge_agg)
+            self.convs.append(conv)
+            self.batch_norms.append(BatchNorm(n_hidden))
+            self.edge_grus.append(nn.GRUCell(n_hidden, n_hidden))
+            # self.flow_gates.append(FlowGate(n_hidden))
+
+
+        if self.edge_agg_type == 'adamm':
+            self.edge_aggrs = None
+            self.edge_agg = MultiEdgeAggModule(n_hidden, agg_type=args.edge_agg_type, index=index_)
+
+
+    def forward(self, x, edge_index, edge_attr, simp_edge_batch=None, times=None):
+        # times= None # TODO: Not implemented yet
+
+        if self.edge_agg_type == 'adamm':
+            # Apply the flattening at the beggining only.
+            edge_index, edge_attr, _ = self.edge_agg(edge_index, edge_attr, simp_edge_batch, times)
+            src, dst = edge_index
+
+            for i in range(self.num_gnn_layers):
+                x = (x + F.relu(self.batch_norms[i](self.convs[i](x, edge_index, edge_attr)))) / 2
+                if self.edge_updates:
+                    edge_attr = edge_attr + self.emlps[i](torch.cat([x[src], x[dst], edge_attr], dim=-1)) / 2
+        else:
+            src, dst = edge_index
+
+            for i in range(self.num_gnn_layers):
+                if self.flatten_edges:
+                    n_edge_index, n_edge_attr, inverse_indices  = self.edge_aggrs[i](edge_index, edge_attr, simp_edge_batch, times)
+                    x = (x + F.relu(self.batch_norms[i](self.convs[i](x, n_edge_index, n_edge_attr)))) / 2
+                    if self.edge_updates:
+                        remapped_edge_attr = n_edge_attr[inverse_indices]
+                        edge_input = torch.cat([x[src], x[dst], remapped_edge_attr, edge_attr], dim=-1)
+                        edge_update = self.emlps[i](edge_input)
+                        edge_attr = self.edge_grus[i](edge_update, edge_attr)
+                else:
+                    x = (x + F.relu(self.batch_norms[i](self.convs[i](x, edge_index, edge_attr)))) / 2
+                    if self.edge_updates: 
+                        edge_attr = edge_attr + self.emlps[i](torch.cat([x[src], x[dst], edge_attr], dim=-1)) / 2
+
+        return x, edge_attr
+
+class MultiMPNN(torch.nn.Module):
+    def __init__(self, num_features, num_gnn_layers, n_classes=2, n_hidden=100,
+                 edge_updates=False,edge_dim=None, final_dropout=0.5,
+                 index_ = None, deg=None, args=None):
+        super().__init__()
+        self.args = args
+        self.n_hidden = n_hidden
+        self.final_dropout = final_dropout
+
+        self.node_emb = nn.Linear(num_features, n_hidden)
+        self.edge_emb = nn.Linear(edge_dim, n_hidden)
+
+        self.edge_emb_rev = nn.Linear(edge_dim, n_hidden)
+
+        self.gnn = GnnHelper(num_gnn_layers=num_gnn_layers, n_hidden=n_hidden, edge_updates=edge_updates, final_dropout=final_dropout,
+                             index_=index_, deg=deg, args=args)
+
+        self.gnn  = to_hetero(self.gnn, metadata= (['node'], [('node', 'to', 'node'), ('node', 'rev_to', 'node')]), aggr='mean')
+
+        self.mlp = nn.Sequential(Linear(n_hidden*3, 50), nn.ReLU(), nn.Dropout(self.final_dropout),Linear(50, 25), nn.ReLU(), nn.Dropout(self.final_dropout),
+                                Linear(25, n_classes))
+
+    def forward(self, data):
+        if isinstance(data, HeteroData):
+
+            # Initial Embedding Layers
+            x_dict = {"node": self.node_emb(data['node'].x)}
+            edge_attr_dict = {
+                    ("node", 'to', 'node'): self.edge_emb(data['node', 'to', 'node'].edge_attr),
+                    ("node", 'rev_to', 'node'): self.edge_emb_rev(data['node', 'rev_to', 'node'].edge_attr),
+                }
+            simp_edge_batch_dict = data.simp_edge_batch_dict
+
+            times_dict = {
+                ('node', 'to', 'node'):
+                    data['node', 'to', 'node'].timestamps,
+
+                ('node', 'rev_to', 'node'):
+                    data['node', 'rev_to', 'node'].timestamps
+            }
+
+            # Message Passing Layers
+            x_dict, edge_attr_dict = self.gnn(x_dict, data.edge_index_dict, edge_attr_dict, simp_edge_batch_dict, times_dict)
+            x = x_dict['node']
+            edge_attr = edge_attr_dict['node', 'to', 'node']
+
+            # Prediction Heads
+            x = x[data['node', 'to', 'node'].edge_index.T].reshape(-1, 2*self.n_hidden).relu()
+            x = torch.cat((x, edge_attr.view(-1, edge_attr.shape[1])), 1)
+            out = self.mlp(x)
+
+
+        else:
+            # Initial Embedding Layers
+            x = self.node_emb(data.x)
+            edge_attr = self.edge_emb(data.edge_attr)
+            simp_edge_batch = data.simp_edge_batch if self.args.flatten_edges else None
+
+            # Message Passing Layers
+            x, edge_attr = self.gnn(x, data.edge_index, edge_attr, simp_edge_batch, data.timestamps)
+
+            # Prediction Heads
+            x = x[data.edge_index.T].reshape(-1, 2*self.n_hidden).relu()
+            x = torch.cat((x, edge_attr.view(-1, edge_attr.shape[1])), 1)
+            out = self.mlp(x)
+        return out
+
+def get_model(sample_batch, config):
+    n_feats = sample_batch.x.shape[1] if not isinstance(sample_batch, HeteroData) else sample_batch['node'].x.shape[1]
+    e_dim = (sample_batch.edge_attr.shape[1]) if not isinstance(sample_batch, HeteroData) else (sample_batch['node', 'to', 'node'].edge_attr.shape[1])
+
+    index_ = sample_batch.simp_edge_batch if not isinstance(sample_batch, HeteroData) else sample_batch['node', 'to', 'node'].simp_edge_batch
+
+    if not isinstance(sample_batch, HeteroData):
+      s_edges = torch.unique(sample_batch.edge_index, dim=1)
+      d = degree(s_edges[1], num_nodes=sample_batch.num_nodes, dtype=torch.long)
+    else:
+      s_edges = torch.unique(torch.cat((sample_batch['node', 'to', 'node'].edge_index, sample_batch['node', 'rev_to', 'node'].edge_index), 1), dim=1)
+      d = degree(s_edges[1], num_nodes=sample_batch.num_nodes, dtype=torch.long)
+
+    deg = torch.bincount(d, minlength=1)
+
+    model = MultiMPNN(num_features=n_feats, num_gnn_layers=config.n_gnn_layers, n_classes=2,
+                      n_hidden=round(config.n_hidden), edge_updates=True, edge_dim=e_dim,
+                      final_dropout=config.final_dropout, index_=index_, deg=deg)
+
+    return model
+
+def compute_binary_metrics(preds: np.array, labels: np.array):
+    probs = preds[:,1]
+    preds = preds.argmax(axis=-1)
+
+    precisions, recalls, _ = sklearn.metrics.precision_recall_curve(labels, probs)
+    f1 = sklearn.metrics.f1_score(labels, preds, zero_division=0)
+    auc = sklearn.metrics.auc(recalls, precisions)
+
+    precision = sklearn.metrics.precision_score(labels, preds, zero_division=0)
+    recall = sklearn.metrics.recall_score(labels, preds, zero_division=0)
+
+    return f1, auc, precision, recall
+
+@torch.no_grad()
+def evaluate_hetero(loader, inds, model, data, device):
+    model.eval()
+    preds = []
+    ground_truths = []
+    for batch in tqdm(loader):
+        assign_ports_with_cpp(batch)
+        inds = inds.detach().cpu()
+        batch_edge_inds = inds[batch['node', 'to', 'node'].input_id.detach().cpu()]
+        batch_edge_ids = loader.data['node', 'to', 'node'].edge_attr.detach().cpu()[batch_edge_inds, 0]
+        mask = torch.isin(batch['node', 'to', 'node'].edge_attr[:, 0].detach().cpu(), batch_edge_ids)
+
+        missing = ~torch.isin(batch_edge_ids, batch['node', 'to', 'node'].edge_attr[:, 0].detach().cpu())
+
+        batch['node', 'to', 'node'].edge_attr = batch['node', 'to', 'node'].edge_attr[:, 1:]
+        batch['node', 'rev_to', 'node'].edge_attr = batch['node', 'rev_to', 'node'].edge_attr[:, 1:]
+
+        with torch.no_grad():
+            batch.to(device)
+            out = model(batch)
+            out = out[mask]
+            pred = out
+            preds.append(pred.detach().cpu())
+            ground_truths.append(batch['node', 'to', 'node'].y[mask].detach().cpu())
+
+    pred = torch.cat(preds, dim=0).numpy()
+    ground_truth = torch.cat(ground_truths, dim=0).numpy()
+    f1, auc, precision, recall = compute_binary_metrics(pred, ground_truth)
+
+    model.train()
+    return pred, ground_truth, f1, auc, precision, recall
+
+model = get_model(sample_batch, config)
+model.to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+sample_batch.to(device)
+loss_fn = torch.nn.CrossEntropyLoss(weight=torch.FloatTensor([config.w_ce1, config.w_ce2]).to(device))
+
+best_val_f1 = 0
+for epoch in range(config.epochs):
+  total_loss = total_examples = 0
+  preds = []
+  ground_truths = []
+
+  for batch in tqdm(tr_loader):
+    assign_ports_with_cpp(batch, process_batch=True)
+    optimizer.zero_grad()
+
+    inds = tr_inds.detach().cpu()
+    batch_edge_inds = inds[batch['node', 'to', 'node'].input_id.detach().cpu()]
+    batch_edge_ids = tr_loader.data['node', 'to', 'node'].edge_attr.detach().cpu()[batch_edge_inds, 0]
+    mask = torch.isin(batch['node', 'to', 'node'].edge_attr[:, 0].detach().cpu(), batch_edge_ids)
+    batch['node', 'to', 'node'].edge_attr = batch['node', 'to', 'node'].edge_attr[:, 1:]
+    batch['node', 'rev_to', 'node'].edge_attr = batch['node', 'rev_to', 'node'].edge_attr[:, 1:]
+    batch.to(device)
+    out = model(batch)
+    pred = out[mask]
+    ground_truth = batch['node', 'to', 'node'].y[mask]
+    loss = loss_fn(pred, ground_truth)
+
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+    total_loss += float(loss) * pred.numel()
+    total_examples += pred.numel()
+    preds.append(pred.detach().cpu())
+    ground_truths.append(ground_truth.detach().cpu())
+
+  pred = torch.cat(preds, dim=0).numpy()
+  ground_truth = torch.cat(ground_truths, dim=0).numpy()
+  f1, auc, precision, recall = compute_binary_metrics(pred, ground_truth)
+
+  val_pred, val_ground_truth, val_f1, val_auc, val_precision, val_recall = evaluate_hetero(val_loader, val_inds, model, val_data, device)
+  print(f"Epoch: {epoch}, Loss: {total_loss}, F1: {f1}, auc: {auc}, precision: {precision}, recall: {recall}")
+  print(f"val_F1: {val_f1}, val_auc: {val_auc}, val_precision: {val_precision}, val_recall: {val_recall}")
+  if val_f1 > best_val_f1:
+    best_val_f1 = val_f1
+    torch.save({
+          'epoch': epoch + 1,
+          'model_state_dict': model.state_dict(),
+          'optimizer_state_dict': optimizer.state_dict()
+        },
+        f'/kaggle/working/epoch_{epoch+1}.tar'
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import os
 import torch
 os.environ['TORCH'] = torch.__version__
