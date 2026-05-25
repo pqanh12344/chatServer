@@ -1,3 +1,154 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_scatter import scatter
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+
+class ExSTraQtPnaGatedFusionAgg(nn.Module):
+    def __init__(self, n_hidden, deg):
+        super().__init__()
+        self.n_hidden = n_hidden
+
+        # =========================================================
+        # 1. STABLE PNA CORE (Bảo lưu lõi cấu trúc tĩnh ổn định)
+        # =========================================================
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+
+        pna_out_features = len(scalers) * len(aggregators) * n_hidden
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out_features, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU()
+        )
+
+        # =========================================================
+        # 2. EXSTRAQT TEMPORAL BRANCH (6 Đặc trưng siêu phẳng chống FP)
+        # =========================================================
+        self.exstraqt_ln = nn.LayerNorm(6)
+        self.exstraqt_project = nn.Sequential(
+            nn.Linear(6, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU()
+        )
+
+        # =========================================================
+        # 3. ANTI-COLLAPSE ADAPTIVE GATE (Sửa lỗi khởi tạo)
+        # =========================================================
+        self.gate_proj = nn.Linear(n_hidden * 2, n_hidden)
+        self.gate_norm = nn.LayerNorm(n_hidden)
+        self.gate_activation = nn.Sigmoid()
+
+        # =========================================================
+        # 4. POST STABILIZATION WITH DROPOUT
+        # =========================================================
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(p=0.4) # Dropout cao giúp chống học vẹt phân phối động
+        )
+
+    def reset_parameters(self):
+        self.pna_core.reset_parameters()
+        nn.init.kaiming_normal_(self.pna_project[0].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.exstraqt_project[0].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.post_transition[0].weight, nonlinearity='relu')
+
+        # KHÓA CHỐNG BÃO HÒA BIÊN: Dùng Xavier thay vì Kaiming cho lớp sát Sigmoid
+        nn.init.xavier_normal_(self.gate_proj.weight)
+        if self.gate_proj.bias is not None:
+            nn.init.zeros_(self.gate_proj.bias)
+
+        self.pna_project[1].reset_parameters()
+        self.exstraqt_ln.reset_parameters()
+        self.exstraqt_project[1].reset_parameters()
+        self.gate_norm.reset_parameters()
+        self.post_transition[1].reset_parameters()
+
+    def forward(self, x, index, timestamps_, log_amounts):
+        num_edges = x.size(0)
+        num_groups = index.max().item() + 1 if num_edges > 0 else 0
+        device = x.device
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=device)
+
+        # === NHÁNH 1: TĨNH (PNA CORES) ===
+        pna_raw = self.pna_core(x, index)
+        pna_feats = self.pna_project(pna_raw)
+
+        # === NHÁNH 2: ĐỘNG (EXSTRAQT KHỬ NHIỄU BIÊN TUYỆT ĐỐI) ===
+        edge_counts = torch.bincount(index, minlength=num_groups).to(torch.float32)
+
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='max')
+
+        # Khử lỗi sập duration về 0 ở tài khoản thưa (Early accounts)
+        duration_safe = (max_t - min_t) + 1.0
+        tau = (timestamps_ - min_t[index]) / duration_safe[index]
+
+        # KHÓA BẢO HIỂM 1: Thay scatter_softmax bằng Sigmoid-Gated Normalized Weights
+        # Triệt tiêu tận gốc hiện tượng phân phối quá nhọn (nhóm ít) hoặc quá loãng (nhóm nhiều)
+        global_std = torch.std(log_amounts) + 1e-6
+        raw_weights = torch.sigmoid(log_amounts / global_std)
+        weight_sum = scatter(raw_weights, index, dim=0, dim_size=num_groups, reduce='sum')
+        amt_weights = raw_weights / (weight_sum[index] + 1e-6)
+
+        # Trích xuất trọng tâm dòng tiền phẳng
+        tf_c = scatter(amt_weights * tau, index, dim=0, dim_size=num_groups, reduce='sum')
+
+        # Giải phóng biến thiên thời gian khỏi Entropy Trọng số
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_groups, reduce='mean')
+        time_var = scatter((tau - mean_tau[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-6)
+        tf_std = torch.sqrt(time_var + 1e-6)
+
+        burst_density = torch.log1p(edge_counts)
+
+        # KHÓA BẢO HIỂM 2: Đồng bộ hóa thứ nguyên Logarit cho money_velocity + nén Tanh
+        # Ngăn chặn việc mô hình đánh tụt chỉ số tốc độ của các tài khoản siêu lớn (Whale Fraud)
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        money_velocity = torch.log1p(mean_log_amount) / (torch.log1p(duration_safe) + 1.0)
+        money_velocity = torch.tanh(money_velocity)
+
+        # KHÓA BẢO HIỂM 3: Nén Skewness bằng Tanh
+        # Không cho phép các giao dịch dị biệt (Outliers) bóp méo không gian nhúng
+        skew_num = scatter((log_amounts - mean_log_amount[index]) ** 3, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-6)
+        skew_den = (scatter((log_amounts - mean_log_amount[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-6)) ** 1.5 + 1e-5
+        flow_skew = torch.tanh(skew_num / skew_den)
+
+        avg_inter_arrival = torch.log1p(duration_safe / (edge_counts + 1e-6))
+
+        # Đóng gói và cào bằng biên độ sai lệch chéo nhóm đồ thị dày/thưa (Dense vs Sparse)
+        exstraqt_raw = torch.stack([tf_c, tf_std, burst_density, money_velocity, flow_skew, avg_inter_arrival], dim=-1)
+        exstraqt_feats = self.exstraqt_project(self.exstraqt_ln(exstraqt_raw))
+
+        # === NHÁNH 3: FUSION GATED MULTI-DIMENSIONAL (THẢ TỰ DO AN TOÀN) ===
+        combined_context = torch.cat([pna_feats, exstraqt_feats], dim=-1)
+
+        # KHÓA BẢO HIỂM 4: Tuyến tính hóa logit nhẹ nhàng giúp Gate không bị "lỳ" bão hòa biên sớm
+        gate_logit = self.gate_proj(combined_context)
+        gate_logit = self.gate_norm(gate_logit)
+        alpha = self.gate_activation(gate_logit)
+
+        # Trộn thích ứng tối ưu phân phối trên từng channel ẩn độc lập
+        fused_feats = (1.0 - alpha) * pna_feats + alpha * exstraqt_feats
+
+        # Residual Connection gánh dòng chảy Gradient, bảo đảm F1 không bao giờ bị "đứng hình"
+        output = self.post_transition(fused_feats) + pna_feats
+
+        return output
+
+
+
+
+
+
+
+
+
+
 !apt-get install git-lfs
 !pip install datatable
 !pip install pybind11
