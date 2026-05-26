@@ -1,5 +1,438 @@
 import torch
 import torch.nn as nn
+from torch_scatter import scatter, scatter_softmax
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+
+
+class ExSTraQtPnaGatedFusionAgg(nn.Module):
+
+    def __init__(self, n_hidden, deg):
+        super().__init__()
+
+        self.n_hidden = n_hidden
+
+        # =========================================================
+        # 1. PNA CORE
+        # =========================================================
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+
+        self.pna_core = DegreeScalerAggregation(
+            aggregators,
+            scalers,
+            deg
+        )
+
+        pna_out_features = (
+            len(aggregators) *
+            len(scalers) *
+            n_hidden
+        )
+
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out_features, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU()
+        )
+
+        # =========================================================
+        # 2. EXSTRAQT FEATURE BRANCH
+        #
+        # 9 behavioral features:
+        #
+        # tf_c
+        # tf_std
+        # burst_density
+        # money_velocity
+        # flow_skew
+        # avg_inter_arrival
+        # flow_entropy
+        # flow_asymmetry
+        # temporal_concentration
+        # =========================================================
+        self.exstraqt_ln = nn.LayerNorm(9)
+
+        self.exstraqt_project = nn.Sequential(
+            nn.Linear(9, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU()
+        )
+
+        # =========================================================
+        # 3. GATED FUSION
+        # =========================================================
+        self.gate_proj = nn.Linear(
+            n_hidden * 2,
+            n_hidden
+        )
+
+        self.gate_norm = nn.LayerNorm(n_hidden)
+
+        self.gate_activation = nn.Sigmoid()
+
+        # =========================================================
+        # 4. OUTPUT
+        # =========================================================
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(0.35)
+        )
+
+    def reset_parameters(self):
+
+        self.pna_core.reset_parameters()
+
+        nn.init.kaiming_normal_(
+            self.pna_project[0].weight,
+            nonlinearity='relu'
+        )
+
+        nn.init.kaiming_normal_(
+            self.exstraqt_project[0].weight,
+            nonlinearity='relu'
+        )
+
+        nn.init.kaiming_normal_(
+            self.gate_proj.weight,
+            nonlinearity='relu'
+        )
+
+        nn.init.kaiming_normal_(
+            self.post_transition[0].weight,
+            nonlinearity='relu'
+        )
+
+        self.pna_project[1].reset_parameters()
+
+        self.exstraqt_ln.reset_parameters()
+
+        self.exstraqt_project[1].reset_parameters()
+
+        self.gate_norm.reset_parameters()
+
+        self.post_transition[1].reset_parameters()
+
+    def forward(
+        self,
+        x,
+        index,
+        timestamps_,
+        log_amounts
+    ):
+
+        device = x.device
+
+        num_edges = x.size(0)
+
+        num_groups = (
+            index.max().item() + 1
+            if num_edges > 0 else 0
+        )
+
+        if num_edges == 0:
+            return torch.zeros(
+                num_groups,
+                self.n_hidden,
+                device=device
+            )
+
+        # =========================================================
+        # 1. PNA BRANCH
+        # =========================================================
+        pna_raw = self.pna_core(x, index)
+
+        pna_feats = self.pna_project(
+            pna_raw
+        )
+
+        # =========================================================
+        # 2. EXSTRAQT BRANCH
+        # =========================================================
+
+        edge_counts = torch.bincount(
+            index,
+            minlength=num_groups
+        ).float()
+
+        # ---------------------------------------------------------
+        # TEMPORAL NORMALIZATION
+        # ---------------------------------------------------------
+        min_t = scatter(
+            timestamps_,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce='min'
+        )
+
+        max_t = scatter(
+            timestamps_,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce='max'
+        )
+
+        duration_safe = (
+            max_t - min_t
+        ) + 1.0
+
+        tau = (
+            timestamps_ -
+            min_t[index]
+        ) / duration_safe[index]
+
+        # ---------------------------------------------------------
+        # STABLE FLOW WEIGHTING
+        # ---------------------------------------------------------
+        global_std = (
+            torch.std(log_amounts) + 1e-6
+        )
+
+        raw_weights = scatter_softmax(
+            log_amounts / global_std,
+            index,
+            dim=0
+        )
+
+        amt_weights = (
+            raw_weights /
+            (edge_counts[index] + 1e-6)
+        )
+
+        # =========================================================
+        # FEATURE 1:
+        # TEMPORAL FLOW CENTER
+        # =========================================================
+        tf_c = scatter(
+            amt_weights * tau,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce='sum'
+        )
+
+        # =========================================================
+        # FEATURE 2:
+        # TEMPORAL FLOW STD
+        # =========================================================
+        mean_tau = scatter(
+            tau,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce='mean'
+        )
+
+        time_var = scatter(
+            (tau - mean_tau[index]) ** 2,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce='sum'
+        ) / (edge_counts + 1e-6)
+
+        tf_std = torch.sqrt(
+            time_var + 1e-6
+        )
+
+        # =========================================================
+        # FEATURE 3:
+        # BURST DENSITY
+        # =========================================================
+        burst_density = torch.log1p(
+            edge_counts
+        )
+
+        # =========================================================
+        # FEATURE 4:
+        # MONEY VELOCITY
+        # =========================================================
+        mean_log_amount = scatter(
+            log_amounts,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce='mean'
+        )
+
+        money_velocity = torch.log1p(
+            mean_log_amount /
+            torch.log1p(duration_safe)
+        )
+
+        # =========================================================
+        # FEATURE 5:
+        # FLOW SKEW
+        # =========================================================
+        centered_amounts = (
+            log_amounts -
+            mean_log_amount[index]
+        )
+
+        skew_num = scatter(
+            centered_amounts ** 3,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce='sum'
+        ) / (edge_counts + 1e-6)
+
+        skew_den = (
+            scatter(
+                centered_amounts ** 2,
+                index,
+                dim=0,
+                dim_size=num_groups,
+                reduce='sum'
+            ) / (edge_counts + 1e-6)
+        ) ** 1.5 + 1e-5
+
+        flow_skew = (
+            skew_num / skew_den
+        )
+
+        # =========================================================
+        # FEATURE 6:
+        # AVG INTER-ARRIVAL
+        # =========================================================
+        avg_inter_arrival = torch.log1p(
+            duration_safe /
+            (edge_counts + 1e-6)
+        )
+
+        # =========================================================
+        # FEATURE 7:
+        # FLOW ENTROPY
+        # =========================================================
+        entropy_edge = (
+            -raw_weights *
+            torch.log(raw_weights + 1e-9)
+        )
+
+        flow_entropy = scatter(
+            entropy_edge,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce='sum'
+        )
+
+        flow_entropy = (
+            flow_entropy /
+            torch.log1p(edge_counts + 1.0)
+        )
+
+        # =========================================================
+        # FEATURE 8:
+        # FLOW ASYMMETRY
+        # =========================================================
+        amounts = torch.exp(
+            log_amounts
+        )
+
+        sum_amount = scatter(
+            amounts,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce='sum'
+        )
+
+        max_amount = scatter(
+            amounts,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce='max'
+        )
+
+        flow_asymmetry = (
+            max_amount /
+            (sum_amount + 1e-6)
+        )
+
+        # =========================================================
+        # FEATURE 9:
+        # TEMPORAL CONCENTRATION
+        # =========================================================
+        temporal_concentration = scatter(
+            tau ** 2,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce='mean'
+        )
+
+        # =========================================================
+        # FEATURE STACK
+        # =========================================================
+        exstraqt_raw = torch.stack([
+            tf_c,
+            tf_std,
+            burst_density,
+            money_velocity,
+            flow_skew,
+            avg_inter_arrival,
+            flow_entropy,
+            flow_asymmetry,
+            temporal_concentration
+        ], dim=-1)
+
+        # =========================================================
+        # NORMALIZE + PROJECT
+        # =========================================================
+        exstraqt_feats = self.exstraqt_project(
+            self.exstraqt_ln(exstraqt_raw)
+        )
+
+        # =========================================================
+        # 3. GATED FUSION
+        # =========================================================
+        combined_context = torch.cat([
+            pna_feats,
+            exstraqt_feats
+        ], dim=-1)
+
+        gate_logit = self.gate_proj(
+            combined_context
+        )
+
+        gate_logit = self.gate_norm(
+            gate_logit
+        )
+
+        alpha = self.gate_activation(
+            gate_logit
+        )
+
+        fused_feats = (
+            (1.0 - alpha) * pna_feats +
+            alpha * exstraqt_feats
+        )
+
+        # =========================================================
+        # 4. OUTPUT
+        # =========================================================
+        output = (
+            self.post_transition(
+                fused_feats
+            ) + pna_feats
+        )
+
+        return output
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch_scatter import scatter
 from torch_geometric.nn.aggr import DegreeScalerAggregation
