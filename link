@@ -3,6 +3,133 @@ import torch.nn as nn
 from torch_scatter import scatter, scatter_softmax
 from torch_geometric.nn.aggr import DegreeScalerAggregation
 
+class ExSTraQtPnaGatedFusionAgg(nn.Module):
+    def __init__(self, n_hidden, deg, dropout_p=0.4):
+        super().__init__()
+        self.n_hidden = n_hidden
+        
+        # 1. Nhánh tính toán Trọng số Cạnh từ Thời gian (ExSTraQt lọc nhiễu)
+        self.exstraqt_ln = nn.LayerNorm(6)
+        self.edge_weight_project = nn.Sequential(
+            nn.Linear(6, 1), # Chiếu thẳng về 1 chiều để làm trọng số cạnh
+            nn.Sigmoid()     # Ép về khoảng (0, 1) để làm cổng lọc an toàn
+        )
+        
+        # 2. Lõi PNA Tĩnh thuần túy - Giữ nguyên gốc 100% không gian biểu diễn
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+        
+        pna_out_features = len(scalers) * len(aggregators) * n_hidden
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out_features, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(p=dropout_p)
+        )
+        
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(p=dropout_p)
+        )
+        
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.pna_core.reset_parameters()
+        nn.init.kaiming_normal_(self.edge_weight_project[0].weight, nonlinearity='sigmoid')
+        nn.init.kaiming_normal_(self.pna_project[0].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.post_transition[0].weight, nonlinearity='relu')
+        
+        self.exstraqt_ln.reset_parameters()
+        self.pna_project[1].reset_parameters()
+        self.post_transition[1].reset_parameters()
+
+    def forward(self, x, index, timestamps_, log_amounts, num_groups=None):
+        num_edges = x.size(0)
+        
+        if num_groups is None:
+            num_groups = index.max().item() + 1 if num_edges > 0 else 0
+            
+        device = x.device
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=device)
+
+        # === BƯỚC 1: TRÍCH XUẤT THÔNG TIN ĐỘNG LÀM BỘ LỌC CẠNH (EDGE ATTENTION) ===
+        edge_counts = torch.bincount(index, minlength=num_groups).to(torch.float32)
+        
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='max')
+        
+        duration_safe = (max_t - min_t) + 1.0
+        tau = (timestamps_ - min_t[index]) / duration_safe[index]
+
+        temperature = 3.0
+        global_std = torch.std(log_amounts) + 1e-5
+        raw_weights = scatter_softmax(log_amounts / (global_std * temperature), index, dim=0)
+        amt_weights = raw_weights / (edge_counts[index] + 1e-5)
+
+        tf_c = scatter(amt_weights * tau, index, dim=0, dim_size=num_groups, reduce='sum')
+        
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_groups, reduce='mean')
+        time_var = scatter((tau - mean_tau[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)
+        tf_std = torch.sqrt(time_var + 1e-5)
+
+        burst_density = torch.log1p(edge_counts)
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        money_velocity = torch.log1p(mean_log_amount / torch.log1p(duration_safe))
+
+        skew_num = scatter((log_amounts - mean_log_amount[index]) ** 3, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)
+        skew_den = (scatter((log_amounts - mean_log_amount[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)) ** 1.5 + 1e-5
+        flow_skew = torch.clamp(skew_num / skew_den, min=-2.0, max=2.0) 
+
+        avg_inter_arrival = torch.log1p(duration_safe / (edge_counts + 1e-5))
+
+        # Đóng gói đặc trưng động cục bộ
+        exstraqt_raw = torch.stack([tf_c, tf_std, burst_density, money_velocity, flow_skew, avg_inter_arrival], dim=-1)
+        
+        # Tính toán điểm tin cậy động cho từng cụm node tương tác
+        group_attention = self.edge_weight_project(self.exstraqt_ln(exstraqt_raw)) # Kích thước: [num_groups, 1]
+        
+        # Phát tán trọng số chú ý từ Node đích ngược lại cho từng Cạnh thành phần
+        edge_attention = group_attention[index] # Kích thước: [num_edges, 1]
+
+        # === BƯỚC 2: TIẾN HÀNH LỌC ĐẶC TRƯNG CẠNH TRƯỚC KHI ĐƯA VÀO PNA ===
+        # Thay vì gộp x thô, ta nhân x với mức độ tin cậy thời gian. 
+        # Nếu dòng thời gian của cạnh bị drift/nhiễu ở tập Test, trọng số attention tự động bóp nhỏ đặc trưng cạnh đó lại.
+        filtered_x = x * edge_attention
+
+        # === BƯỚC 3: GỘP KHÔNG GIAN BẰNG PNA THUẦN TÚY ===
+        pna_raw = self.pna_core(filtered_x, index) 
+        pna_feats = self.pna_project(pna_raw) 
+        
+        output = self.post_transition(pna_feats) + pna_feats
+        
+        return output
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+from torch_scatter import scatter, scatter_softmax
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+
 
 class ExSTraQtPnaGatedFusionAgg(nn.Module):
 
