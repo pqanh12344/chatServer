@@ -1,3 +1,827 @@
+import copy
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn import Linear
+from torch_geometric.data import HeteroData
+from torch_geometric.nn import GINEConv, PNAConv, BatchNorm
+from torch_geometric.utils import degree
+from torch_scatter import scatter, scatter_softmax
+from sklearn.metrics import precision_score, recall_score, f1_score
+
+# ====================================================================
+# PHẦN 1: ĐỊNH NGHĨA CÁC LỚP AGGREGATION ĐỘC LẬP (TẦNG 1)
+# ====================================================================
+
+class PnaPureAgg(nn.Module):
+    """Nhánh tĩnh: PNA thuần túy giữ nguyên cấu trúc không gian ẩn sạch"""
+    def __init__(self, n_hidden, deg, dropout_p=0.3):
+        super().__init__()
+        self.n_hidden = n_hidden
+        from torch_geometric.nn.aggr import DegreeScalerAggregation
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+        
+        pna_out_features = len(scalers) * len(aggregators) * n_hidden
+        self.project = nn.Sequential(
+            nn.Linear(pna_out_features, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(p=dropout_p)
+        )
+
+    def forward(self, x, index, num_groups=None):
+        if num_groups is None:
+            num_groups = index.max().item() + 1 if x.size(0) > 0 else 0
+        if x.size(0) == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=x.device)
+        return self.project(self.pna_core(x, index))
+
+
+class ExSTraQtPureAgg(nn.Module):
+    """Nhánh động: Trích xuất triệt để các đặc trưng chuỗi thời gian động"""
+    def __init__(self, n_hidden, dropout_p=0.3):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.exstraqt_ln = nn.LayerNorm(6)
+        self.project = nn.Sequential(
+            nn.Linear(6, n_hidden),
+            nn.LayerNorm(n_hidden), 
+            nn.SiLU(),
+            nn.Dropout(p=dropout_p)
+        )
+
+    def forward(self, x, index, timestamps_, log_amounts, num_groups=None):
+        num_edges = x.size(0)
+        if num_groups is None:
+            num_groups = index.max().item() + 1 if num_edges > 0 else 0
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=x.device)
+
+        edge_counts = torch.bincount(index, minlength=num_groups).to(torch.float32)
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='max')
+        
+        duration_safe = (max_t - min_t) + 1.0
+        tau = (timestamps_ - min_t[index]) / duration_safe[index]
+
+        temperature = 3.0
+        global_std = torch.std(log_amounts) + 1e-5
+        raw_weights = scatter_softmax(log_amounts / (global_std * temperature), index, dim=0)
+        amt_weights = raw_weights / (edge_counts[index] + 1e-5)
+
+        tf_c = scatter(amt_weights * tau, index, dim=0, dim_size=num_groups, reduce='sum')
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_groups, reduce='mean')
+        time_var = scatter((tau - mean_tau[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)
+        tf_std = torch.sqrt(time_var + 1e-5)
+
+        burst_density = torch.log1p(edge_counts)
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        money_velocity = torch.log1p(mean_log_amount / torch.log1p(duration_safe))
+
+        skew_num = scatter((log_amounts - mean_log_amount[index]) ** 3, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)
+        skew_den = (scatter((log_amounts - mean_log_amount[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)) ** 1.5 + 1e-5
+        flow_skew = torch.clamp(skew_num / skew_den, min=-2.0, max=2.0)
+
+        avg_inter_arrival = torch.log1p(duration_safe / (edge_counts + 1e-5))
+
+        exstraqt_raw = torch.stack([tf_c, tf_std, burst_density, money_velocity, flow_skew, avg_inter_arrival], dim=-1)
+        exstraqt_raw = torch.clamp(exstraqt_raw, min=-3.0, max=3.0)
+        
+        return self.project(self.exstraqt_ln(exstraqt_raw))
+
+
+class MultiEdgeAggModule(nn.Module):
+    """Bộ quản lý Aggregation chọn thuật toán tĩnh/động theo tham số cấu hình"""
+    def __init__(self, n_hidden=None, agg_type=None, index=None, deg=None):
+        super().__init__()
+        self.agg_type = agg_type
+
+        if agg_type == 'pna':
+            if deg is None and index is not None:
+                uniq_index, inverse_indices = torch.unique(index, return_inverse=True)
+                d = degree(inverse_indices, num_nodes=uniq_index.numel(), dtype=torch.long)
+                deg = torch.bincount(d, minlength=1)
+            self.agg = PnaPureAgg(n_hidden=n_hidden, deg=deg)
+        elif agg_type == 'exstraqt':
+            self.agg = ExSTraQtPureAgg(n_hidden=n_hidden)
+        else:
+            from torch_geometric.nn.aggr import SumAggregation
+            self.agg = SumAggregation()
+        
+    def forward(self, edge_index, edge_attr, simp_edge_batch, times=None, log_amounts=None):
+        _, inverse_indices = torch.unique(simp_edge_batch, return_inverse=True)
+        new_edge_index = scatter(edge_index, inverse_indices, dim=1, reduce='mean') if self.agg_type is not None else edge_index
+
+        if self.agg_type == 'exstraqt':
+            new_edge_attr = self.agg(x=edge_attr, index=inverse_indices, timestamps_=times, log_amounts=log_amounts)
+        else:
+            new_edge_attr = self.agg(x=edge_attr, index=inverse_indices)
+            
+        return new_edge_index, new_edge_attr, inverse_indices
+
+# ====================================================================
+# PHẦN 2: CẤU TRÚC MÔ HÌNH CHÍNH (MultiMPNN & GnnHelper)
+# ====================================================================
+
+class GnnHelper(torch.nn.Module):
+    def __init__(self, num_gnn_layers, n_hidden=100, edge_updates=False, 
+                 final_dropout=0.5, index_ = None, deg = None, args=None):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.num_gnn_layers = num_gnn_layers
+        self.edge_updates = edge_updates
+        self.flatten_edges = args.flatten_edges
+        self.edge_agg_type = args.edge_agg_type
+        self.args = args
+        self.node_agg = 'sum' if args.node_agg_type == 'sum' else 'mean'
+     
+        self.edge_aggrs = nn.ModuleList()
+        self.convs = nn.ModuleList()
+        self.emlps = nn.ModuleList()
+        self.batch_norms = nn.ModuleList()
+        
+        for _ in range(self.num_gnn_layers):
+            if args.model == 'gin':
+                conv = GINEConv(nn.Sequential(Linear(self.n_hidden, self.n_hidden), nn.ReLU(), Linear(self.n_hidden, self.n_hidden)), edge_dim=self.n_hidden, aggr=self.node_agg)
+            elif args.model == 'pna':
+                conv = PNAConv(in_channels=n_hidden, out_channels=n_hidden, aggregators=['mean', 'min', 'max', 'std'], scalers=['identity', 'amplification', 'attenuation'], deg=deg, edge_dim=n_hidden, towers=5, pre_layers=1, post_layers=1, divide_input=False)
+                
+            if self.edge_updates: 
+                self.emlps.append(nn.Sequential(Linear(3 * self.n_hidden, self.n_hidden), nn.ReLU(), Linear(self.n_hidden, self.n_hidden)))
+            if self.flatten_edges:
+                self.edge_aggrs.append(MultiEdgeAggModule(n_hidden, agg_type=self.edge_agg_type, index=index_, deg=deg))
+                
+            self.convs.append(conv)
+            self.batch_norms.append(BatchNorm(n_hidden))
+
+    def forward(self, x, edge_index, edge_attr, simp_edge_batch=None, times=None, log_amounts=None):
+        src, dst = edge_index
+        for i in range(self.num_gnn_layers):
+            if self.flatten_edges:
+                n_edge_index, n_edge_attr, inverse_indices = self.edge_aggrs[i](edge_index, edge_attr, simp_edge_batch, times=times, log_amounts=log_amounts)
+                x = (x + F.relu(self.batch_norms[i](self.convs[i](x, n_edge_index, n_edge_attr)))) / 2
+                if self.edge_updates: 
+                    remapped_edge_attr = torch.index_select(n_edge_attr, 0, inverse_indices) 
+                    edge_attr = edge_attr + self.emlps[i](torch.cat([x[src], remapped_edge_attr, edge_attr], dim=-1)) / 2
+            else:
+                x = (x + F.relu(self.batch_norms[i](self.convs[i](x, edge_index, edge_attr)))) / 2
+                if self.edge_updates: 
+                    edge_attr = edge_attr + self.emlps[i](torch.cat([x[src], x[dst], edge_attr], dim=-1)) / 2
+        return x, edge_attr
+
+
+class LinkPredHead(torch.nn.Module):
+    def __init__(self, n_hidden, n_classes, final_dropout) -> None:
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.mlp = nn.Sequential(Linear(self.n_hidden*3, self.n_hidden), nn.ReLU(), nn.Dropout(final_dropout), Linear(self.n_hidden, 25), nn.ReLU(), nn.Dropout(final_dropout), Linear(25, n_classes))
+            
+    def forward(self, x, pos_edge_index, pos_edge_attr, neg_edge_index, neg_edge_attr):
+        x_pos = x[pos_edge_index.T].reshape(-1, 2 * self.n_hidden).relu()
+        x_neg = x[neg_edge_index.T].reshape(-1, 2 * self.n_hidden).relu()
+        x_pos = torch.cat((x_pos, pos_edge_attr.view(-1, pos_edge_attr.shape[1])), 1)
+        x_neg = torch.cat((x_neg, neg_edge_attr.view(-1, neg_edge_attr.shape[1])), 1)
+        return torch.sigmoid(self.mlp(x_pos)), torch.sigmoid(self.mlp(x_neg))
+
+
+class MultiMPNN(torch.nn.Module):
+    def __init__(self, num_features, num_gnn_layers, n_classes=2, n_hidden=100, edge_updates=False, edge_dim=None, final_dropout=0.5, index_ = None, deg=None, args=None):
+        super().__init__()
+        self.args = args
+        self.n_hidden = n_hidden
+        self.node_emb = nn.Linear(num_features, n_hidden)
+        self.edge_emb = nn.Linear(edge_dim, n_hidden)
+        self.gnn = GnnHelper(num_gnn_layers=num_gnn_layers, n_hidden=n_hidden, edge_updates=edge_updates, final_dropout=final_dropout, index_=index_, deg=deg, args=args)
+        
+        if args.task == 'edge_class':
+            self.mlp = nn.Sequential(Linear(n_hidden*3, 50), nn.ReLU(), nn.Dropout(final_dropout), Linear(50, 25), nn.ReLU(), nn.Dropout(final_dropout), Linear(25, n_classes))
+        elif args.task == 'node_class':
+            self.mlp = nn.Sequential(Linear(n_hidden, 50), nn.ReLU(), nn.Dropout(final_dropout), Linear(50, 25), nn.ReLU(), nn.Dropout(final_dropout), Linear(25, n_classes))
+        elif args.task == 'lp':
+            self.edge_readout = LinkPredHead(n_hidden=n_hidden, n_classes=1, final_dropout=final_dropout)
+    
+    def forward(self, data):
+        times = data.timestamps if hasattr(data, 'timestamps') else None
+        log_amounts = data.log_amounts if hasattr(data, 'log_amounts') else None
+        
+        if isinstance(data, HeteroData):
+            x_dict = {"node": self.node_emb(data['node'].x)}
+            edge_attr_dict = {("node", 'to', 'node'): self.edge_emb(data['node', 'to', 'node'].edge_attr)}
+            simp_edge_batch_dict = data.simp_edge_batch_dict if self.args.flatten_edges else None
+            x_dict, edge_attr_dict = self.gnn(x_dict, data.edge_index_dict, edge_attr_dict, simp_edge_batch_dict, times, log_amounts)
+            x, edge_attr = x_dict['node'], edge_attr_dict['node', 'to', 'node']
+            
+            if self.args.task == 'edge_class':
+                x = x[data['node', 'to', 'node'].edge_index.T].reshape(-1, 2*self.n_hidden).relu()
+                return self.mlp(torch.cat((x, edge_attr.view(-1, edge_attr.shape[1])), 1))
+            elif self.args.task == 'node_class':
+                return self.mlp(x)
+            elif self.args.task == 'lp':
+                return self.edge_readout(x, data['node', 'to', 'node'].pos_edge_index, self.edge_emb(data['node', 'to', 'node'].pos_edge_attr), data['node', 'to', 'node'].neg_edge_index, self.edge_emb(data['node', 'to', 'node'].neg_edge_attr))
+        else:
+            x, edge_attr = self.node_emb(data.x), self.edge_emb(data.edge_attr)
+            x, edge_attr = self.gnn(x, data.edge_index, edge_attr, data.simp_edge_batch if self.args.flatten_edges else None, times, log_amounts)
+            
+            if self.args.task == 'edge_class':
+                x = x[data.edge_index.T].reshape(-1, 2*self.n_hidden).relu()
+                return self.mlp(torch.cat((x, edge_attr.view(-1, edge_attr.shape[1])), 1))
+            elif self.args.task == 'node_class':
+                return self.mlp(x)
+            elif self.args.task == 'lp':
+                return self.edge_readout(x, data.pos_edge_index, self.edge_emb(data.pos_edge_attr), data.neg_edge_index, self.edge_emb(data.neg_edge_attr))
+
+# ====================================================================
+# PHẦN 3: BỘ GỘP QUYẾT ĐỊNH CUỐI CÙNG LATE FUSION (TẦNG 2)
+# ====================================================================
+
+class DowaIowaMetaAggregator(nn.Module):
+    def __init__(self, mode='IOWA'):
+        super().__init__()
+        self.mode = mode
+        if self.mode == 'IOWA':
+            self.beta = nn.Parameter(torch.tensor([0.0, 0.0]), requires_grad=True)
+
+    def forward(self, pred_pna, pred_dyn):
+        p_pna, p_dyn = pred_pna.view(-1), pred_dyn.view(-1)
+        if self.mode == 'DOWA':
+            m = (p_pna + p_dyn) / 2.0
+            diff_pna, diff_dyn = torch.abs(p_pna - m), torch.abs(p_dyn - m)
+            sum_diff = diff_pna + diff_dyn + 1e-6
+            w_pna, w_dyn = (1.0 - diff_pna/sum_diff)/(2.0 - 1.0), (1.0 - diff_dyn/sum_diff)/(2.0 - 1.0) # Chuẩn hóa mẫu số gọn
+            return w_pna * p_pna + w_dyn * p_dyn
+        elif self.mode == 'IOWA':
+            preds_sorted, _ = torch.sort(torch.stack([p_pna, p_dyn], dim=-1), dim=-1, descending=True)
+            weights = torch.softmax(self.beta, dim=0)
+            return preds_sorted[:, 0] * weights[0] + preds_sorted[:, 1] * weights[1]
+
+# ====================================================================
+# PHẦN 4: ĐÓNG GÓI TOÀN BỘ ENSEMBLE TRƯỚC ĐOẠN TRAINING (GỌN ĐẸP)
+# ====================================================================
+
+class EnsembleStackingModel(nn.Module):
+    """Lớp bọc hợp nhất toàn bộ hệ thống Stacking để tối giản hóa code Train Loop"""
+    def __init__(self, num_features, num_gnn_layers, edge_dim, index_, deg, args, meta_mode='IOWA'):
+        super().__init__()
+        self.task = args.task
+        
+        # Tạo mô hình PNA tĩnh độc lập
+        args_pna = copy.deepcopy(args)
+        args_pna.model, args_pna.edge_agg_type = 'pna', 'pna'
+        self.model_pna = MultiMPNN(num_features, num_gnn_layers, edge_dim=edge_dim, index_=index_, deg=deg, args=args_pna)
+
+        # Tạo mô hình ExSTraQt động độc lập
+        args_dyn = copy.deepcopy(args)
+        args_dyn.edge_agg_type = 'exstraqt'
+        self.model_dyn = MultiMPNN(num_features, num_gnn_layers, edge_dim=edge_dim, index_=index_, deg=deg, args=args_dyn)
+
+        # Tầng Meta Aggregator gộp quyết định
+        self.meta_aggregator = DowaIowaMetaAggregator(mode=meta_mode)
+
+    def forward(self, data):
+        if self.task == 'lp':
+            pos_pna, neg_pna = self.model_pna(data)
+            pos_dyn, neg_dyn = self.model_dyn(data)
+            
+            final_pos = self.meta_aggregator(pos_pna, pos_dyn)
+            final_neg = self.meta_aggregator(neg_pna, neg_dyn)
+            return final_pos, final_neg
+        else:
+            # Cho node_class hoặc edge_class
+            out_pna = torch.softmax(self.model_pna(data), dim=-1)[:, 1]
+            out_dyn = torch.softmax(self.model_dyn(data), dim=-1)[:, 1]
+            return self.meta_aggregator(out_pna, out_dyn)
+
+# ====================================================================
+# PHẦN 5: VÒNG LẶP HUÂN LUYỆN SIÊU TỐI GIẢN (TRAINING & EVALUATION LOOP)
+# ====================================================================
+
+def run_clean_pipeline(train_loader, test_loader, num_features, num_gnn_layers, edge_dim, index_, deg, args):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # KHỞI TẠO DUY NHẤT MỘT ĐỐI TƯỢNG HỢP NHẤT
+    model = EnsembleStackingModel(num_features, num_gnn_layers, edge_dim, index_, deg, args, meta_mode='IOWA').to(device)
+    
+    # Khai báo Optimizer gom toàn bộ tham số của cả Tầng 1 và Tầng 2
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+    criterion = nn.BCELoss()
+
+    # --- Vòng lặp Train ---
+    def train_one_epoch():
+        model.train()
+        total_loss = 0
+        for batch in train_loader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            
+            if args.task == 'lp':
+                final_pos, final_neg = model(batch)
+                loss = criterion(final_pos, torch.ones_like(final_pos)) + criterion(final_neg, torch.zeros_like(final_neg))
+            else:
+                final_pred = model(batch)
+                loss = criterion(final_pred, batch.y.float())
+                
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        return total_loss / len(train_loader)
+
+    # --- Vòng lặp Test Eval ---
+    def evaluate():
+        model.eval()
+        all_preds, all_targets = [], []
+        with torch.no_grad():
+            for batch in test_loader:
+                batch = batch.to(device)
+                if args.task == 'lp':
+                    final_pos, final_neg = model(batch)
+                    preds = torch.cat([final_pos, final_neg], dim=0)
+                    targets = torch.cat([torch.ones_like(final_pos), torch.zeros_like(final_neg)], dim=0)
+                else:
+                    preds = model(batch)
+                    targets = batch.y
+                all_preds.append(preds.cpu())
+                all_targets.append(targets.cpu())
+                
+        y_pred_labels = (torch.cat(all_preds, dim=0).numpy() >= 0.5).astype(int)
+        y_true = torch.cat(all_targets, dim=0).numpy()
+        return (precision_score(y_true, y_pred_labels, zero_division=0), recall_score(y_true, y_pred_labels, zero_division=0), f1_score(y_true, y_pred_labels, zero_division=0))
+
+    # --- Chạy Epochs ---
+    for epoch in range(1, args.epochs + 1):
+        loss_val = train_one_epoch()
+        prec, rec, f1 = evaluate()
+        print(f"Epoch {epoch:03d} | Loss: {loss_val:.4f} | Test Precision: {prec:.4f} | Recall: {rec:.4f} | F1: {f1:.4f}")
+
+
+
+
+
+
+
+
+
+import copy
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn import Linear
+from torch_geometric.data import HeteroData
+from torch_geometric.nn import GINEConv, PNAConv, BatchNorm
+from torch_geometric.utils import degree
+from torch_scatter import scatter, scatter_softmax
+from sklearn.metrics import precision_score, recall_score, f1_score
+
+# ====================================================================
+# PHẦN 1: ĐỊNH NGHĨA CÁC LỚP AGGREGATION ĐỘC LẬP (TẦNG 1)
+# ====================================================================
+
+class PnaPureAgg(nn.Module):
+    """Nhánh tĩnh: PNA thuần túy giữ nguyên cấu trúc không gian ẩn sạch"""
+    def __init__(self, n_hidden, deg, dropout_p=0.3):
+        super().__init__()
+        self.n_hidden = n_hidden
+        from torch_geometric.nn.aggr import DegreeScalerAggregation
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+        
+        pna_out_features = len(scalers) * len(aggregators) * n_hidden
+        self.project = nn.Sequential(
+            nn.Linear(pna_out_features, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(p=dropout_p)
+        )
+
+    def forward(self, x, index, num_groups=None):
+        if num_groups is None:
+            num_groups = index.max().item() + 1 if x.size(0) > 0 else 0
+        if x.size(0) == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=x.device)
+        return self.project(self.pna_core(x, index))
+
+    def reset_parameters(self):
+        self.pna_core.reset_parameters()
+        nn.init.kaiming_normal_(self.project[0].weight, nonlinearity='relu')
+        self.project[1].reset_parameters()
+
+
+class ExSTraQtPureAgg(nn.Module):
+    """Nhánh động: Trích xuất triệt để các đặc trưng chuỗi thời gian động"""
+    def __init__(self, n_hidden, dropout_p=0.3):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.exstraqt_ln = nn.LayerNorm(6)
+        self.project = nn.Sequential(
+            nn.Linear(6, n_hidden),
+            nn.LayerNorm(n_hidden), 
+            nn.SiLU(),
+            nn.Dropout(p=dropout_p)
+        )
+
+    def forward(self, x, index, timestamps_, log_amounts, num_groups=None):
+        num_edges = x.size(0)
+        if num_groups is None:
+            num_groups = index.max().item() + 1 if num_edges > 0 else 0
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=x.device)
+
+        # 1. Tính toán mật độ cạnh và khoảng thời gian trôi qua (duration)
+        edge_counts = torch.bincount(index, minlength=num_groups).to(torch.float32)
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='max')
+        
+        duration_safe = (max_t - min_t) + 1.0
+        tau = (timestamps_ - min_t[index]) / duration_safe[index]
+
+        # 2. Cơ chế làm mượt và tính trọng số dựa trên số tiền (Amount-based Softmax)
+        temperature = 3.0
+        global_std = torch.std(log_amounts) + 1e-5
+        raw_weights = scatter_softmax(log_amounts / (global_std * temperature), index, dim=0)
+        amt_weights = raw_weights / (edge_counts[index] + 1e-5)
+
+        # 3. Trích xuất 6 đặc trưng động cốt lõi của ExSTraQt
+        tf_c = scatter(amt_weights * tau, index, dim=0, dim_size=num_groups, reduce='sum')
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_groups, reduce='mean')
+        time_var = scatter((tau - mean_tau[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)
+        tf_std = torch.sqrt(time_var + 1e-5)
+
+        burst_density = torch.log1p(edge_counts)
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        money_velocity = torch.log1p(mean_log_amount / torch.log1p(duration_safe))
+
+        skew_num = scatter((log_amounts - mean_log_amount[index]) ** 3, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)
+        skew_den = (scatter((log_amounts - mean_log_amount[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)) ** 1.5 + 1e-5
+        flow_skew = torch.clamp(skew_num / skew_den, min=-2.0, max=2.0)
+
+        avg_inter_arrival = torch.log1p(duration_safe / (edge_counts + 1e-5))
+
+        # 4. Gộp đặc trưng và đẩy qua tầng chiếu ẩn (Projection)
+        exstraqt_raw = torch.stack([tf_c, tf_std, burst_density, money_velocity, flow_skew, avg_inter_arrival], dim=-1)
+        exstraqt_raw = torch.clamp(exstraqt_raw, min=-3.0, max=3.0)
+        
+        return self.project(self.exstraqt_ln(exstraqt_raw))
+
+    def reset_parameters(self):
+        self.exstraqt_ln.reset_parameters()
+        nn.init.kaiming_normal_(self.project[0].weight, nonlinearity='relu')
+        self.project[1].reset_parameters()
+
+
+class MultiEdgeAggModule(nn.Module):
+    """Bộ quản lý Aggregation cho Cạnh tùy thuộc cấu hình hệ thống"""
+    def __init__(self, n_hidden=None, agg_type=None, index=None, deg=None):
+        super().__init__()
+        self.agg_type = agg_type
+
+        if agg_type == 'pna':
+            if deg is None and index is not None:
+                uniq_index, inverse_indices = torch.unique(index, return_inverse=True)
+                d = degree(inverse_indices, num_nodes=uniq_index.numel(), dtype=torch.long)
+                deg = torch.bincount(d, minlength=1)
+            self.agg = PnaPureAgg(n_hidden=n_hidden, deg=deg)
+            
+        elif agg_type == 'exstraqt':
+            # GỌI LỚP EXSTRAQT Ở ĐÂY
+            self.agg = ExSTraQtPureAgg(n_hidden=n_hidden)
+            
+        elif agg_type == 'transformer':
+            from mock_modules import TransformerAgg # Thay bằng import thực tế của bạn nếu có
+            self.agg = TransformerAgg(d_model=n_hidden)
+        elif agg_type == 'gru':
+            from mock_modules import GRUAgg
+            self.agg = GRUAgg(d_model=n_hidden)
+        else:
+            from torch_geometric.nn.aggr import SumAggregation
+            self.agg = SumAggregation()
+        
+    def forward(self, edge_index, edge_attr, simp_edge_batch, times=None, log_amounts=None):
+        _, inverse_indices = torch.unique(simp_edge_batch, return_inverse=True)
+        new_edge_index = scatter(edge_index, inverse_indices, dim=1, reduce='mean') if self.agg_type is not None else edge_index
+
+        if self.agg_type == 'exstraqt':
+            # Truyền mốc thời gian và log_amounts của cạnh vào ExSTraQt
+            new_edge_attr = self.agg(x=edge_attr, index=inverse_indices, timestamps_=times, log_amounts=log_amounts)
+        elif self.agg_type in ['transformer', 'gru']:
+            new_edge_attr = self.agg(x=edge_attr, index=inverse_indices, timestamps_=times)
+        else:
+            new_edge_attr = self.agg(x=edge_attr, index=inverse_indices)
+            
+        return new_edge_index, new_edge_attr, inverse_indices
+    
+    def reset_parameters(self):
+        if hasattr(self.agg, 'reset_parameters'):
+            self.agg.reset_parameters()
+
+# ====================================================================
+# PHẦN 2: CẤU TRÚC MÔ HÌNH CHÍNH (MultiMPNN & GnnHelper)
+# ====================================================================
+
+class GnnHelper(torch.nn.Module):
+    def __init__(self, num_gnn_layers, n_hidden=100, edge_updates=False, 
+                 final_dropout=0.5, index_ = None, deg = None, args=None):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.num_gnn_layers = num_gnn_layers
+        self.edge_updates = edge_updates
+        self.flatten_edges = args.flatten_edges
+        self.edge_agg_type = args.edge_agg_type
+        self.args = args
+
+        self.node_agg = 'sum' if args.node_agg_type == 'sum' else 'mean'
+     
+        self.edge_aggrs = nn.ModuleList()
+        self.convs = nn.ModuleList()
+        self.emlps = nn.ModuleList()
+        self.batch_norms = nn.ModuleList()
+        
+        for _ in range(self.num_gnn_layers):
+            if args.model == 'gin':
+                conv = GINEConv(nn.Sequential(
+                    nn.Linear(self.n_hidden, self.n_hidden), 
+                    nn.ReLU(), 
+                    nn.Linear(self.n_hidden, self.n_hidden)
+                ), edge_dim=self.n_hidden, aggr=self.node_agg)
+            elif args.model == 'pna':
+                aggregators = ['mean', 'min', 'max', 'std']
+                scalers = ['identity', 'amplification', 'attenuation']
+                conv = PNAConv(in_channels=n_hidden, out_channels=n_hidden,
+                               aggregators=aggregators, scalers=scalers, deg=deg,
+                               edge_dim=n_hidden, towers=5, pre_layers=1, post_layers=1,
+                               divide_input=False)
+                
+            if self.edge_updates: 
+                self.emlps.append(nn.Sequential(
+                    nn.Linear(3 * self.n_hidden, self.n_hidden),
+                    nn.ReLU(),
+                    nn.Linear(self.n_hidden, self.n_hidden),
+                ))
+            if self.flatten_edges:
+                edge_agg = MultiEdgeAggModule(n_hidden, agg_type=self.edge_agg_type, index=index_, deg=deg)
+                self.edge_aggrs.append(edge_agg)
+                
+            self.convs.append(conv)
+            self.batch_norms.append(BatchNorm(n_hidden))
+
+    def forward(self, x, edge_index, edge_attr, simp_edge_batch=None, times=None, log_amounts=None):
+        src, dst = edge_index
+        for i in range(self.num_gnn_layers):
+            if self.flatten_edges:
+                n_edge_index, n_edge_attr, inverse_indices = self.edge_aggrs[i](
+                    edge_index, edge_attr, simp_edge_batch, times=times, log_amounts=log_amounts
+                )
+                x = (x + F.relu(self.batch_norms[i](self.convs[i](x, n_edge_index, n_edge_attr)))) / 2
+                if self.edge_updates: 
+                    remapped_edge_attr = torch.index_select(n_edge_attr, 0, inverse_indices) 
+                    edge_attr = edge_attr + self.emlps[i](torch.cat([x[src], remapped_edge_attr, edge_attr], dim=-1)) / 2
+            else:
+                x = (x + F.relu(self.batch_norms[i](self.convs[i](x, edge_index, edge_attr)))) / 2
+                if self.edge_updates: 
+                    edge_attr = edge_attr + self.emlps[i](torch.cat([x[src], x[dst], edge_attr], dim=-1)) / 2
+                    
+        return x, edge_attr
+
+
+class LinkPredHead(torch.nn.Module):
+    def __init__(self, n_hidden, n_classes, final_dropout) -> None:
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.mlp = nn.Sequential(
+            Linear(self.n_hidden*3, self.n_hidden), nn.ReLU(), nn.Dropout(final_dropout), 
+            Linear(self.n_hidden, 25), nn.ReLU(), nn.Dropout(final_dropout),
+            Linear(25, n_classes)
+        )
+            
+    def forward(self, x, pos_edge_index, pos_edge_attr, neg_edge_index, neg_edge_attr):
+        x_pos = x[pos_edge_index.T].reshape(-1, 2 * self.n_hidden).relu()
+        x_neg = x[neg_edge_index.T].reshape(-1, 2 * self.n_hidden).relu()
+
+        x_pos = torch.cat((x_pos, pos_edge_attr.view(-1, pos_edge_attr.shape[1])), 1)
+        x_neg = torch.cat((x_neg, neg_edge_attr.view(-1, neg_edge_attr.shape[1])), 1)
+
+        return torch.sigmoid(self.mlp(x_pos)), torch.sigmoid(self.mlp(x_neg))
+
+
+class MultiMPNN(torch.nn.Module):
+    def __init__(self, num_features, num_gnn_layers, n_classes=2, n_hidden=100, 
+                 edge_updates=False, edge_dim=None, final_dropout=0.5, 
+                 index_ = None, deg=None, args=None):
+        super().__init__()
+        self.args = args
+        self.n_hidden = n_hidden
+        self.final_dropout = final_dropout
+
+        self.node_emb = nn.Linear(num_features, n_hidden)
+        self.edge_emb = nn.Linear(edge_dim, n_hidden)
+
+        self.gnn = GnnHelper(num_gnn_layers=num_gnn_layers, n_hidden=n_hidden, edge_updates=edge_updates, 
+                             final_dropout=final_dropout, index_=index_, deg=deg, args=args)
+        
+        if args.task == 'edge_class':
+            self.mlp = nn.Sequential(Linear(n_hidden*3, 50), nn.ReLU(), nn.Dropout(final_dropout),
+                                     Linear(50, 25), nn.ReLU(), nn.Dropout(final_dropout), Linear(25, n_classes))
+        elif args.task == 'node_class':
+            self.mlp = nn.Sequential(Linear(n_hidden, 50), nn.ReLU(), nn.Dropout(final_dropout),
+                                     Linear(50, 25), nn.ReLU(), nn.Dropout(final_dropout), Linear(25, n_classes))
+        elif args.task == 'lp':
+            self.edge_readout = LinkPredHead(n_hidden=n_hidden, n_classes=1, final_dropout=final_dropout)
+    
+    def forward(self, data):
+        # Trích xuất dữ liệu mốc thời gian và lượng tiền mặt giao dịch từ batch dữ liệu phục vụ ExSTraQt
+        times = data.timestamps if hasattr(data, 'timestamps') else None
+        log_amounts = data.log_amounts if hasattr(data, 'log_amounts') else None
+        
+        if isinstance(data, HeteroData):
+            x_dict = {"node": self.node_emb(data['node'].x)}
+            edge_attr_dict = {("node", 'to', 'node'): self.edge_emb(data['node', 'to', 'node'].edge_attr)}
+            simp_edge_batch_dict = data.simp_edge_batch_dict if self.args.flatten_edges else None
+
+            x_dict, edge_attr_dict = self.gnn(x_dict, data.edge_index_dict, edge_attr_dict, simp_edge_batch_dict, times, log_amounts)
+            x = x_dict['node']
+            edge_attr = edge_attr_dict['node', 'to', 'node']
+            
+            if self.args.task == 'edge_class':
+                x = x[data['node', 'to', 'node'].edge_index.T].reshape(-1, 2*self.n_hidden).relu()
+                x = torch.cat((x, edge_attr.view(-1, edge_attr.shape[1])), 1)
+                return self.mlp(x)
+            elif self.args.task == 'node_class':
+                return self.mlp(x)
+            elif self.args.task == 'lp':
+                neg_edge_attr = self.edge_emb(data['node', 'to', 'node'].neg_edge_attr) 
+                pos_edge_attr = self.edge_emb(data['node', 'to', 'node'].pos_edge_attr)
+                return self.edge_readout(x, data['node', 'to', 'node'].pos_edge_index, pos_edge_attr, 
+                                         data['node', 'to', 'node'].neg_edge_index, neg_edge_attr)
+        else:
+            x = self.node_emb(data.x)
+            edge_attr = self.edge_emb(data.edge_attr) 
+            simp_edge_batch = data.simp_edge_batch if self.args.flatten_edges else None
+
+            x, edge_attr = self.gnn(x, data.edge_index, edge_attr, simp_edge_batch, times, log_amounts)
+
+            if self.args.task == 'edge_class':
+                x = x[data.edge_index.T].reshape(-1, 2*self.n_hidden).relu()
+                x = torch.cat((x, edge_attr.view(-1, edge_attr.shape[1])), 1)
+                return self.mlp(x)
+            elif self.args.task == 'node_class':
+                return self.mlp(x)
+            elif self.args.task == 'lp':
+                neg_edge_attr = self.edge_emb(data.neg_edge_attr) 
+                pos_edge_attr = self.edge_emb(data.pos_edge_attr)
+                return self.edge_readout(x, data.pos_edge_index, pos_edge_attr, data.neg_edge_index, neg_edge_attr)
+
+# ====================================================================
+# PHẦN 3: BỘ GỘP QUYẾT ĐỊNH CUỐI CÙNG LATE FUSION (TẦNG 2)
+# ====================================================================
+
+class DowaIowaMetaAggregator(nn.Module):
+    """Toán tử DOWA / IOWA thực thi trên xác suất đầu ra (Probabilities)"""
+    def __init__(self, mode='IOWA'):
+        super().__init__()
+        self.mode = mode
+        if self.mode == 'IOWA':
+            self.beta = nn.Parameter(torch.tensor([0.0, 0.0]), requires_grad=True)
+
+    def forward(self, pred_pna, pred_dyn):
+        p_pna = pred_pna.view(-1)
+        p_dyn = pred_dyn.view(-1)
+
+        if self.mode == 'DOWA':
+            m = (p_pna + p_dyn) / 2.0
+            diff_pna = torch.abs(p_pna - m)
+            diff_dyn = torch.abs(p_dyn - m)
+            sum_diff = diff_pna + diff_dyn + 1e-6
+
+            c_pna = 1.0 - (diff_pna / sum_diff)
+            c_dyn = 1.0 - (diff_dyn / sum_diff)
+
+            sum_c = c_pna + c_dyn + 1e-6
+            w_pna = c_pna / sum_c
+            w_dyn = c_dyn / sum_c
+            return w_pna * p_pna + w_dyn * p_dyn
+
+        elif self.mode == 'IOWA':
+            preds_stacked = torch.stack([p_pna, p_dyn], dim=-1)
+            preds_sorted, _ = torch.sort(preds_stacked, dim=-1, descending=True)
+            b1 = preds_sorted[:, 0]
+            b2 = preds_sorted[:, 1]
+
+            weights = torch.softmax(self.beta, dim=0)
+            return b1 * weights[0] + b2 * weights[1]
+
+# ====================================================================
+# PHẦN 4: KHỞI TẠO HỆ THỐNG VÀ VÒNG LẶP HUẤN LUYỆN (PIPELINE COMPLETE)
+# ====================================================================
+
+def run_full_ensemble_pipeline(train_loader, test_loader, num_features, num_gnn_layers, edge_dim, index_, deg, args):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # --- 1. Nhân bản cấu hình và Khởi tạo 2 Mô hình song song ở Tầng 1 ---
+    args_pna = copy.deepcopy(args)
+    args_pna.model = 'pna'
+    args_pna.edge_agg_type = 'pna' # Nhánh tĩnh PNA
+    model_pna = MultiMPNN(num_features, num_gnn_layers, edge_dim=edge_dim, index_=index_, deg=deg, args=args_pna).to(device)
+
+    args_dyn = copy.deepcopy(args)
+    args_dyn.edge_agg_type = 'exstraqt' # Ép chạy nhánh động EXSTRAQT
+    model_dyn = MultiMPNN(num_features, num_gnn_layers, edge_dim=edge_dim, index_=index_, deg=deg, args=args_dyn).to(device)
+
+    # --- 2. Khởi tạo bộ kiểm duyệt quyết định ở Tầng 2 ---
+    meta_aggregator = DowaIowaMetaAggregator(mode='IOWA').to(device)
+
+    # --- 3. Đăng ký Optimizers ---
+    optimizer_gnn = torch.optim.Adam(list(model_pna.parameters()) + list(model_dyn.parameters()), lr=0.001, weight_decay=1e-4)
+    optimizer_meta = torch.optim.Adam(meta_aggregator.parameters(), lr=0.01)
+    criterion = nn.BCELoss()
+
+    # --- 4. Định nghĩa hàm Train Epoch ---
+    def train_epoch():
+        model_pna.train()
+        model_dyn.train()
+        meta_aggregator.train()
+        total_loss = 0
+        
+        for batch in train_loader:
+            batch = batch.to(device)
+            optimizer_gnn.zero_grad()
+            optimizer_meta.zero_grad()
+            
+            if args.task == 'lp':
+                pos_pna, neg_pna = model_pna(batch)
+                pos_dyn, neg_dyn = model_dyn(batch)
+                
+                final_pos = meta_aggregator(pos_pna, pos_dyn)
+                final_neg = meta_aggregator(neg_pna, neg_dyn)
+                
+                loss = criterion(final_pos, torch.ones_like(final_pos)) + criterion(final_neg, torch.zeros_like(final_neg))
+            else:
+                out_pna = torch.softmax(model_pna(batch), dim=-1)[:, 1]
+                out_dyn = torch.softmax(model_dyn(batch), dim=-1)[:, 1]
+                
+                final_pred = meta_aggregator(out_pna, out_dyn)
+                loss = criterion(final_pred, batch.y.float())
+                
+            loss.backward()
+            optimizer_gnn.step()
+            optimizer_meta.step()
+            total_loss += loss.item()
+        return total_loss / len(train_loader)
+
+    # --- 5. Định nghĩa hàm Test Evaluate ---
+    def evaluate():
+        model_pna.eval()
+        model_dyn.eval()
+        meta_aggregator.eval()
+        all_preds, all_targets = [], []
+        
+        with torch.no_grad():
+            for batch in test_loader:
+                batch = batch.to(device)
+                if args.task == 'lp':
+                    pos_pna, neg_pna = model_pna(batch)
+                    pos_dyn, neg_dyn = model_dyn(batch)
+                    
+                    preds = torch.cat([meta_aggregator(pos_pna, pos_dyn), meta_aggregator(neg_pna, neg_dyn)], dim=0)
+                    targets = torch.cat([torch.ones_like(pos_pna), torch.zeros_like(neg_pna)], dim=0)
+                else:
+                    out_pna = torch.softmax(model_pna(batch), dim=-1)[:, 1]
+                    out_dyn = torch.softmax(model_dyn(batch), dim=-1)[:, 1]
+                    preds = meta_aggregator(out_pna, out_dyn)
+                    targets = batch.y
+                    
+                all_preds.append(preds.cpu())
+                all_targets.append(targets.cpu())
+                
+        y_pred_probs = torch.cat(all_preds, dim=0).numpy()
+        y_true = torch.cat(all_targets, dim=0).numpy()
+        y_pred_labels = (y_pred_probs >= 0.5).astype(int)
+        
+        return (precision_score(y_true, y_pred_labels, zero_division=0),
+                recall_score(y_true, y_pred_labels, zero_division=0),
+                f1_score(y_true, y_pred_labels, zero_division=0))
+
+    # --- 6. Khởi chạy toàn bộ số vòng lặp ---
+    for epoch in range(1, args.epochs + 1):
+        loss_val = train_epoch()
+        prec, rec, f1 = evaluate()
+        print(f"Epoch {epoch:03d} | Loss: {loss_val:.4f} | Precision: {prec:.4f} | Recall: {rec:.4f} | F1: {f1:.4f}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 from torch_scatter import scatter, scatter_softmax
