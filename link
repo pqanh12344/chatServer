@@ -1,3 +1,168 @@
+split_per = [0.6, 0.1, 0.1, 0.2]  # Train, Val, Cab, Test
+daily_totals = np.array(daily_trans)
+d_ts = daily_totals
+I = list(range(len(d_ts)))
+split_scores = dict()
+
+# Tìm 3 điểm cắt (i, j, k) để chia thành 4 khoảng dữ liệu
+for i, j, k in itertools.combinations(I, 3):
+    if k >= j and j >= i:
+        # Chia tổng số sample theo 4 khoảng ngày
+        split_totals = [
+            d_ts[:i].sum(),      # Train
+            d_ts[i:j].sum(),     # Val
+            d_ts[j:k].sum(),     # Cab
+            d_ts[k:].sum()       # Test
+        ]
+        
+        split_totals_sum = np.sum(split_totals)
+        if split_totals_sum == 0:
+            continue
+            
+        # Tính tỷ lệ thực tế thu được và độ lệch (error) so với tỷ lệ mong muốn
+        split_props = [v / split_totals_sum for v in split_totals]
+        split_error = [abs(v - t) / t for v, t in zip(split_props, split_per)]
+        
+        # Lấy độ lệch lớn nhất làm score (càng nhỏ càng tốt)
+        score = max(split_error)
+        split_scores[(i, j, k)] = score
+
+# Lấy ra bộ 3 điểm cắt có độ lệch nhỏ nhất
+i, j, k = min(split_scores, key=split_scores.get)
+
+# Chia các ngày vào 4 tập tương ứng
+split = [
+    list(range(i)),          # Ngày cho tập Train
+    list(range(i, j)),       # Ngày cho tập Val
+    list(range(j, k)),       # Ngày cho tập Cab
+    list(range(k, len(daily_totals)))  # Ngày cho tập Test
+]
+
+# Gom các index (indices) tương ứng của từng ngày vào 4 tập
+split_inds = {m: [] for m in range(4)}
+for m in range(4):
+    for day in split[m]:
+        split_inds[m].append(daily_inds[day])
+
+# Gộp (concatenate) các tensor index lại để dùng cho model
+tr_inds  = torch.cat(split_inds[0]) if split_inds[0] else torch.tensor([], dtype=torch.long)
+val_inds = torch.cat(split_inds[1]) if split_inds[1] else torch.tensor([], dtype=torch.long)
+cab_inds = torch.cat(split_inds[2]) if split_inds[2] else torch.tensor([], dtype=torch.long)
+te_inds  = torch.cat(split_inds[3]) if split_inds[3] else torch.tensor([], dtype=torch.long)
+
+# --- (Tùy chọn) In ra kiểm tra tỷ lệ thực tế ---
+total_allocated = len(tr_inds) + len(val_inds) + len(cab_inds) + len(te_inds)
+print(f"Điểm cắt tối ưu tại các ngày: {i}, {j}, {k}")
+print(f"Tỷ lệ thực tế - Train: {len(tr_inds)/total_allocated:.2%}, Val: {len(val_inds)/total_allocated:.2%}, Cab: {len(cab_inds)/total_allocated:.2%}, Test: {len(te_inds)/total_allocated:.2%}")
+
+
+
+tr_x, val_x, cab_x, te_x = x, x, x, x
+
+e_tr = tr_inds.numpy()
+e_val = np.concatenate([tr_inds, val_inds])
+e_cab = np.concatenate([tr_inds, val_inds, cab_inds])
+
+tr_edge_index, tr_edge_attr, tr_y, tr_edge_times, tr_log_amounts = \
+    edge_index[:, e_tr], edge_attr[e_tr], y[e_tr], timestamps[e_tr], log_amounts[e_tr]
+tr_simp_edge_batch = simp_edge_batch[e_tr]
+
+val_edge_index, val_edge_attr, val_y, val_edge_times, val_log_amounts = \
+    edge_index[:, e_val], edge_attr[e_val], y[e_val], timestamps[e_val], log_amounts[e_val]
+val_simp_edge_batch = simp_edge_batch[e_val]
+
+cab_edge_index, cab_edge_attr, cab_y, cab_edge_times, cab_log_amounts = \
+    edge_index[:, e_cab], edge_attr[e_cab], y[e_cab], timestamps[e_cab], log_amounts[e_cab]
+cab_simp_edge_batch = simp_edge_batch[e_cab]
+
+te_edge_index, te_edge_attr, te_y, te_edge_times, te_log_amounts = \
+    edge_index, edge_attr, y, timestamps, log_amounts
+te_simp_edge_batch = simp_edge_batch
+
+tr_data = GraphData(
+    x=tr_x, y=tr_y, edge_index=tr_edge_index, edge_attr=tr_edge_attr, 
+    timestamps=tr_edge_times, log_amounts=tr_log_amounts, simp_edge_batch=tr_simp_edge_batch
+)
+
+val_data = GraphData(
+    x=val_x, y=val_y, edge_index=val_edge_index, edge_attr=val_edge_attr, 
+    timestamps=val_edge_times, log_amounts=val_log_amounts, simp_edge_batch=val_simp_edge_batch
+)
+
+cab_data = GraphData(
+    x=cab_x, y=cab_y, edge_index=cab_edge_index, edge_attr=cab_edge_attr, 
+    timestamps=cab_edge_times, log_amounts=cab_log_amounts, simp_edge_batch=cab_simp_edge_batch
+)
+
+te_data = GraphData(
+    x=te_x, y=te_y, edge_index=te_edge_index, edge_attr=te_edge_attr, 
+    timestamps=te_edge_times, log_amounts=te_log_amounts, simp_edge_batch=te_simp_edge_batch
+)
+
+
+assign_ports_with_cpp(tr_data, process_batch=False)
+assign_ports_with_cpp(val_data, process_batch=False)
+assign_ports_with_cpp(cab_data, process_batch=False)
+assign_ports_with_cpp(te_data, process_batch=False)
+
+tr_data.add_time_deltas()
+val_data.add_time_deltas()
+cab_data.add_time_deltas()
+te_data.add_time_deltas()
+
+def z_norm(data):
+    std = data.std(0).unsqueeze(0)
+    std = torch.where(std == 0, torch.tensor(1, dtype=torch.float32).cpu(), std)
+    return (data - data.mean(0).unsqueeze(0)) / std
+
+# --- 1. Chuẩn hóa đặc trưng của Node (x) dùng hàm z_norm gốc ---
+tr_data.x, val_data.x, cab_data.x, te_data.x = \
+    z_norm(tr_data.x), z_norm(val_data.x), z_norm(cab_data.x), z_norm(te_data.x)
+
+# --- 2. Chuẩn hóa đặc trưng của Cạnh (edge_attr) dùng hàm z_norm gốc ---
+tr_data.edge_attr, val_data.edge_attr, cab_data.edge_attr, te_data.edge_attr = \
+    z_norm(tr_data.edge_attr), z_norm(val_data.edge_attr), z_norm(cab_data.edge_attr), z_norm(te_data.edge_attr)
+
+
+tr_data = create_hetero_obj(
+    tr_data.x, tr_data.y, tr_data.edge_index, tr_data.edge_attr, 
+    tr_data.timestamps, tr_data.log_amounts, tr_simp_edge_batch
+)
+
+val_data = create_hetero_obj(
+    val_data.x, val_data.y, val_data.edge_index, val_data.edge_attr, 
+    val_data.timestamps, val_data.log_amounts, val_simp_edge_batch
+)
+
+# Bổ sung tạo object cho tập CAB mới
+cab_data = create_hetero_obj(
+    cab_data.x, cab_data.y, cab_data.edge_index, cab_data.edge_attr, 
+    cab_data.timestamps, cab_data.log_amounts, cab_simp_edge_batch  # Lưu ý truyền đúng cab_simp_edge_batch
+)
+
+te_data = create_hetero_obj(
+    te_data.x, te_data.y, te_data.edge_index, te_data.edge_attr, 
+    te_data.timestamps, te_data.log_amounts, te_simp_edge_batch
+)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
