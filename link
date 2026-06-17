@@ -1,3 +1,128 @@
+import time
+import torch
+import logging
+import tqdm
+import psutil
+import os
+import wandb
+
+def train_hetero(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config):
+    # training
+    best_val_f1 = 0
+    process = psutil.Process(os.getpid()) # Dùng cho (e) Process Memory
+    
+    for epoch in range(config.epochs):
+        logging.info(f"---------- Epoch {epoch} ----------")
+        total_loss = total_examples = 0
+        preds = []
+        ground_truths = []
+        
+        assert model.training, "Training error: Model is not in training mode"
+
+        # Reset bộ nhớ tối đa của GPU để đo chính xác cho từng epoch
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(device)
+
+        for batch in tqdm.tqdm(tr_loader, disable=not args.tqdm):
+            if args.ports and args.ports_batch:
+                assign_ports_with_cpp(batch, process_batch=True) 
+            
+            optimizer.zero_grad()
+
+            inds = tr_inds.detach().cpu()
+            batch_edge_inds = inds[batch['node', 'to', 'node'].input_id.detach().cpu()]
+            batch_edge_ids = tr_loader.data['node', 'to', 'node'].edge_attr.detach().cpu()[batch_edge_inds, 0]
+            mask = torch.isin(batch['node', 'to', 'node'].edge_attr[:, 0].detach().cpu(), batch_edge_ids)
+            
+            batch['node', 'to', 'node'].edge_attr = batch['node', 'to', 'node'].edge_attr[:, 1:]
+            batch['node', 'rev_to', 'node'].edge_attr = batch['node', 'rev_to', 'node'].edge_attr[:, 1:]
+
+            batch.to(device)
+
+            out = model(batch)
+            pred = out[mask]
+            ground_truth = batch['node', 'to', 'node'].y[mask]
+            loss = loss_fn(pred, ground_truth)
+
+            loss.backward()
+            optimizer.step()
+
+            total_loss += float(loss) * pred.numel()
+            total_examples += pred.numel()
+
+            preds.append(pred.detach().cpu())
+            ground_truths.append(ground_truth.detach().cpu())
+            
+        pred = torch.cat(preds, dim=0).numpy()
+        ground_truth = torch.cat(ground_truths, dim=0).numpy()
+
+        # 1. Tính toán Metrics Huấn luyện
+        f1, auc, precision, recall = compute_binary_metrics(pred, ground_truth)
+        train_loss = total_loss / total_examples
+        
+        logging.info(f'Train Loss: {train_loss:.4f} | F1: {f1:.4f}')
+
+        # 2. Đo tốc độ Inference (Validation và Test)
+        # Đo Validation Inference
+        start_val = time.time()
+        val_f1, val_auc, val_precision, val_recall = evaluate_hetero(val_loader, val_inds, model, val_data, device, args)
+        val_infer_time = time.time() - start_val
+        
+        # Đo Test Inference
+        start_te = time.time()
+        te_f1, te_auc, te_precision, te_recall = evaluate_hetero(te_loader, te_inds, model, te_data, device, args)
+        te_infer_time = time.time() - start_te
+
+        # 3. Thu thập thông số bộ nhớ phần cứng thủ công (để log tường minh theo Epoch)
+        gpu_allocated = torch.cuda.memory_allocated(device) if torch.cuda.is_available() else 0 # (a)
+        process_mem = process.memory_info().rss / (1024 * 1024) # (e) tính bằng MB
+        sys_mem_util = psutil.virtual_memory().percent # (f) tính bằng %
+        disk_util = psutil.disk_usage('/').percent # (d) Phần trăm đĩa (hoặc tính bằng GB đã dùng: psutil.disk_usage('/').used / (1024**3))
+
+        # 4. Gửi TẤT CẢ dữ liệu lên W&B trong 1 lượt log duy nhất (Tránh lỗi lệch step)
+        wandb.log({
+            # Độ ổn định & Quỹ đạo hội tụ (Hình 4)
+            "Loss/train": train_loss,
+            
+            # Metrics các tập
+            "f1/train": f1, "precision/train": precision, "recall/train": recall, "auc/train": auc,
+            "f1/validation": val_f1, "precision/validation": val_precision, "recall/validation": recall, "auc/validation": val_auc,
+            "f1/test": te_f1, "precision/test": te_precision, "recall/test": te_recall, "auc/test": te_auc,
+            
+            # Tốc độ Inference (Thời gian chạy tính bằng giây)
+            "inference_time/validation_seconds": val_infer_time,
+            "inference_time/test_seconds": te_infer_time,
+            
+            # Các thông số hệ thống yêu cầu log thủ công theo trục Epoch
+            "sys_hardware/gpu_memory_allocated_bytes": gpu_allocated, # (a)
+            "sys_hardware/process_memory_in_use_mb": process_mem,     # (e)
+            "sys_hardware/system_memory_utilization_percent": sys_mem_util, # (f)
+            "sys_hardware/disk_utilization_percent": disk_util        # (d)
+        }, step=epoch)
+
+        # Cập nhật Best F1
+        if epoch == 0:
+            best_val_f1 = val_f1
+            wandb.log({"best_test_f1": te_f1}, step=epoch)
+        elif val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            wandb.log({"best_test_f1": te_f1}, step=epoch)
+            if args.save_model:
+                save_model(model, optimizer, epoch, args, data_config)
+        
+    return model
+
+
+
+
+
+
+
+
+
+
+
+
 split_per = [0.6, 0.1, 0.1, 0.2]  # Train, Val, Cab, Test
 daily_totals = np.array(daily_trans)
 d_ts = daily_totals
