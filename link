@@ -116,6 +116,385 @@ def train_hetero(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, m
 
 
 
+import torch
+import torch.nn as nn
+from torch_scatter import scatter, scatter_softmax
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+
+
+class ExSTraQtPnaEdgeGatedAgg(nn.Module):
+    def __init__(self, n_hidden, deg, dropout_p=0.4):
+        super().__init__()
+        self.n_hidden = n_hidden
+
+        # ExSTraQt statistics normalization
+        self.exstraqt_ln = nn.LayerNorm(6)
+
+        # Edge-level attention (6 node stats + tau + log_amount = 8 dims)
+        self.edge_gate = nn.Sequential(
+            nn.Linear(8, 32),
+            nn.SiLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+
+        # PNA Aggregator Configuration
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+        
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+        pna_out_features = len(aggregators) * len(scalers) * n_hidden
+
+        # Multi-layer Perceptrons
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out_features, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p)
+        )
+
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p)
+        )
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.pna_core.reset_parameters()
+        self.exstraqt_ln.reset_parameters()
+
+        for m in self.edge_gate:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                nn.init.zeros_(m.bias)
+
+        nn.init.kaiming_normal_(self.pna_project[0].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.post_transition[0].weight, nonlinearity='relu')
+        
+        self.pna_project[1].reset_parameters()
+        self.post_transition[1].reset_parameters()
+
+    def forward(self, x, index, timestamps_, log_amounts, num_groups=None):
+        num_edges = x.size(0)
+
+        if num_groups is None:
+            num_groups = index.max().item() + 1 if num_edges > 0 else 0
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=x.device)
+
+        # 1. Group statistics & Time Normalization (tau)
+        edge_counts = torch.bincount(index, minlength=num_groups).float()
+        eps_counts = edge_counts + 1e-5
+
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='max')
+        
+        duration_safe = (max_t - min_t) + 1.0
+        tau = (timestamps_ - min_t[index]) / duration_safe[index]
+
+        # 2. Extract ExSTraQt Temporal & Flow Features
+        # tf_c (Time-flow Centrality)
+        temperature = 3.0
+        global_std = torch.std(log_amounts) + 1e-5
+        raw_weights = scatter_softmax(log_amounts / (global_std * temperature), index, dim=0)
+        amt_weights = raw_weights / eps_counts[index]
+        tf_c = scatter(amt_weights * tau, index, dim=0, dim_size=num_groups, reduce='sum')
+
+        # tf_std (Time Variance)
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_groups, reduce='mean')
+        time_var = scatter((tau - mean_tau[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / eps_counts
+        tf_std = torch.sqrt(time_var + 1e-5)
+
+        # Burst density & Money velocity
+        burst_density = torch.log1p(edge_counts)
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        money_velocity = torch.log1p(mean_log_amount / torch.log1p(duration_safe))
+
+        # Flow skewness
+        centered = log_amounts - mean_log_amount[index]
+        skew_num = scatter(centered ** 3, index, dim=0, dim_size=num_groups, reduce='sum') / eps_counts
+        skew_den = (scatter(centered ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / eps_counts) ** 1.5 + 1e-5
+        flow_skew = torch.clamp(skew_num / skew_den, min=-2.0, max=2.0)
+
+        # Average inter-arrival time
+        avg_inter_arrival = torch.log1p(duration_safe / eps_counts)
+
+        # 3. ExSTraQt Fusion & Gating Mechanism
+        exstraqt_raw = torch.stack([tf_c, tf_std, burst_density, money_velocity, flow_skew, avg_inter_arrival], dim=-1)
+        exstraqt_raw = self.exstraqt_ln(exstraqt_raw)
+
+        edge_context = exstraqt_raw[index]
+        edge_local = torch.stack([tau, log_amounts], dim=-1)
+        
+        edge_feat = torch.cat([edge_context, edge_local], dim=-1)
+        edge_attention = self.edge_gate(edge_feat)
+
+        filtered_x = x * edge_attention
+
+        # 4. PNA Aggregation & Residual Transition
+        pna_raw = self.pna_core(filtered_x, index)
+        pna_feats = self.pna_project(pna_raw)
+        
+        output = self.post_transition(pna_feats) + pna_feats
+
+        return output
+
+
+class MultiEdgeAggModule(nn.Module):
+    def __init__(self, n_hidden=None, agg_type=None, index=None):
+        super().__init__()
+        self.agg_type = agg_type
+
+        if agg_type == 'genagg':
+            self.agg = GenAgg(f=MLPAutoencoder, jit=False)
+        elif agg_type == 'gin':
+            self.agg = GinAgg(n_hidden=n_hidden)
+        elif agg_type == 'pna':
+            uniq_index, inverse_indices = torch.unique(index, return_inverse=True)
+            d = degree(inverse_indices, num_nodes=uniq_index.numel(), dtype=torch.long)
+            deg = torch.bincount(d, minlength=1)
+            self.agg = PnaAgg(n_hidden=n_hidden, deg=deg)
+        elif agg_type == 'pna':
+            uniq_index, inverse_indices = torch.unique(index, return_inverse=True)
+            d = degree(inverse_indices, num_nodes=uniq_index.numel(), dtype=torch.long)
+            deg = torch.bincount(d, minlength=1)
+            self.agg = ExSTraQtPnaEdgeGatedAgg(n_hidden=n_hidden, deg=deg)
+        elif agg_type == 'sum':
+            self.agg = SumAgg()
+        elif agg_type == 'transformer':
+            self.agg = TransformerAgg(d_model=n_hidden)
+        elif agg_type == 'gru':
+            self.agg = GRUAgg(d_model=n_hidden)
+        elif agg_type == 'adamm':
+            self.agg = AdammAgg(n_hidden)
+        else:
+            self.agg = IdentityAgg()
+        
+    def forward(self, edge_index, edge_attr, simp_edge_batch, times, amounts):
+        _, inverse_indices = torch.unique(simp_edge_batch, return_inverse=True)
+        new_edge_index = scatter(edge_index, inverse_indices, dim=1, reduce='mean') if self.agg_type is not None else edge_index
+        if (self.agg_type == 'exstraqt'):
+            new_edge_attr = self.agg(x= edge_attr, index=inverse_indices, timestamps_=times, log_amounts=amounts)
+        if (self.agg_type == 'transformer') or (self.agg_type == 'gru'):
+            new_edge_attr = self.agg(x= edge_attr, index=inverse_indices, timestamps_=times)
+        else:
+            new_edge_attr = self.agg(x=edge_attr, index=inverse_indices)
+        return new_edge_index, new_edge_attr, inverse_indices
+    
+    def reset_parameters(self):
+        self.agg.reset_parameters()
+		
+		
+class GnnHelper(torch.nn.Module):
+    def __init__(self, num_gnn_layers, n_hidden=100, edge_updates=False,
+                final_dropout=0.5, index_ = None, deg = None, args=None):
+        super().__init__()
+
+        self.n_hidden = n_hidden
+        self.num_gnn_layers = num_gnn_layers
+        self.edge_updates = edge_updates
+        self.final_dropout = final_dropout
+        self.flatten_edges = True
+        # self.edge_agg_type = 'pna'
+        self.edge_agg_type = 'exstraqt'
+        self.args = args
+
+        self.node_agg = 'sum'
+        # self.edge_grus = nn.ModuleList()
+        self.edge_aggrs = nn.ModuleList()
+        self.edge_gates = nn.ModuleList()
+        self.convs = nn.ModuleList()
+        self.emlps = nn.ModuleList()
+        # self.flow_gates = nn.ModuleList()
+        self.batch_norms = nn.ModuleList()
+        for _ in range(self.num_gnn_layers):
+            aggregators = ['mean', 'min', 'max', 'std']
+            scalers = ['identity', 'amplification', 'attenuation']
+            conv = PNAConv(in_channels=n_hidden, out_channels=n_hidden,
+                           aggregators=aggregators, scalers=scalers, deg=deg,
+                           edge_dim=n_hidden, towers=5, pre_layers=1, post_layers=1,
+                           divide_input=False)
+
+            if self.edge_updates: self.emlps.append(nn.Sequential(
+                nn.Linear(4 * self.n_hidden, self.n_hidden),
+                nn.ReLU(),
+                nn.Linear(self.n_hidden, self.n_hidden),
+            ))
+            if self.flatten_edges:
+                edge_agg = MultiEdgeAggModule(n_hidden, agg_type='exstraqt', index=index_)
+                self.edge_aggrs.append(edge_agg)
+            self.convs.append(conv)
+            self.batch_norms.append(BatchNorm(n_hidden))
+            # self.edge_gates.append(
+            #     nn.Linear(4 * n_hidden, n_hidden)
+            # )
+            # self.edge_grus.append(nn.GRUCell(n_hidden, n_hidden))
+            # self.flow_gates.append(FlowGate(n_hidden))
+
+
+        if self.edge_agg_type == 'adamm':
+            self.edge_aggrs = None
+            self.edge_agg = MultiEdgeAggModule(n_hidden, agg_type=args.edge_agg_type, index=index_)
+
+
+    def forward(self, x, edge_index, edge_attr, simp_edge_batch=None, times=None, amounts=None):
+        # times= None # TODO: Not implemented yet
+
+        if self.edge_agg_type == 'adamm':
+            # Apply the flattening at the beggining only.
+            edge_index, edge_attr, _ = self.edge_agg(edge_index, edge_attr, simp_edge_batch, times, amounts)
+            src, dst = edge_index
+
+            for i in range(self.num_gnn_layers):
+                x = (x + F.relu(self.batch_norms[i](self.convs[i](x, edge_index, edge_attr)))) / 2
+                if self.edge_updates:
+                    edge_attr = edge_attr + self.emlps[i](torch.cat([x[src], x[dst], edge_attr], dim=-1)) / 2
+        else:
+            src, dst = edge_index
+
+            for i in range(self.num_gnn_layers):
+                if self.flatten_edges:
+                    n_edge_index, n_edge_attr, inverse_indices  = self.edge_aggrs[i](edge_index, edge_attr, simp_edge_batch, times, amounts)
+                    x = (x + F.relu(self.batch_norms[i](self.convs[i](x, n_edge_index, n_edge_attr)))) / 2
+                    if self.edge_updates:
+                        remapped_edge_attr = n_edge_attr[inverse_indices]
+
+                        edge_input = torch.cat([x[src], x[dst], remapped_edge_attr, edge_attr], dim=-1)
+                        edge_update = self.emlps[i](edge_input)
+						edge_attr= edge_attr + edge_update / 2
+
+
+                else:
+                    x = (x + F.relu(self.batch_norms[i](self.convs[i](x, edge_index, edge_attr)))) / 2
+                    if self.edge_updates:
+                        edge_attr = edge_attr + self.emlps[i](torch.cat([x[src], x[dst], edge_attr], dim=-1)) / 2
+
+        return x, edge_attr
+
+
+
+class MultiMPNN(torch.nn.Module):
+    def __init__(self, num_features, num_gnn_layers, n_classes=2, n_hidden=100,
+                 edge_updates=False,edge_dim=None, final_dropout=0.5,
+                 index_ = None, deg=None, args=None):
+        super().__init__()
+        self.args = args
+        self.n_hidden = n_hidden
+        self.final_dropout = final_dropout
+
+        self.node_emb = nn.Linear(num_features, n_hidden)
+        self.edge_emb = nn.Linear(edge_dim, n_hidden)
+
+        self.edge_emb_rev = nn.Linear(edge_dim, n_hidden)
+
+        self.gnn = GnnHelper(num_gnn_layers=num_gnn_layers, n_hidden=n_hidden, edge_updates=edge_updates, final_dropout=final_dropout,
+                             index_=index_, deg=deg, args=args)
+
+        self.gnn = to_hetero(
+            self.gnn,
+            metadata=(
+                ['node'],
+                [
+                    ('node', 'to', 'node'),
+                    ('node', 'rev_to', 'node')
+                ]
+            ),
+            aggr='mean',
+
+            input_map={
+                'x': 'node',
+                'edge_index': 'edge',
+                'edge_attr': 'edge',
+                'simp_edge_batch': 'edge',
+                'times': 'edge',
+                'amounts': 'edge',
+            }
+        )
+
+        self.mlp = nn.Sequential(Linear(n_hidden*3, 50), nn.ReLU(), nn.Dropout(self.final_dropout),Linear(50, 25), nn.ReLU(), nn.Dropout(self.final_dropout),
+                                Linear(25, n_classes))
+
+    def forward(self, data):
+        if isinstance(data, HeteroData):
+
+            # Initial Embedding Layers
+            x_dict = {"node": self.node_emb(data['node'].x)}
+            edge_attr_dict = {
+                    ("node", 'to', 'node'): self.edge_emb(data['node', 'to', 'node'].edge_attr),
+                    ("node", 'rev_to', 'node'): self.edge_emb_rev(data['node', 'rev_to', 'node'].edge_attr),
+                }
+            simp_edge_batch_dict = data.simp_edge_batch_dict
+
+            times_dict = {
+                ('node', 'to', 'node'):
+                    data['node', 'to', 'node'].timestamps,
+
+                ('node', 'rev_to', 'node'):
+                    data['node', 'rev_to', 'node'].timestamps
+            }
+
+            amount_dict = {
+                ('node', 'to', 'node'):
+                    data['node', 'to', 'node'].log_amounts,
+
+                ('node', 'rev_to', 'node'):
+                    data['node', 'rev_to', 'node'].log_amounts
+            }
+
+            # Message Passing Layers
+            x_dict, edge_attr_dict = self.gnn(x_dict, data.edge_index_dict, edge_attr_dict, simp_edge_batch_dict, times_dict, amount_dict)
+            x = x_dict['node']
+            edge_attr = edge_attr_dict['node', 'to', 'node']
+
+            # Prediction Heads
+            x = x[data['node', 'to', 'node'].edge_index.T].reshape(-1, 2*self.n_hidden).relu()
+            x = torch.cat((x, edge_attr.view(-1, edge_attr.shape[1])), 1)
+            out = self.mlp(x)
+
+
+        else:
+            # Initial Embedding Layers
+            x = self.node_emb(data.x)
+            edge_attr = self.edge_emb(data.edge_attr)
+            simp_edge_batch = data.simp_edge_batch if self.args.flatten_edges else None
+
+            # Message Passing Layers
+            x, edge_attr = self.gnn(x, data.edge_index, edge_attr, simp_edge_batch, data.timestamps, data.log_amounts)
+
+            # Prediction Heads
+            x = x[data.edge_index.T].reshape(-1, 2*self.n_hidden).relu()
+            x = torch.cat((x, edge_attr.view(-1, edge_attr.shape[1])), 1)
+            out = self.mlp(x)
+        return out
+        
+
+def get_model(sample_batch, config):
+    n_feats = sample_batch.x.shape[1] if not isinstance(sample_batch, HeteroData) else sample_batch['node'].x.shape[1]
+    e_dim = (sample_batch.edge_attr.shape[1]) if not isinstance(sample_batch, HeteroData) else (sample_batch['node', 'to', 'node'].edge_attr.shape[1])
+
+    index_ = sample_batch.simp_edge_batch if not isinstance(sample_batch, HeteroData) else sample_batch['node', 'to', 'node'].simp_edge_batch
+
+    if not isinstance(sample_batch, HeteroData):
+      s_edges = torch.unique(sample_batch.edge_index, dim=1)
+      d = degree(s_edges[1], num_nodes=sample_batch.num_nodes, dtype=torch.long)
+    else:
+      s_edges = torch.unique(torch.cat((sample_batch['node', 'to', 'node'].edge_index, sample_batch['node', 'rev_to', 'node'].edge_index), 1), dim=1)
+      d = degree(s_edges[1], num_nodes=sample_batch.num_nodes, dtype=torch.long)
+
+    deg = torch.bincount(d, minlength=1)
+
+    model = MultiMPNN(num_features=n_feats, num_gnn_layers=config.n_gnn_layers, n_classes=2,
+                      n_hidden=round(config.n_hidden), edge_updates=True, edge_dim=e_dim,
+                      final_dropout=config.final_dropout, index_=index_, deg=deg)
+
+    return model
+
+
+
 
 
 
