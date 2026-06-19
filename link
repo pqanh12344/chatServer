@@ -1,3 +1,223 @@
+Learning to Match Prototype for Few-Shot
+Classification of Attacks and Faults in Smart Grids
+
+
+
+
+
+import torch
+import torch.nn as nn
+from torch_geometric.data import HeteroData
+from torch_geometric.nn import to_hetero
+
+
+class MultiMPNN_L2MP(torch.nn.Module):
+    def __init__(self,
+                 num_features,
+                 num_gnn_layers,
+                 n_hidden=100,
+                 edge_updates=False,
+                 edge_dim=None,
+                 final_dropout=0.5,
+                 index_=None,
+                 deg=None,
+                 args=None,
+                 n_classes=2):
+        super().__init__()
+
+        self.n_hidden = n_hidden
+        self.final_dropout = final_dropout
+        self.n_classes = n_classes
+
+        # ===== Embeddings =====
+        self.node_emb = nn.Linear(num_features, n_hidden)
+        self.edge_emb = nn.Linear(edge_dim, n_hidden)
+        self.edge_emb_rev = nn.Linear(edge_dim, n_hidden)
+
+        # ===== GNN backbone (UNCHANGED) =====
+        self.gnn = GnnHelper(
+            num_gnn_layers=num_gnn_layers,
+            n_hidden=n_hidden,
+            edge_updates=edge_updates,
+            final_dropout=final_dropout,
+            index_=index_,
+            deg=deg,
+            args=args
+        )
+
+        self.gnn = to_hetero(
+            self.gnn,
+            metadata=(
+                ['node'],
+                [
+                    ('node', 'to', 'node'),
+                    ('node', 'rev_to', 'node')
+                ]
+            ),
+            aggr='mean',
+            input_map={
+                'x': 'node',
+                'edge_index': 'edge',
+                'edge_attr': 'edge',
+                'simp_edge_batch': 'edge',
+                'times': 'edge',
+                'amounts': 'edge',
+            }
+        )
+
+        # ===== L2MP: Matching Network (Θ) =====
+        self.matching = nn.Sequential(
+            nn.Linear(2 * n_hidden, n_hidden),
+            nn.ReLU(),
+            nn.Dropout(final_dropout),
+            nn.Linear(n_hidden, 1)
+        )
+
+    # =========================================================
+    # Prototype builder
+    # =========================================================
+    def build_prototypes(self, h, y):
+        """
+        h: [N, D]
+        y: [N]
+        """
+        prototypes = []
+        classes = torch.unique(y)
+
+        for c in classes:
+            prototypes.append(h[y == c].mean(dim=0))
+
+        return torch.stack(prototypes, dim=0), classes
+
+    # =========================================================
+    # Matching function
+    # =========================================================
+    def match(self, h_q, prototypes):
+        """
+        h_q: [Nq, D]
+        prototypes: [K, D]
+        """
+        logits = []
+
+        for c in prototypes:
+            c_expand = c.unsqueeze(0).repeat(h_q.size(0), 1)
+            inp = torch.cat([h_q, c_expand], dim=-1)
+            logits.append(self.matching(inp))
+
+        return torch.cat(logits, dim=1)  # [Nq, K]
+
+    # =========================================================
+    # Forward
+    # =========================================================
+    def forward(self, data,
+                support_mask=None,
+                query_mask=None,
+                y_support=None):
+
+        # =====================================================
+        # Case: HeteroGraph
+        # =====================================================
+        if isinstance(data, HeteroData):
+
+            x_dict = {
+                "node": self.node_emb(data['node'].x)
+            }
+
+            edge_attr_dict = {
+                ("node", "to", "node"): self.edge_emb(data['node', 'to', 'node'].edge_attr),
+                ("node", "rev_to", "node"): self.edge_emb_rev(data['node', 'rev_to', 'node'].edge_attr),
+            }
+
+            simp_edge_batch_dict = data.simp_edge_batch_dict
+
+            times_dict = {
+                ('node', 'to', 'node'): data['node', 'to', 'node'].timestamps,
+                ('node', 'rev_to', 'node'): data['node', 'rev_to', 'node'].timestamps
+            }
+
+            amount_dict = {
+                ('node', 'to', 'node'): data['node', 'to', 'node'].log_amounts,
+                ('node', 'rev_to', 'node'): data['node', 'rev_to', 'node'].log_amounts
+            }
+
+            x_dict, edge_attr_dict = self.gnn(
+                x_dict,
+                data.edge_index_dict,
+                edge_attr_dict,
+                simp_edge_batch_dict,
+                times_dict,
+                amount_dict
+            )
+
+            x = x_dict['node']
+            edge_attr = edge_attr_dict['node', 'to', 'node']
+
+            # node-pair representation (as bạn đang làm)
+            h = torch.cat(
+                (
+                    x[data['node', 'to', 'node'].edge_index.T]
+                    .reshape(-1, 2 * self.n_hidden)
+                    .relu(),
+                    edge_attr.view(-1, edge_attr.shape[1])
+                ),
+                dim=1
+            )
+
+        # =====================================================
+        # Case: Homogeneous Graph
+        # =====================================================
+        else:
+            x = self.node_emb(data.x)
+            edge_attr = self.edge_emb(data.edge_attr)
+
+            simp_edge_batch = data.simp_edge_batch if hasattr(data, "simp_edge_batch") else None
+
+            x, edge_attr = self.gnn(
+                x,
+                data.edge_index,
+                edge_attr,
+                simp_edge_batch,
+                data.timestamps,
+                data.log_amounts
+            )
+
+            h = torch.cat(
+                (
+                    x[data.edge_index.T].reshape(-1, 2 * self.n_hidden).relu(),
+                    edge_attr.view(-1, edge_attr.shape[1])
+                ),
+                dim=1
+            )
+
+        # =====================================================
+        # L2MP PART (CORE CHANGE)
+        # =====================================================
+
+        if support_mask is None or query_mask is None:
+            # fallback: normal embedding output
+            return h
+
+        h_support = h[support_mask]
+        h_query = h[query_mask]
+
+        # build prototypes
+        prototypes, classes = self.build_prototypes(h_support, y_support)
+
+        # matching
+        logits = self.match(h_query, prototypes)
+
+        return logits, classes
+
+
+
+
+
+
+
+
+
+
+
 import time
 import torch
 import logging
