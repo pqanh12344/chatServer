@@ -1,3 +1,65 @@
+import pandas as pd
+
+df = pd.read_csv("transactions.csv")
+
+# Đổi tên theo file của bạn
+src_col = "from_id"
+dst_col = "to_id"
+
+# Tạo pair
+df["pair"] = (
+    df[src_col].astype(str)
+    + "->"
+    + df[dst_col].astype(str)
+)
+
+# Số transaction mỗi pair
+pair_counts = df.groupby("pair").size()
+
+print("Mean   :", pair_counts.mean())
+print("Median :", pair_counts.median())
+print("Max    :", pair_counts.max())
+print("Min    :", pair_counts.min())
+
+print("\nDistribution:")
+print(pair_counts.describe())
+
+
+dist = pair_counts.value_counts().sort_index()
+
+print(dist.head(20))
+
+
+import matplotlib.pyplot as plt
+
+pair_counts.clip(upper=50).hist(bins=50)
+
+plt.xlabel("Transactions per pair")
+plt.ylabel("Number of pairs")
+plt.title("Distribution of Transactions per Account Pair")
+
+plt.show()
+
+
+import matplotlib.pyplot as plt
+
+pair_counts.clip(upper=50).hist(bins=50)
+
+plt.xlabel("Transactions per pair")
+plt.ylabel("Number of pairs")
+plt.title("Distribution of Transactions per Account Pair")
+
+plt.show()
+
+
+
+
+
+
+
+
+
+
 Learning to Match Prototype for Few-Shot
 Classification of Attacks and Faults in Smart Grids
 
