@@ -1,3 +1,79 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# 1. Định nghĩa lại lớp DWBLoss mới (từ DiG-RSB)
+class DWBLoss(nn.Module):
+    """
+    Dynamically Weighted Balanced Loss (from DiG-RSB)
+    """
+    def __init__(self, num_classes, gamma=2.0, beta=0.999, eps=1e-8):
+        super().__init__()
+        self.num_classes = num_classes
+        self.gamma = gamma
+        self.beta = beta
+        self.eps = eps
+        # Dùng register_buffer để tự động chuyển tensor này lên đúng GPU cùng với Loss/Model
+        self.register_buffer('running_weights', torch.ones(num_classes))
+
+    def update_running_weights(self, labels, losses_per_sample):
+        with torch.no_grad():
+            for c in range(self.num_classes):
+                mask = (labels == c)
+                if mask.sum() > 0:
+                    avg_loss = losses_per_sample[mask].mean()
+                    self.running_weights[c] = self.beta * self.running_weights[c] + (1 - self.beta) * avg_loss
+            self.running_weights = self.running_weights / (self.running_weights.sum() + self.eps)
+
+    def forward(self, logits, labels):
+        ce = F.cross_entropy(logits, labels, reduction='none')
+        pt = torch.exp(-ce)
+        focal = (1 - pt) ** self.gamma * ce
+
+        class_weight = self.running_weights[labels]
+        loss = (class_weight * focal).mean()
+
+        # Confidence calibration
+        probs = F.softmax(logits, dim=1)
+        correct_mask = (probs.argmax(dim=1) == labels)
+        if correct_mask.any():
+            conf = probs[correct_mask, labels[correct_mask]]
+            cal_loss = -torch.log(conf + self.eps).mean()
+            loss += 0.1 * cal_loss
+
+        self.update_running_weights(labels, focal.detach())
+        return loss
+
+# 2. Khoản khởi tạo Model và Checkpoint
+model = get_model(sample_batch, config)
+model.to(device)
+
+ckpt = torch.load("/kaggle/input/datasets/qucanhphan/checkpoint12344/eee_18/e_18.tar", map_location=device)
+model.load_state_dict(ckpt["model_state_dict"])
+
+model = DDP(
+    model,
+    device_ids=[local_rank],
+    output_device=local_rank,
+    find_unused_parameters=True
+)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+sample_batch = sample_batch.to(device)
+
+# 3. Khởi tạo DWBLoss mới thay thế cho CrossEntropyLoss và DWBLoss cũ
+NUM_CLASSES = 2  # Dựa theo mảng 2 phần tử class_samples = [3245716, 2530]
+criterion = DWBLoss(num_classes=NUM_CLASSES).to(device)
+
+
+
+
+
+
+
+
+
 class ExSTraQtPnaGatedFusionAgg(nn.Module):
     def __init__(self, n_hidden, deg, dropout_p=0.4):
         super().__init__()
