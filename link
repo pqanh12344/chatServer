@@ -1,3 +1,12 @@
+Việc đưa thêm hệ số $\lambda$ không chỉ là "chế thêm cho khác công thức", mà nó có 2 lý do toán học và nghiệp vụ cực kỳ đắt giá đối với bài toán Anti-Money Laundering (AML):1. Lý do Toán học: Mất cân bằng độ lớn Gradient (Gradient Magnitude Mismatch)Trong công thức DWB gốc, hai thành phần được cộng trực tiếp tỷ lệ $1:1$:Classification loss ($\mathcal{L}_{\text{DWCE}}$): Sử dụng logarit kết hợp hàm mũ $w_j^{1-p_{ij}}$. Khi dữ liệu mất cân bằng cực đoan (như AML với tỷ lệ $1:1000$), trọng số $w_j$ rất lớn. Khi gặp mẫu gian lận khó ($p_{ij} \to 0$), gradient của phần này bùng nổ rất mạnh.Calibration loss ($\mathcal{R}_{\text{BS}}$): Là dạng entropy bậc hai $p_{ij}(1-p_{ij})$, có giá trị tối đa chỉ là $0.25$ và đạo hàm bị giới hạn trong khoảng $[-1, 1]$.Hệ quả nếu để $1:1$: Gradient của phần Classification sẽ nuốt chửng (drown out) gradient của Calibration. Phần hiệu chỉnh xác suất gần như không có tác dụng trên tập dữ liệu gian lận.$\lambda$ đóng vai trò là một scale factor để kéo độ lớn gradient của 2 bên về cùng một vùng ảnh hưởng.2. Lý do Nghiệp vụ AML: Xác suất rủi ro (Risk Score) quan trọng hơn Nhãn nhị phân (0/1)Hệ thống chống rửa tiền thực tế trong ngân hàng không hoạt động theo kiểu đưa ra quyết định 0/1 cứng nhắc.Mô hình AI sẽ xuất ra Xác suất gian lận ($p_{ij} \in [0, 1]$) làm điểm rủi ro (Risk Score).Đội ngũ thẩm định (Compliance Analysts) sẽ dựa vào điểm này để phân luồng:$p < 0.3$: Cho qua tự động.$0.3 \le p \le 0.8$: Gửi cảnh báo yêu cầu xác minh thủ công (Manual Review).$p > 0.8$: Khóa tài khoản khẩn cấp.Mỗi ngân hàng có Khẩu vị rủi ro (Risk Appetite) khác nhau. Việc thêm $\lambda$ cho phép mô hình linh hoạt:Nếu ngân hàng muốn ưu tiên tối đa việc bắt sạch gian lận (chấp nhận cảnh báo nhầm): Chọn $\lambda$ nhỏ để tập trung phân loại.Nếu ngân hàng muốn xác suất rủi ro ra phải cực kỳ chuẩn xác để đặt ngưỡng phễu lọc chính xác: Chọn $\lambda$ lớn hơn để siết chặt Calibration.Mẫu đoạn văn giải thích lý do (Motivation) để viết thẳng vào PaperBạn có thể đưa lý luận này vào mục giới thiệu công thức $\mathcal{L}_{\text{FAADW}}$ để thuyết phục hoàn toàn Reviewer:
+
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
