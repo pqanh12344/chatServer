@@ -4,6 +4,76 @@ import torch.nn.functional as F
 
 
 class FAADWLoss(nn.Module):
+
+    def __init__(
+        self, class_counts, beta=1.5, lambda_calib=0.5, reduction="mean"
+    ):
+        """Args:
+
+        class_counts (list/Tensor): [n_legit, n_fraud]
+        beta (float): Cost penalty riêng cho lớp Fraud (default: 1.5).
+        lambda_calib (float): Scaling factor cho Brier Entropy Calibration
+        (default: 0.5). reduction (str): 'mean', 'sum', hoặc 'none'.
+        """
+        super(FAADWLoss, self).__init__()
+        self.beta = beta
+        self.lambda_calib = lambda_calib
+        self.reduction = reduction
+
+        if not isinstance(class_counts, torch.Tensor):
+            counts = torch.tensor(class_counts, dtype=torch.float32)
+        else:
+            counts = class_counts.float()
+
+        n0, n1 = counts[0], counts[1]
+
+        # Tính trọng số w_j có tích hợp beta cho lớp Fraud (index 1)
+        w0 = 1.0
+        w1 = self.beta * (torch.log(n0 / (n1 + 1e-8)) + 1.0)
+        weights = torch.tensor([w0, w1], dtype=torch.float32)
+
+        self.register_buffer("weights", weights)
+
+    def forward(self, logits, targets):
+        eps = 1e-7
+        probs = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+
+        batch_size = logits.size(0)
+        batch_indices = torch.arange(batch_size, device=logits.device)
+
+        p_y = probs[batch_indices, targets]
+        log_p_y = log_probs[batch_indices, targets]
+        w_y = self.weights[targets]
+
+        p_y_clamped = torch.clamp(p_y, min=eps, max=1.0 - eps)
+
+        # 1. Cost-Sensitive DWCE Component
+        dynamic_weight = torch.pow(w_y, 1.0 - p_y_clamped)
+        term_dwce = -dynamic_weight * log_p_y
+
+        # 2. Scaled Calibration Component
+        term_calib = -p_y_clamped * (1.0 - p_y_clamped)
+
+        loss = term_dwce + self.lambda_calib * term_calib
+
+        if self.reduction == "mean":
+            return torch.mean(loss)
+        elif self.reduction == "sum":
+            return torch.sum(loss)
+        else:
+            return loss
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class FAADWLoss(nn.Module):
     """Fraud-Aware Adaptive Dynamic Weighting Loss (FAADW Loss).
 
     An extended loss formulation built upon DWB Loss, designed for class-imbalanced
