@@ -1,3 +1,316 @@
+class DWBLoss(nn.Module):
+    def __init__(
+        self,
+        class_counts,          # [n_class0, n_class1] -- THAM SỐ BẮT BUỘC DUY NHẤT
+        ema_beta=0.9,           # hệ số EMA cho độ khó lớp d_j(t)
+        rank_margin=0.3,        # margin cho pairwise ranking loss
+        rank_lambda_max=1.0,    # trọng số tối đa cho rank loss
+        rank_warmup_epochs=5,   # số epoch warm-up cho lambda
+        reduction="mean",
+    ):
+        super().__init__()
+        assert len(class_counts) == 2, "Bản binary chỉ nhận đúng 2 giá trị: [n_class0, n_class1]"
+        self.reduction = reduction
+        self.ema_beta = ema_beta
+        self.rank_margin = rank_margin
+        self.rank_lambda_max = rank_lambda_max
+        self.rank_warmup_epochs = max(rank_warmup_epochs, 1)
+ 
+        counts = torch.tensor(class_counts, dtype=torch.float32)
+        max_count = torch.max(counts)
+ 
+        # w_j^static theo đúng công thức (8) trong bài DWB gốc
+        self.register_buffer("static_weights", torch.log(max_count / (counts + 1e-8)) + 1.0)
+        # d_j(t): EMA độ khó từng lớp, khởi tạo = 0
+        self.register_buffer("difficulty_ema", torch.zeros(2))
+ 
+        # Lớp hiếm = lớp có count nhỏ hơn (tự động, không cần khai báo tay)
+        self.minority_class = int(torch.argmin(counts).item())
+ 
+        self._current_epoch = 0
+ 
+    def set_epoch(self, epoch: int):
+        """Gọi ở đầu mỗi epoch để warm-up dần trọng số của rank loss."""
+        self._current_epoch = epoch
+ 
+    def _current_lambda(self):
+        progress = min(self._current_epoch / self.rank_warmup_epochs, 1.0)
+        return self.rank_lambda_max * progress
+ 
+    @torch.no_grad()
+    def _update_difficulty(self, p_y, targets):
+        for c in (0, 1):
+            mask = targets == c
+            if mask.sum() == 0:
+                continue
+            mean_p_c = p_y[mask].mean()
+            self.difficulty_ema[c] = self.ema_beta * self.difficulty_ema[c] + (1 - self.ema_beta) * (1.0 - mean_p_c)
+ 
+    def _rank_loss(self, prob_class1, targets):
+        pos_mask = targets == self.minority_class
+        neg_mask = ~pos_mask
+        if pos_mask.sum() == 0 or neg_mask.sum() == 0:
+            return prob_class1.new_tensor(0.0)
+ 
+        pos_scores = prob_class1[pos_mask]   # (P,) điểm số class-1 của mẫu lớp hiếm
+        neg_scores = prob_class1[neg_mask]   # (N,) điểm số class-1 của mẫu lớp đa số
+ 
+        diff = pos_scores.unsqueeze(1) - neg_scores.unsqueeze(0)      # (P, N)
+        hinge = torch.clamp(self.rank_margin - diff, min=0.0)
+        return (hinge ** 2).mean()
+ 
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits (Tensor): (batch_size, 2) -- đầu ra chưa softmax (2 logits: class0, class1).
+                              Nếu model của bạn chỉ xuất 1 logit (sigmoid style), xem hàm
+                              from_single_logit() bên dưới để convert.
+            targets (Tensor): (batch_size,) -- nhãn 0/1.
+        """
+        device = logits.device
+        self.static_weights = self.static_weights.to(device)
+        self.difficulty_ema = self.difficulty_ema.to(device)
+ 
+        probs = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+ 
+        batch_idx = torch.arange(logits.size(0), device=device)
+        p_y = probs[batch_idx, targets]
+        log_p_y = log_probs[batch_idx, targets]
+ 
+        # ---- [MỚI 1] Adaptive class weight ----
+        self._update_difficulty(p_y.detach(), targets)
+        w_y_static = self.static_weights[targets]
+        d_y = self.difficulty_ema[targets]
+        w_y_adaptive = w_y_static * (1.0 + d_y)
+ 
+        # ---- Thành phần DWB (dùng trọng số adaptive) ----
+        dynamic_weight = torch.pow(w_y_adaptive, 1.0 - p_y)
+        term1 = -dynamic_weight * log_p_y          # dynamically weighted CE
+        term2 = -p_y * (1.0 - p_y)                  # entropy of Brier score (calibration)
+        dwb_loss = term1 + term2
+ 
+        if self.reduction == "mean":
+            dwb_loss_reduced = torch.mean(dwb_loss)
+        elif self.reduction == "sum":
+            dwb_loss_reduced = torch.sum(dwb_loss)
+        else:
+            dwb_loss_reduced = dwb_loss
+ 
+        # ---- [MỚI 2] Rank-aware regularization (soft AUPRC surrogate) ----
+        prob_class1 = probs[:, 1]
+        rank_loss = self._rank_loss(prob_class1, targets)
+        lam = self._current_lambda()
+ 
+        total_loss = dwb_loss_reduced + lam * rank_loss
+ 
+        # logs = {
+        #     "dwb_loss": dwb_loss_reduced.detach().item() if self.reduction != "none" else None,
+        #     "rank_loss": rank_loss.detach().item(),
+        #     "lambda": lam,
+        #     "w_minority": w_y_adaptive[targets == self.minority_class].mean().item()
+        #     if (targets == self.minority_class).any() else None,
+        # }
+        return total_loss
+ 
+    @staticmethod
+    def from_single_logit(logit):
+        """
+        Tiện ích: nếu model của bạn chỉ xuất ra 1 logit (kiểu BCEWithLogits),
+        chuyển thành 2 logits [logit_class0, logit_class1] = [0, logit]
+        để dùng chung với ARDWBLossBinary.
+        """
+        zeros = torch.zeros_like(logit)
+        return torch.stack([zeros, logit], dim=-1)
+
+
+
+"""
+AML-DWB Loss: Effective-Number Reweighted, Cost-Sensitive DWB Loss for AML
+------------------------------------------------------------------------------
+Cải tiến DWB Loss gốc (Fernando & Tsokos, 2022) dựa trên 2 ĐẶC THÙ THỰC SỰ
+của bài toán AML (Anti-Money Laundering) mất cân bằng cực đoan, KHÔNG phải
+chỉ chạy theo một metric (F1) chung chung:
+
+============================================================================
+ĐẶC ĐIỂM 1 CỦA AML: mất cân bằng cực đoan hơn hẳn imbalance "thông thường"
+============================================================================
+DWB gốc dùng: w_j = log(max(n_k)/n_j) + 1
+
+Vấn đề: công thức log được thiết kế cho tỉ lệ mất cân bằng vừa phải
+(vd CICIDS2017: ~1:10 - 1:100). AML thực tế thường có tỉ lệ 1:1000 -
+1:10000+ (SAR thật cực kỳ hiếm so với giao dịch bình thường). Ở mức
+độ này, log() nén sự khác biệt giữa "hiếm" và "cực hiếm" lại quá nhiều
+-> mất khả năng phân biệt độ ưu tiên cần thiết.
+
+GIẢI PHÁP: dùng "Effective Number of Samples" (Cui et al., CVPR 2019) -
+kỹ thuật được thiết kế RIÊNG cho long-tail cực đoan, dựa trên lý luận:
+các giao dịch bình thường (majority) có độ TRÙNG LẶP/REDUNDANT rất cao
+(rất nhiều giao dịch "bình thường" mang thông tin gần như lặp lại), nên
+"thông tin hữu ích thực sự" mà lớp đa số đóng góp KHÔNG tăng tuyến tính
+theo số lượng mẫu:
+
+    E(n_j) = (1 - beta^n_j) / (1 - beta),    beta = (N-1)/N
+
+    (N = tổng số mẫu toàn dataset -> beta được SUY RA từ dữ liệu,
+     KHÔNG phải một hyperparameter tự do cần tune)
+
+    w_j = (1 - beta) / (1 - beta^n_j),  sau đó chuẩn hoá để w_min = 1
+
+Đây là cơ chế reweighting KHÁC HẲN về bản chất so với log-ratio: nó mô
+hình hoá độ "bão hoà thông tin" của lớp đa số thay vì chỉ đếm tần suất
+thô -> phù hợp hơn khi tỉ lệ mất cân bằng cực đoan như AML.
+
+============================================================================
+ĐẶC ĐIỂM 2 CỦA AML: chi phí sai lầm bất đối xứng theo RỦI RO PHÁP LÝ,
+                     không phải theo tần suất dữ liệu
+============================================================================
+Đây là đặc thù AML mà KHÔNG loss nào dựa trên tần suất lớp (kể cả DWB gốc,
+kể cả effective-number ở trên) nắm bắt được: bỏ sót 1 giao dịch rửa tiền
+thật (False Negative) có thể dẫn tới hậu quả pháp lý/regulatory fine cho
+tổ chức tài chính - mức độ nghiêm trọng này đến từ QUY ĐỊNH PHÁP LUẬT, hoàn
+toàn độc lập với việc lớp đó hiếm ra sao trong dữ liệu training.
+
+GIẢI PHÁP: thêm hệ số cost ratio r = C_FN / C_FP làm INPUT của loss (giống
+class_counts - đây là tham số nghiệp vụ do tổ chức/đội compliance cung cấp
+dựa trên chi phí thực tế điều tra false alarm so với chi phí/rủi ro khi bỏ
+sót 1 case rửa tiền thật - KHÔNG phải hyperparameter tune bằng grid-search):
+
+    w_1_final = w_1_effective_number * r
+
+============================================================================
+TỔNG HỢP CÔNG THỨC LOSS (giữ nguyên cấu trúc DWB gốc, chỉ thay w_j)
+============================================================================
+    L_AML-DWB = - w_y^(1-p_y) * log(p_y)  -  p_y * (1 - p_y)
+
+    trong đó w_y giờ = effective_number_weight(y) * cost_ratio(y)
+    (cost_ratio = r cho y=1 (lớp rửa tiền), = 1 cho y=0)
+============================================================================
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class AMLDWBLoss(nn.Module):
+    def __init__(self, class_counts, cost_ratio_fn_fp=10.0, reduction="mean"):
+        """
+        Args:
+            class_counts (list/tuple/Tensor): [n_class0, n_class1].
+                class 1 = lớp rửa tiền/hiếm.
+            cost_ratio_fn_fp (float): r = C_FN / C_FP - tỉ lệ chi phí giữa việc
+                BỎ SÓT 1 case rửa tiền thật so với chi phí ĐIỀU TRA 1 false
+                alarm. Đây là THAM SỐ NGHIỆP VỤ, nên được đội compliance/rủi ro
+                của tổ chức cung cấp dựa trên chi phí thực tế (vd: chi phí
+                regulatory fine trung bình / chi phí giờ công điều tra viên).
+                Mặc định 10.0 chỉ là placeholder hợp lý cho AML (nhiều nghiên
+                cứu ngành ước tính bỏ sót SAR có chi phí kỳ vọng cao hơn đáng
+                kể so với điều tra sai) - BẠN NÊN THAY BẰNG SỐ THỰC TẾ của tổ
+                chức mình nếu có.
+            reduction (str): 'mean' | 'sum' | 'none'.
+        """
+        super().__init__()
+        assert len(class_counts) == 2, "Chỉ nhận đúng 2 giá trị: [n_class0, n_class1]"
+        self.reduction = reduction
+        self.cost_ratio_fn_fp = cost_ratio_fn_fp
+
+        counts = torch.tensor(class_counts, dtype=torch.float32)
+        N = counts.sum()
+
+        # --- Effective Number of Samples (Cui et al., 2019) ---
+        # beta suy ra từ tổng số mẫu N, KHÔNG phải hyperparameter tự do
+        beta = (N - 1.0) / N
+        effective_num = (1.0 - torch.pow(beta, counts)) / (1.0 - beta)
+        w_eff_raw = 1.0 / effective_num
+        w_eff_ratio = w_eff_raw / w_eff_raw.min()  # lớp đa số = 1 (mốc so sánh)
+
+        # LƯU Ý QUAN TRỌNG (kiểm chứng bằng số liệu thực tế):
+        # Với tỉ lệ mất cân bằng cực đoan kiểu AML (vd 1:1000+), w_eff_ratio thô
+        # có thể lớn hơn RẤT NHIỀU so với log-ratio gốc (vd 632 so với 7.9) do
+        # effective-number gần như suy biến về 1/n_j (inverse frequency) khi
+        # n_j << N. Nếu dùng thẳng giá trị này, dynamic_weight = w_y^(1-p_y)
+        # có nguy cơ gây gradient explosion/loss instability khi p_y nhỏ.
+        #
+        # -> Cần một bước "damping" (sqrt) SAU KHI đã tính effective-number
+        # ratio, để giữ được đặc tính nhạy với mức độ mất cân bằng cực đoan
+        # (tốt hơn log-ratio thuần) NHƯNG vẫn an toàn về mặt số học khi train.
+        # Đây là bước ổn định kỹ thuật cho 1 công thức MỚI (effective number),
+        # không phải bản thân cải tiến - cải tiến vẫn là việc THAY THẾ cơ chế
+        # log-ratio bằng effective-number + cost ratio.
+        w_eff_damped = torch.sqrt(w_eff_ratio)
+
+        # --- Áp thêm cost ratio CHỈ cho lớp hiếm (class 1) ---
+        # phản ánh chi phí bất đối xứng theo rủi ro pháp lý, không phải tần suất
+        cost_multiplier = torch.tensor([1.0, cost_ratio_fn_fp])
+        w_final = w_eff_damped * cost_multiplier
+
+        self.register_buffer("weights", w_final)
+
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits (Tensor): (batch_size, 2) - đầu ra chưa activation.
+            targets (Tensor): (batch_size,) - nhãn 0/1.
+        """
+        self.weights = self.weights.to(logits.device)
+
+        probs = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+
+        batch_idx = torch.arange(logits.size(0), device=logits.device)
+        p_y = probs[batch_idx, targets]
+        log_p_y = log_probs[batch_idx, targets]
+        w_y = self.weights[targets]
+
+        # Cấu trúc công thức GIỮ NGUYÊN như DWB gốc (13) - chỉ w_y thay đổi bản chất
+        dynamic_weight = torch.pow(w_y, 1.0 - p_y)
+        term1 = -dynamic_weight * log_p_y
+        term2 = -p_y * (1.0 - p_y)
+        loss = term1 + term2
+
+        if self.reduction == "mean":
+            return torch.mean(loss)
+        elif self.reduction == "sum":
+            return torch.sum(loss)
+        else:
+            return loss
+
+
+# -------------------------------------------------------------------------
+# Ví dụ + so sánh trọng số giữa DWB gốc (log-ratio) và AML-DWB (effective-number x cost)
+# -------------------------------------------------------------------------
+if __name__ == "__main__":
+    import math
+
+    class_counts = [999000, 1000]  # tỉ lệ 1:999 - mức độ mất cân bằng thực tế của AML
+
+    # Trọng số theo công thức GỐC (log-ratio) để so sánh
+    n0, n1 = class_counts
+    w1_original_log = math.log(max(n0, n1) / n1) + 1.0
+    print(f"[DWB gốc]      w_1 (log-ratio)                = {w1_original_log:.2f}")
+
+    criterion = AMLDWBLoss(class_counts, cost_ratio_fn_fp=10.0)
+    print(f"[AML-DWB]      w_1 (effective-number damped, chưa nhân cost) = "
+          f"{(criterion.weights[1] / 10.0).item():.2f}")
+    print(f"[AML-DWB]      w_1 (effective-number damped x cost_ratio=10) = {criterion.weights[1].item():.2f}")
+
+    logits = torch.randn(256, 2, requires_grad=True)
+    targets = torch.cat([torch.zeros(253, dtype=torch.long), torch.ones(3, dtype=torch.long)])
+
+    loss = criterion(logits, targets)
+    loss.backward()
+    print("Total loss:", loss.item())
+
+
+
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
