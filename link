@@ -1,3 +1,533 @@
+import argparse
+import random
+import time
+from typing import Dict, List, Tuple
+
+import dgl
+import dgl.function as fn
+from dgl.nn.pytorch.factory import KNNGraph
+import numpy as np
+import scipy
+from scipy.special import beta
+from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score
+import sympy
+import torch
+from torch import nn
+import torch.nn.functional as F
+from xgboost import XGBClassifier
+
+# ============================================================
+# Global Configuration & Environment
+# ============================================================
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def set_seed(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# ============================================================
+# Dummy Data & Metric Utils (Đảm bảo code tự chạy độc lập)
+# ============================================================
+
+def create_synthetic_data(num_nodes=500, num_feats=32) -> dgl.DGLGraph:
+    """Tạo đồ thị mô phỏng bài toán Gian lận tài chính (Fraud Detection)."""
+    # Tạo đồ thị ngẫu nhiên Erdos-Renyi
+    src = np.random.randint(0, num_nodes, size=num_nodes * 5)
+    dst = np.random.randint(0, num_nodes, size=num_nodes * 5)
+    g = dgl.graph((src, dst), num_nodes=num_nodes)
+    g = dgl.to_bidirected(g)
+    g = dgl.add_self_loop(g)
+
+    # Khởi tạo Features và Labels (Gợi ý: 10% gian lận)
+    x = torch.randn(num_nodes, num_feats)
+    y = torch.zeros(num_nodes, dtype=torch.long)
+    fraud_indices = np.random.choice(num_nodes, size=int(num_nodes * 0.1), replace=False)
+    y[fraud_indices] = 1
+
+    # Tạo train/val/test masks
+    perm = torch.randperm(num_nodes)
+    train_size = int(0.6 * num_nodes)
+    val_size = int(0.2 * num_nodes)
+
+    train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+
+    train_mask[perm[:train_size]] = True
+    val_mask[perm[train_size:train_size + val_size]] = True
+    test_mask[perm[train_size + val_size:]] = True
+
+    g.ndata['x'] = x
+    g.ndata['y'] = y
+    g.ndata['train_mask'] = train_mask
+    g.ndata['val_mask'] = val_mask
+    g.ndata['test_mask'] = test_mask
+
+    return g.to(DEVICE)
+
+
+def prob_convert_pred(probs: np.ndarray, thres: float = 0.5) -> np.ndarray:
+    return (probs >= thres).astype(int)
+
+
+def eval_metric(y_true: np.ndarray, y_prob: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    auc = roc_auc_score(y_true, y_prob)
+    ap = average_precision_score(y_true, y_prob)
+
+    # Tìm threshold tối ưu theo F1-score trên Precision-Recall curve
+    precisions, recalls, thresholds = precision_recall_curve(y_true, y_prob)
+    f1_scores = (2 * precisions * recalls) / (precisions + recalls + 1e-8)
+    best_idx = np.argmax(f1_scores)
+    best_thres = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
+
+    return {
+        'auc': auc,
+        'ap': ap,
+        'best_pr_thres': float(best_thres)
+    }
+
+
+# ============================================================
+# Graph Filter Utilities
+# ============================================================
+
+def calculate_theta(d: int) -> List[List[float]]:
+    """Tính các hệ số ma trận đa thức lọc đồ thị (Bernstein Basis)."""
+    thetas = []
+    x = sympy.symbols('x')
+
+    for i in range(d + 1):
+        f = sympy.poly(
+            (x / 2) ** i
+            * (1 - x / 2) ** (d - i)
+            / scipy.special.beta(i + 1, d + 1 - i)
+        )
+        coeff = f.all_coeffs()
+        inv_coeff = [float(coeff[d - j]) for j in range(d + 1)]
+        thetas.append(inv_coeff)
+
+    return thetas
+
+
+class PolyConv(nn.Module):
+    """Lớp Tích phân Đa thức Đồ thị (Polynomial Graph Convolution)."""
+    def __init__(self, theta: List[float]):
+        super(PolyConv, self).__init__()
+        self._theta = theta
+        self._k = len(self._theta)
+
+    def _unnormalized_laplacian(
+        self, 
+        feat: torch.Tensor, 
+        d_invsqrt: torch.Tensor, 
+        graph: dgl.DGLGraph
+    ) -> torch.Tensor:
+        """Tính: X - D^(-1/2) A D^(-1/2) X"""
+        graph.ndata['h'] = feat * d_invsqrt
+        graph.update_all(fn.copy_u('h', 'm'), fn.sum('m', 'h'))
+        return feat - graph.ndata.pop('h') * d_invsqrt
+
+    def forward(self, graph: dgl.DGLGraph, feat: torch.Tensor) -> torch.Tensor:
+        with graph.local_scope():
+            d_invsqrt = torch.pow(
+                graph.in_degrees().float().clamp(min=1), -0.5
+            ).unsqueeze(-1).to(feat.device)
+
+            h = self._theta[0] * feat
+            curr_feat = feat
+            for k in range(1, self._k):
+                curr_feat = self._unnormalized_laplacian(curr_feat, d_invsqrt, graph)
+                h += self._theta[k] * curr_feat
+            return h
+
+
+# ============================================================
+# Loss Functions & Mining Mechanisms
+# ============================================================
+
+def pairwise_ranking_loss(
+    fraud_scores: torch.Tensor, 
+    benign_scores: torch.Tensor, 
+    margin: float = 0.2,
+    max_pairs: int = 4096
+) -> torch.Tensor:
+    """Hàm tổn thất Pairwise Ranking tối ưu cho imbalance nhãn gian lận."""
+    if fraud_scores.numel() == 0 or benign_scores.numel() == 0:
+        return torch.tensor(0.0, device=fraud_scores.device)
+
+    if fraud_scores.shape[0] > max_pairs:
+        idx = torch.randperm(fraud_scores.shape[0], device=fraud_scores.device)[:max_pairs]
+        fraud_scores = fraud_scores[idx]
+
+    if benign_scores.shape[0] > max_pairs:
+        idx = torch.randperm(benign_scores.shape[0], device=benign_scores.device)[:max_pairs]
+        benign_scores = benign_scores[idx]
+
+    diff = fraud_scores.unsqueeze(1) - benign_scores.unsqueeze(0)
+    loss = F.relu(margin - diff)
+    return loss.mean()
+
+
+def cross_view_hard_negative_mining(
+    z_graph: torch.Tensor,
+    z_sim: torch.Tensor,
+    labels: torch.Tensor,
+    num_hard: int = 20,
+    alpha: float = 0.5
+) -> torch.Tensor:
+    """Khai thác mẫu âm khó (Hard Negative Mining) giữa 2 góc nhìn Đồ thị."""
+    fraud_mask = (labels == 1)
+    benign_mask = (labels == 0)
+
+    fraud_graph, benign_graph = z_graph[fraud_mask], z_graph[benign_mask]
+    fraud_sim, benign_sim = z_sim[fraud_mask], z_sim[benign_mask]
+
+    if fraud_graph.shape[0] == 0 or benign_graph.shape[0] == 0:
+        return torch.empty(0, dtype=torch.long, device=labels.device)
+
+    fraud_graph = F.normalize(fraud_graph, p=2, dim=1)
+    benign_graph = F.normalize(benign_graph, p=2, dim=1)
+    fraud_sim = F.normalize(fraud_sim, p=2, dim=1)
+    benign_sim = F.normalize(benign_sim, p=2, dim=1)
+
+    max_sim_graph = torch.mm(benign_graph, fraud_graph.T).max(dim=1).values
+    max_sim_sim = torch.mm(benign_sim, fraud_sim.T).max(dim=1).values
+
+    hardness = alpha * max_sim_graph + (1.0 - alpha) * max_sim_sim
+
+    k = min(num_hard, hardness.shape[0])
+    hard_local_idx = torch.topk(hardness, k=k, largest=True).indices
+    benign_global_idx = torch.where(benign_mask)[0]
+
+    return benign_global_idx[hard_local_idx]
+
+
+# ============================================================
+# Dual-Branch Network Architecture (DPF-GFD)
+# ============================================================
+
+class DPFGFDModel(nn.Module):
+    def __init__(
+        self,
+        in_feats: int,
+        hid_feats: int,
+        out_feats: int,
+        num_layers: int,
+        dropout_rate: float,
+        activation: str
+    ):
+        super(DPFGFDModel, self).__init__()
+        self.act = getattr(nn, activation)()
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
+
+        self.thetas = calculate_theta(d=num_layers)
+
+        # Nhánh 1: Structural Graph
+        self.conv_o = nn.ModuleList([PolyConv(t) for t in self.thetas])
+        self.linear1_o = nn.Linear(in_feats, hid_feats)
+
+        # Nhánh 2: Feature Similarity Graph
+        self.conv_s = nn.ModuleList([PolyConv([4] * len(t)) for t in self.thetas])
+        self.linear1_s = nn.Linear(in_feats, hid_feats)
+
+        # Trích xuất Embeddings hợp nhất
+        branch_emb_dim = hid_feats * len(self.conv_o)
+        self.embedding_dim = branch_emb_dim * 2
+
+        self.mlp = nn.Sequential(
+            nn.Linear(self.embedding_dim, hid_feats),
+            nn.ReLU(),
+            nn.Linear(hid_feats, out_feats)
+        )
+
+    def forward(
+        self, 
+        graph: dgl.DGLGraph, 
+        sim_graph: dgl.DGLGraph
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Branch 1
+        h_o = self.act(self.linear1_o(graph.ndata['x']))
+        h_o_final = self.dropout(torch.cat([conv(graph, h_o) for conv in self.conv_o], dim=-1))
+
+        # Branch 2
+        h_s = self.act(self.linear1_s(sim_graph.ndata['x']))
+        h_s_final = self.dropout(torch.cat([conv(sim_graph, h_s) for conv in self.conv_s], dim=-1))
+
+        # Concatenate multi-view representation
+        h_all = torch.cat([h_o_final, h_s_final], dim=-1)
+        logits = self.mlp(h_all)
+
+        return h_all, logits, h_o_final, h_s_final
+
+
+# ============================================================
+# Fraud Detector Pipeline Controller
+# ============================================================
+
+class FraudDetector:
+    def __init__(
+        self, 
+        train_config: Dict, 
+        model_config: Dict, 
+        data: dgl.DGLGraph
+    ):
+        self.train_config = train_config
+        self.model_config = model_config
+        self.source_graph = data
+
+        # Tự động dựng k-NN Similarity Graph từ đặc trưng node
+        feat = data.ndata['x']
+        knn_builder = KNNGraph(model_config['k'])
+        self.sim_graph = knn_builder(
+            feat, algorithm='bruteforce-sharemem', dist=model_config['dist']
+        )
+        self.sim_graph.ndata['x'] = feat
+        self.sim_graph = self.sim_graph.to(DEVICE)
+
+        self.in_feats = feat.shape[1]
+        self.train_mask = data.ndata['train_mask'].bool()
+        self.val_mask = data.ndata['val_mask'].bool()
+        self.test_mask = data.ndata['test_mask'].bool()
+
+        self.train_y = data.ndata['y'][self.train_mask].long()
+        self.val_y = data.ndata['y'][self.val_mask].long()
+        self.test_y = data.ndata['y'][self.test_mask].long()
+
+        # Tính tỷ lệ Imbalance để điều chỉnh Trọng số Class
+        num_benign = (self.train_y == 0).sum().item()
+        num_fraud = (self.train_y == 1).sum().item()
+        self.weight = num_benign / max(num_fraud, 1)
+
+        # Khởi tạo mô hình DPF-GFD GNN
+        self.gnn_model = DPFGFDModel(
+            in_feats=self.in_feats,
+            hid_feats=model_config['hid_feats'],
+            out_feats=2,
+            num_layers=model_config['num_layers'],
+            dropout_rate=model_config['dropout_rate'],
+            activation=model_config['activation']
+        ).to(DEVICE)
+
+        # Khởi tạo XGBoost làm classifier lai ở Phase 2
+        tree_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.tree_model = XGBClassifier(
+            device=tree_device,
+            tree_method='hist',
+            eval_metric='aucpr',
+            n_estimators=model_config['n_estimators'],
+            learning_rate=model_config['eta'],
+            subsample=model_config['subsample'],
+            colsample_bytree=model_config['colsample_bytree'],
+            reg_lambda=model_config['reg_lambda'],
+            scale_pos_weight=self.weight,
+            random_state=model_config.get('seed', 42)
+        )
+
+        self.best_val_score = 0.0
+        self.patience_cnt = 0
+        self.best_emb = None
+        self.best_pr_thres = 0.5
+
+    def pretrain(self) -> float:
+        """Phase 1: Pretrain GNN với Multi-view & Hard Negative Mining."""
+        optimizer = torch.optim.Adam(
+            self.gnn_model.parameters(), 
+            lr=self.model_config['learning_rate']
+        )
+        class_weight = torch.tensor([1.0, self.weight], dtype=torch.float32, device=DEVICE)
+
+        for e in range(self.train_config['epochs']):
+            self.gnn_model.train()
+            h_all, logits, z_graph, z_sim = self.gnn_model(self.source_graph, self.sim_graph)
+
+            train_logits = logits[self.train_mask]
+            cls_loss = F.cross_entropy(train_logits, self.train_y, weight=class_weight)
+
+            # Khai thác mẫu âm khó
+            hard_idx = cross_view_hard_negative_mining(
+                z_graph=z_graph[self.train_mask],
+                z_sim=z_sim[self.train_mask],
+                labels=self.train_y,
+                num_hard=self.model_config['num_hard_negatives'],
+                alpha=self.model_config['cross_view_alpha']
+            )
+
+            # Pairwise Ranking Loss
+            fraud_mask = (self.train_y == 1)
+            benign_mask = (self.train_y == 0)
+            fraud_scores = torch.sigmoid(train_logits[fraud_mask, 1])
+
+            if hard_idx.numel() > 0:
+                benign_indices = torch.where(benign_mask)[0]
+                hard_benign_scores = torch.sigmoid(train_logits[benign_indices[hard_idx], 1])
+            else:
+                hard_benign_scores = torch.empty(0, device=DEVICE)
+
+            rank_loss = pairwise_ranking_loss(
+                fraud_scores=fraud_scores,
+                benign_scores=hard_benign_scores,
+                margin=self.model_config['ranking_margin']
+            )
+
+            loss = cls_loss + self.model_config['lambda_rank'] * rank_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.gnn_model.parameters(), max_norm=5.0)
+            optimizer.step()
+
+            # Đánh giá Validation
+            self.gnn_model.eval()
+            with torch.no_grad():
+                h_val, logits_val, _, _ = self.gnn_model(self.source_graph, self.sim_graph)
+                val_probs = logits_val.softmax(dim=1)[self.val_mask, 1].cpu().numpy()
+                val_y_np = self.val_y.cpu().numpy()
+                val_preds = prob_convert_pred(val_probs, thres=0.5)
+
+                val_score = eval_metric(val_y_np, val_probs, val_preds)
+                current_score = val_score[self.train_config['metric']]
+
+            if e % 10 == 0 or e == self.train_config['epochs'] - 1:
+                print(
+                    f"Epoch {e:03d} | CLS Loss: {cls_loss.item():.4f} | "
+                    f"Rank Loss: {rank_loss.item():.4f} | "
+                    f"Val {self.train_config['metric'].upper()}: {current_score:.4f}"
+                )
+
+            # Early Stopping Check
+            if current_score > self.best_val_score:
+                self.best_val_score = current_score
+                self.patience_cnt = 0
+                self.best_emb = h_val.detach().clone()
+            else:
+                self.patience_cnt += 1
+                if self.patience_cnt >= self.train_config['patience']:
+                    print(f"Early stopping kích hoạt tại epoch {e}")
+                    break
+
+        return self.best_val_score
+
+    def train(self) -> float:
+        """Phase 2: Train Gradient Boosted Decision Tree dựa trên Embeddings."""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Ghép Đặc trưng gốc + Embeddings đã học từ GNN
+        all_emb = torch.cat([self.source_graph.ndata['x'], self.best_emb], dim=1)
+
+        train_emb = all_emb[self.train_mask].cpu().numpy()
+        val_emb = all_emb[self.val_mask].cpu().numpy()
+        self.test_emb = all_emb[self.test_mask].cpu().numpy()
+
+        train_y_np = self.train_y.cpu().numpy()
+        val_y_np = self.val_y.cpu().numpy()
+
+        # Fit XGBoost Model
+        print("\n--- Bắt đầu huấn luyện XGBoost Classifier ---")
+        self.tree_model.fit(train_emb, train_y_np)
+
+        val_probs = self.tree_model.predict_proba(val_emb)[:, 1]
+        val_preds = prob_convert_pred(val_probs, thres=0.5)
+        val_score = eval_metric(val_y_np, val_probs, val_preds)
+
+        self.best_pr_thres = val_score.get('best_pr_thres', 0.5)
+        print(f"XGBoost Val AP Score: {val_score['ap']:.4f} | Best Threshold: {self.best_pr_thres:.4f}")
+        return val_score[self.train_config['metric']]
+
+    def test(self) -> Dict[str, float]:
+        """Phase 3: Đánh giá trên Test Set."""
+        test_probs = self.tree_model.predict_proba(self.test_emb)[:, 1]
+        test_preds = prob_convert_pred(test_probs, thres=self.best_pr_thres)
+        return eval_metric(self.test_y.cpu().numpy(), test_probs, test_preds)
+
+
+# ============================================================
+# Main Execution Strategy
+# ============================================================
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Pipeline Phát hiện Gian lận DPF-GFD")
+    parser.add_argument('--seed', type=int, default=42)
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+
+    print(f"Chạy pipeline trên thiết bị: {DEVICE}")
+
+    # 1. Tạo Graph dữ liệu giả lập
+    graph = create_synthetic_data(num_nodes=600, num_feats=32)
+    print(f"Đã tạo đồ thị thành công: {graph.num_nodes()} Nodes, {graph.num_edges()} Edges")
+
+    # 2. Cấu hình Hyperparameters
+    train_config = {
+        'epochs': 100,
+        'patience': 20,
+        'metric': 'ap'
+    }
+
+    model_config = {
+        'num_layers': 2,
+        'hid_feats': 32,
+        'activation': 'ReLU',
+        'dropout_rate': 0.1,
+        'learning_rate': 0.01,
+        'k': 10,
+        'dist': 'euclidean',
+        'n_estimators': 100,
+        'eta': 0.1,
+        'reg_lambda': 1.0,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'num_hard_negatives': 10,
+        'cross_view_alpha': 0.5,
+        'ranking_margin': 0.2,
+        'lambda_rank': 0.5,
+        'seed': args.seed
+    }
+
+    # 3. Khởi tạo Pipeline & Thực thi
+    pipeline = FraudDetector(
+        train_config=train_config,
+        model_config=model_config,
+        data=graph
+    )
+
+    print("\n================== PHASE 1: PRETRAIN GNN ==================")
+    pipeline.pretrain()
+
+    print("\n================== PHASE 2: TRAIN HYBRID TREE =============")
+    pipeline.train()
+
+    print("\n================== PHASE 3: EVALUATE TEST SET =============")
+    test_res = pipeline.test()
+    print(f"KẾT QUẢ TEST SET FINAL:")
+    print(f" -> ROC-AUC : {test_res['auc']:.4f}")
+    print(f" -> PR-AUC (AP): {test_res['ap']:.4f}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class DWBLoss(nn.Module):
     def __init__(
         self,
