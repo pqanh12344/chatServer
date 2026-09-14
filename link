@@ -1,4 +1,714 @@
 import argparse
+import copy
+import datetime
+import gc
+import os
+import random
+import time
+
+import joblib
+import numpy as np
+import pandas as pd
+import scipy
+import sympy
+import yaml
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import dgl
+from dgl import function as fn
+from dgl.nn.pytorch.factory import KNNGraph
+from sklearn.metrics import average_precision_score, f1_score, roc_auc_score
+from xgboost import XGBClassifier
+
+
+# ============================================================
+# 1. METRICS
+# ============================================================
+
+def prob_convert_pred(prob, thres=0.5):
+    return (np.asarray(prob) >= thres).astype(int)
+
+
+def calculate_rec_at_k(y_true, y_prob):
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob)
+    k = int(np.sum(y_true == 1))
+    if k == 0:
+        return 0.0
+    idx = np.argsort(-y_prob)[:k]
+    return float(np.mean(y_true[idx] == 1))
+
+
+def find_best_pr_threshold(y_true, y_prob):
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob)
+    order = np.argsort(-y_prob)
+    p = y_prob[order]
+    y = y_true[order]
+    tp = np.cumsum(y == 1)
+    fp = np.cumsum(y == 0)
+    pos = max(np.sum(y_true == 1), 1)
+    fn = pos - tp
+    precision = tp / np.maximum(tp + fp, 1)
+    recall = tp / np.maximum(tp + fn, 1)
+    f1 = 2 * precision * recall / np.maximum(precision + recall, 1e-12)
+    return float(p[int(np.argmax(f1))])
+
+
+def eval_metric(y_true, y_prob, y_pred):
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob)
+    y_pred = np.asarray(y_pred).astype(int)
+    return {
+        "rec@k": calculate_rec_at_k(y_true, y_prob),
+        "f1": f1_score(y_true, y_pred, zero_division=0),
+        "auc": roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.0,
+        "ap": average_precision_score(y_true, y_prob) if np.sum(y_true == 1) else 0.0,
+        "best_pr_thres": find_best_pr_threshold(y_true, y_prob),
+    }
+
+
+# ============================================================
+# 2. POLYNOMIAL COEFFICIENTS
+# ============================================================
+
+THETA_CACHE = {}
+
+
+def calculate_theta(d):
+    if d in THETA_CACHE:
+        return THETA_CACHE[d]
+    thetas = []
+    x = sympy.symbols("x")
+    for i in range(d + 1):
+        f = sympy.poly(
+            (x / 2) ** i * (1 - x / 2) ** (d - i)
+            / scipy.special.beta(i + 1, d + 1 - i)
+        )
+        coeff = f.all_coeffs()
+        thetas.append([float(coeff[d - j]) for j in range(d + 1)])
+    THETA_CACHE[d] = thetas
+    return thetas
+
+
+# ============================================================
+# 3. CURVATURE
+# ============================================================
+
+def edge_curvature(graph):
+    """
+    Lightweight Forman-style curvature approximation:
+        kappa(u,v) = 4 - deg(u) - deg(v)
+    for an unweighted graph.
+
+    It is intentionally computed without triangle enumeration so that
+    it remains practical on large fraud graphs.
+    """
+    src, dst = graph.edges()
+    deg = graph.in_degrees().float().clamp(min=1)
+    k = 4.0 - deg[src] - deg[dst]
+    k = torch.tanh(k / 10.0)
+    return k
+
+
+def add_refined_edge_weight(graph, base_weight):
+    graph.edata["rw"] = base_weight.float()
+    return graph
+
+
+def refine_graph(graph, x, fraud_prob=None, top_quantile=0.30,
+                 alpha=0.45, beta=0.35, gamma=0.20):
+    """
+    Curvature-aware fraud-oriented edge reliability.
+
+    reliability =
+        alpha * curvature_score
+      + beta  * feature/embedding similarity
+      + gamma * fraud compatibility
+
+    The graph topology is kept unchanged; unreliable edges receive
+    smaller message weights. This avoids expensive graph rebuilding.
+    """
+    with torch.no_grad():
+        src, dst = graph.edges()
+
+        curv = edge_curvature(graph)
+        curv_score = (curv - curv.min()) / (curv.max() - curv.min() + 1e-8)
+
+        z = F.normalize(x, p=2, dim=1)
+        sim = (z[src] * z[dst]).sum(dim=1)
+        sim_score = (sim + 1.0) * 0.5
+
+        if fraud_prob is None:
+            compat = torch.ones_like(sim_score)
+        else:
+            compat = 1.0 - torch.abs(fraud_prob[src] - fraud_prob[dst])
+
+        reliability = (
+            alpha * curv_score
+            + beta * sim_score
+            + gamma * compat
+        )
+
+        # Keep a non-zero floor so the original graph is not destroyed.
+        q = torch.quantile(reliability, top_quantile)
+        weight = 0.20 + 0.80 * torch.sigmoid(
+            8.0 * (reliability - q)
+        )
+
+    return add_refined_edge_weight(graph, weight)
+
+
+# ============================================================
+# 4. WEIGHTED POLYNOMIAL GRAPH CONVOLUTION
+# ============================================================
+
+class PolyConv(nn.Module):
+    def __init__(self, theta):
+        super().__init__()
+        self._theta = theta
+        self._k = len(theta)
+
+    def forward(self, graph, feat):
+        def unn_laplacian(feat, d_inv_sqrt, graph):
+            graph.ndata["h"] = feat * d_inv_sqrt
+            graph.update_all(fn.copy_u("h", "m"), fn.sum("m", "h"))
+            agg = graph.ndata.pop("h")
+
+            if "rw" in graph.edata:
+                # The weighted graph is handled by an explicit weighted
+                # aggregation for the same normalized propagation.
+                graph.edata["m_w"] = graph.edata["rw"].unsqueeze(-1)
+                graph.ndata["h2"] = feat * d_inv_sqrt
+                graph.apply_edges(
+                    lambda edges: {
+                        "mw": edges.src["h2"] * edges.data["rw"].unsqueeze(-1)
+                    }
+                )
+                graph.update_all(
+                    fn.copy_e("mw", "m2"),
+                    fn.sum("m2", "h2")
+                )
+                agg = graph.ndata.pop("h2")
+
+            return feat - agg * d_inv_sqrt
+
+        with graph.local_scope():
+            if "rw" in graph.edata:
+                w = graph.edata["rw"]
+                deg = dgl.ops.copy_e_sum(
+                    graph,
+                    w.unsqueeze(-1)
+                ).squeeze(-1).clamp(min=1e-6)
+            else:
+                deg = graph.in_degrees().float().clamp(min=1)
+
+            d_inv_sqrt = deg.pow(-0.5).unsqueeze(-1).to(feat.device)
+
+            if "rw" not in graph.edata:
+                h = self._theta[0] * feat
+                cur = feat
+                for k in range(1, self._k):
+                    cur = unn_laplacian(cur, d_inv_sqrt, graph)
+                    h = h + self._theta[k] * cur
+                return h
+
+            # Weighted normalized Laplacian.
+            cur = feat
+            h = self._theta[0] * cur
+
+            for k in range(1, self._k):
+                graph.ndata["h"] = cur * d_inv_sqrt
+                graph.apply_edges(
+                    lambda edges: {
+                        "m": edges.src["h"] * edges.data["rw"].unsqueeze(-1)
+                    }
+                )
+                graph.update_all(fn.copy_e("m", "agg"), fn.sum("agg", "h_agg"))
+                agg = graph.ndata.pop("h_agg")
+                cur = cur - agg * d_inv_sqrt
+                h = h + self._theta[k] * cur
+
+            return h
+
+
+# ============================================================
+# 5. CAGR-GFD MODEL
+# ============================================================
+
+class MyModel(nn.Module):
+    def __init__(
+        self,
+        in_feats,
+        hid_feats,
+        out_feats,
+        num_layers,
+        dropout_rate,
+        activation,
+    ):
+        super().__init__()
+
+        self.hid_feats = hid_feats
+        self.thetas = calculate_theta(num_layers)
+        self.act = getattr(nn, activation)()
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
+
+        self.conv_o = nn.ModuleList([PolyConv(t) for t in self.thetas])
+        self.conv_s = nn.ModuleList(
+            [PolyConv([4.0] * len(t)) for t in self.thetas]
+        )
+
+        self.linear1_o = nn.Linear(in_feats, hid_feats)
+        self.linear1_s = nn.Linear(in_feats, hid_feats)
+
+        branch_dim = hid_feats * len(self.conv_o)
+
+        # Node-adaptive fusion.
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(branch_dim * 2, hid_feats),
+            nn.ReLU(),
+            nn.Linear(hid_feats, 1),
+        )
+
+        self.mlp = nn.Sequential(
+            nn.Linear(branch_dim * 2, hid_feats),
+            nn.ReLU(),
+            nn.Linear(hid_feats, out_feats),
+        )
+
+    def forward(self, graph, sim_graph):
+        h = self.act(self.linear1_o(graph.ndata["x"]))
+        h_o = torch.cat([c(graph, h) for c in self.conv_o], dim=-1)
+        h_o = self.dropout(h_o)
+
+        h_s = self.act(self.linear1_s(sim_graph.ndata["x"]))
+        h_s = torch.cat([c(sim_graph, h_s) for c in self.conv_s], dim=-1)
+        h_s = self.dropout(h_s)
+
+        both = torch.cat([h_o, h_s], dim=-1)
+        gate = torch.sigmoid(self.fusion_gate(both))
+        fused = gate * h_o + (1.0 - gate) * h_s
+
+        # Keep both fused and path-specific information for XGBoost.
+        h_all = torch.cat([fused, h_o, h_s], dim=-1)
+        logits = self.mlp(both)
+
+        return h_all, logits
+
+
+# ============================================================
+# 6. DATA
+# ============================================================
+
+def load_data(dataset_name):
+    paths = [
+        f"./data/{dataset_name}.dgl",
+        f"/kaggle/input/datasets/qucanhphan/ellipic-dataset/data/processed/{dataset_name}.dgl",
+    ]
+    for p in paths:
+        if os.path.exists(p):
+            graphs, _ = dgl.load_graphs(p)
+            return graphs[0]
+    raise FileNotFoundError(f"Dataset not found: {dataset_name}.dgl")
+
+
+# ============================================================
+# 7. DETECTOR
+# ============================================================
+
+class MyDetector:
+    def __init__(self, train_config, model_config, data, device):
+        self.train_config = train_config
+        self.model_config = model_config
+        self.device = device
+
+        feat = data.ndata["x"].float()
+        self.in_feats = feat.shape[1]
+
+        print(f"KNN k={model_config['k']} {model_config['dist']}")
+        knn_graph = KNNGraph(model_config["k"])
+        knn_g = knn_graph(
+            feat,
+            algorithm="bruteforce-sharemem",
+            dist=model_config["dist"],
+        )
+        knn_g.ndata["x"] = feat
+        self.sim_graph = knn_g.to(device)
+        self.source_graph = data.to(device)
+
+        self.train_mask = data.ndata["train_mask"].bool().to(device)
+        self.val_mask = data.ndata["val_mask"].bool().to(device)
+        self.test_mask = data.ndata["test_mask"].bool().to(device)
+
+        self.train_y = data.ndata["y"][self.train_mask].long().to(device)
+        self.val_y = data.ndata["y"][self.val_mask].long().to(device)
+        self.test_y = data.ndata["y"][self.test_mask].long().to(device)
+
+        neg = (self.train_y == 0).sum().item()
+        pos = (self.train_y == 1).sum().item()
+        self.weight = neg / max(pos, 1)
+
+        self.gnn_model = MyModel(
+            self.in_feats,
+            model_config["hid_feats"],
+            2,
+            model_config["num_layers"],
+            model_config["dropout_rate"],
+            model_config["activation"],
+        ).to(device)
+
+        metric = "aucpr" if train_config["metric"] == "ap" else "auc"
+        self.tree_model = XGBClassifier(
+            device="cuda",
+            tree_method="hist",
+            eval_metric=metric,
+            n_estimators=model_config["n_estimators"],
+            eta=model_config["eta"],
+            subsample=model_config["subsample"],
+            colsample_bytree=model_config["colsample_bytree"],
+            reg_lambda=model_config["reg_lambda"],
+            scale_pos_weight=self.weight,
+        )
+
+        self.best_val_score = -float("inf")
+        self.best_model = None
+        self.best_emb = None
+        self.best_pr_thres = 0.5
+
+    def _predict_gnn(self):
+        self.gnn_model.eval()
+        with torch.no_grad():
+            h, logits = self.gnn_model(self.source_graph, self.sim_graph)
+            p = torch.softmax(logits, dim=1)[:, 1]
+        return h, p
+
+    def pretrain(self):
+        optimizer = torch.optim.Adam(
+            self.gnn_model.parameters(),
+            lr=self.model_config["learning_rate"],
+        )
+        class_weight = torch.tensor(
+            [1.0, self.weight],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        for epoch in range(self.train_config["epochs"]):
+            self.gnn_model.train()
+            h, logits = self.gnn_model(self.source_graph, self.sim_graph)
+            loss = F.cross_entropy(
+                logits[self.train_mask],
+                self.train_y,
+                weight=class_weight,
+            )
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            _, p = self._predict_gnn()
+            val_prob = p[self.val_mask].cpu().numpy()
+            val_y = self.val_y.cpu().numpy()
+            val_pred = prob_convert_pred(val_prob, 0.5)
+            score = eval_metric(val_y, val_prob, val_pred)
+            current = score[self.train_config["metric"]]
+
+            if current > self.best_val_score:
+                self.best_val_score = current
+                self.best_model = copy.deepcopy(self.gnn_model)
+                self.best_emb = h.detach().clone()
+
+            if epoch == 0 or (epoch + 1) % 20 == 0:
+                print(f"e{epoch+1} loss={loss.item():.4f} valAP={score['ap']:.4f}")
+
+            if epoch >= self.train_config["patience"] and \
+               epoch - np.argmax([self.best_val_score]) > self.train_config["patience"]:
+                pass
+
+        return self.best_val_score
+
+    def refine(self):
+        # Fraud probabilities are generated only from the training/validation
+        # stage; test labels are never used.
+        self.gnn_model = copy.deepcopy(self.best_model).to(self.device)
+        _, p = self._predict_gnn()
+
+        self.source_graph = refine_graph(
+            self.source_graph,
+            self.source_graph.ndata["x"],
+            fraud_prob=p,
+            top_quantile=self.model_config["refine_quantile"],
+            alpha=self.model_config["curv_weight"],
+            beta=self.model_config["sim_weight"],
+            gamma=self.model_config["fraud_weight"],
+        )
+
+        self.sim_graph = refine_graph(
+            self.sim_graph,
+            self.sim_graph.ndata["x"],
+            fraud_prob=p,
+            top_quantile=self.model_config["refine_quantile"],
+            alpha=self.model_config["curv_weight"],
+            beta=self.model_config["sim_weight"],
+            gamma=self.model_config["fraud_weight"],
+        )
+
+        print("Graph refinement: done")
+
+    def retrain(self):
+        optimizer = torch.optim.Adam(
+            self.gnn_model.parameters(),
+            lr=self.model_config["learning_rate"] * 0.5,
+        )
+        class_weight = torch.tensor(
+            [1.0, self.weight],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        best_score = -float("inf")
+        best_emb = None
+        best_model = None
+        patience = 0
+
+        for epoch in range(self.train_config["refine_epochs"]):
+            self.gnn_model.train()
+            h, logits = self.gnn_model(self.source_graph, self.sim_graph)
+            loss = F.cross_entropy(
+                logits[self.train_mask],
+                self.train_y,
+                weight=class_weight,
+            )
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            _, p = self._predict_gnn()
+            val_prob = p[self.val_mask].cpu().numpy()
+            val_y = self.val_y.cpu().numpy()
+            score = eval_metric(
+                val_y, val_prob, prob_convert_pred(val_prob, 0.5)
+            )
+            current = score[self.train_config["metric"]]
+
+            if current > best_score:
+                best_score = current
+                best_emb = h.detach().clone()
+                best_model = copy.deepcopy(self.gnn_model)
+                patience = 0
+            else:
+                patience += 1
+
+            if epoch == 0 or (epoch + 1) % 10 == 0:
+                print(f"r{epoch+1} loss={loss.item():.4f} valAP={score['ap']:.4f}")
+
+            if patience >= self.train_config["refine_patience"]:
+                break
+
+        self.gnn_model = best_model
+        self.best_emb = best_emb
+        self.best_val_score = best_score
+
+    def train(self):
+        torch.cuda.empty_cache()
+
+        all_emb = torch.cat(
+            (self.source_graph.ndata["x"], self.best_emb),
+            dim=1,
+        )
+
+        self.train_emb = all_emb[self.train_mask]
+        self.val_emb = all_emb[self.val_mask]
+        self.test_emb = all_emb[self.test_mask]
+
+        self.tree_model.fit(self.train_emb, self.train_y)
+
+        val_prob = self.tree_model.predict_proba(self.val_emb)[:, 1]
+        val_y = self.val_y.cpu().numpy()
+        val_score = eval_metric(
+            val_y,
+            val_prob,
+            prob_convert_pred(val_prob, 0.5),
+        )
+        self.best_pr_thres = val_score["best_pr_thres"]
+        return val_score
+
+    def test(self):
+        test_prob = self.tree_model.predict_proba(self.test_emb)[:, 1]
+        test_y = self.test_y.cpu().numpy()
+        return eval_metric(
+            test_y,
+            test_prob,
+            prob_convert_pred(test_prob, self.best_pr_thres),
+        )
+
+
+# ============================================================
+# 8. MAIN
+# ============================================================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default="elliptic",
+                        choices=["fdcompcn", "ffsd", "elliptic", "dgraphfin"])
+    parser.add_argument("--model", type=str, default="cagr_gfd")
+    parser.add_argument("--trials", type=int, default=10)
+    args = parser.parse_args()
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required.")
+
+    device = torch.device("cuda")
+
+    train_config = {
+        "epochs": 100,
+        "patience": 30,
+        "refine_epochs": 60,
+        "refine_patience": 15,
+        "metric": "ap",
+    }
+
+    # Original DPF-GFD parameters + refinement parameters.
+    param_space = {
+        "num_layers": [1, 2],
+        "hid_feats": [16, 32, 64],
+        "activation": ["ReLU", "LeakyReLU", "Tanh"],
+        "dropout_rate": [0, 0.1, 0.2, 0.3],
+        "learning_rate": 10 ** np.linspace(-3, -1, 1000),
+        "k": range(10, 101),
+        "dist": ["euclidean", "cosine"],
+        "n_estimators": list(range(10, 301)),
+        "eta": 0.5 * 10 ** np.linspace(-1, 0, 100),
+        "reg_lambda": [0, 1, 10],
+        "subsample": [0.5, 0.75, 1.0],
+        "colsample_bytree": [0.5, 0.75, 1.0],
+
+        "refine_quantile": [0.20, 0.30, 0.40],
+        "curv_weight": [0.40, 0.50, 0.60],
+        "sim_weight": [0.20, 0.30, 0.40],
+        "fraud_weight": [0.20, 0.30, 0.40],
+    }
+
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    checkpoint_path = os.path.join(
+        "checkpoints", args.dataset, args.model, stamp
+    )
+    os.makedirs(checkpoint_path, exist_ok=True)
+
+    data = load_data(args.dataset)
+    print(
+        f"data={args.dataset} N={data.num_nodes()} E={data.num_edges()} "
+        f"X={tuple(data.ndata['x'].shape)}"
+    )
+
+    data = dgl.to_bidirected(data, copy_ndata=True)
+    data = dgl.add_self_loop(data).to(device)
+
+    best_val = -float("inf")
+    best_test = None
+    rows = []
+
+    for t in range(args.trials):
+        start = time.time()
+
+        cfg = {k: random.choice(list(v)) for k, v in param_space.items()}
+        print(f"\ntrial {t+1}/{args.trials} k={cfg['k']} h={cfg['hid_feats']} "
+              f"lr={cfg['learning_rate']:.2e}")
+
+        detector = MyDetector(train_config, cfg, data, device)
+
+        detector.pretrain()
+        detector.refine()
+        detector.retrain()
+
+        val_score = detector.train()
+        test_score = None
+
+        if val_score["ap"] > best_val:
+            best_val = val_score["ap"]
+            test_score = detector.test()
+            best_test = test_score
+
+            torch.save(
+                detector.gnn_model.state_dict(),
+                os.path.join(checkpoint_path, "gnn.pt"),
+            )
+            joblib.dump(
+                detector.tree_model,
+                os.path.join(checkpoint_path, "xgb.pkl"),
+            )
+            with open(os.path.join(checkpoint_path, "config.yml"), "w") as f:
+                yaml.dump(cfg, f)
+
+        row = {
+            "trial": t + 1,
+            "val_rec@k": val_score["rec@k"],
+            "val_f1": val_score["f1"],
+            "val_auc": val_score["auc"],
+            "val_ap": val_score["ap"],
+            "time": time.time() - start,
+        }
+
+        if test_score is not None:
+            row.update({
+                "test_rec@k": test_score["rec@k"],
+                "test_f1": test_score["f1"],
+                "test_auc": test_score["auc"],
+                "test_ap": test_score["ap"],
+            })
+
+        rows.append(row)
+
+        print(
+            f"val AP={val_score['ap']:.4f} AUC={val_score['auc']:.4f} "
+            f"F1={val_score['f1']:.4f} R@K={val_score['rec@k']:.4f}"
+        )
+
+        if test_score is not None:
+            print(
+                f"BEST test AP={test_score['ap']:.4f} "
+                f"AUC={test_score['auc']:.4f} "
+                f"F1={test_score['f1']:.4f} "
+                f"R@K={test_score['rec@k']:.4f}"
+            )
+
+        del detector
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    pd.DataFrame(rows).to_excel(
+        os.path.join(checkpoint_path, "all_trials.xlsx"),
+        index=False,
+    )
+
+    print("\nFINAL")
+    print(f"best val AP={best_val:.4f}")
+    if best_test is not None:
+        print(
+            f"test AP={best_test['ap']:.4f} "
+            f"AUC={best_test['auc']:.4f} "
+            f"F1={best_test['f1']:.4f} "
+            f"R@K={best_test['rec@k']:.4f}"
+        )
+    print(checkpoint_path)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import argparse
 import random
 import time
 from typing import Dict, List, Tuple
