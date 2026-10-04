@@ -1,3 +1,2672 @@
+def extract_hodge_descriptors(g, dataset_name, data_path='./data', chunk_size=4000):
+  cache_dir = os.path.join(data_path, 'hodge_cache')
+  os.makedirs(cache_dir, exist_ok=True)
+  cache_path = os.path.join(cache_dir, f'{dataset_name}_hodge_feat.pt')
+  if os.path.exists(cache_path):
+    return torch.load(cache_path, weights_only=True)
+
+  if isinstance(g, dgl.DGLGraph):
+    if len(g.canonical_etypes) > 1:
+      homo_g = dgl.to_homogeneous(g)
+    else:
+      homo_g = g
+  else:
+    homo_g = g
+
+  num_nodes = homo_g.num_nodes()
+  src, dst = homo_g.edges()
+  src_np = src.cpu().numpy()
+  dst_np = dst.cpu().numpy()
+
+  mask = src_np != dst_np
+  src_clean = src_np[mask]
+  dst_clean = dst_np[mask]
+  adj_data = np.ones(len(src_clean), dtype=np.float32)
+  A = sp.csr_matrix((adj_data, (src_clean, dst_clean)), shape=(num_nodes, num_nodes))
+  A = np.maximum(A, A.T)
+  A.setdiag(0)
+  A.eliminate_zeros()
+
+  node_degrees = np.array(A.sum(axis=1)).flatten()
+  deg_safe = np.maximum(node_degrees, 1.0)
+  print('...')
+
+  node_triangles = np.zeros(num_nodes, dtype=np.float32)
+  A_csc = A.tocsc()
+
+  for start_idx in tqdm(range(0, num_nodes, chunk_size)):
+    end_idx = min(start_idx + chunk_size, num_nodes)
+    A_chunk = A[start_idx:end_idx, :]
+    A2_chunk = A_chunk.dot(A_csc)
+    A_tri_chunk = A_chunk.multiply(A2_chunk)
+    node_triangles[start_idx:end_idx] = (np.array(A_tri_chunk.sum(axis=1)).flatten() / 2.0)
+
+  print('...')
+  neighbor_degree_sum = np.array(A.dot(node_degrees)).flatten()
+  curv_deg_part = 4.0 - node_degrees - (neighbor_degree_sum / deg_safe)
+  curv_tri_part = (6.0 * node_triangles) / deg_safe
+  ricci_curvature = curv_deg_part + curv_tri_part
+
+  print('...')
+  if "feature" in homo_g.ndata:
+    feats = homo_g.ndata["feature"]
+    if torch.is_tensor(feats):
+      feats_np = feats.cpu().numpy()
+    else:
+      feats_np = np.asarray(feats)
+
+    D_inv = sp.diags(1.0 / deg_safe)
+    A_norm = D_inv.dot(A)
+    neigh_feat_mean = A_norm.dot(feats_np)
+
+    dispersion = np.linalg.norm(feats_np - neigh_feat_mean, axis=1)
+  else:
+    dispersion = np.abs(node_degrees - (neighbor_degree_sum / deg_safe))
+
+  log_degree = np.log1p(node_degrees)
+  triangle_ratio = node_triangles / deg_safe
+  print('...')
+
+  hodge_matrix = np.stack([ricci_curvature, dispersion, log_degree, triangle_ratio], axis=1).astype(np.float32)
+  hodge_matrix = np.nan_to_num(hodge_matrix, nan = 0.0, posinf = 0.0, neginf = 0.0)
+  mean_val = np.mean(hodge_matrix, axis = 0)
+  std_val = np.std(hodge_matrix, axis = 0) + 1e-6
+  hodge_matrix = (hodge_matrix - mean_val) / std_val
+  hodge_tensor = torch.tensor(hodge_matrix, dtype=torch.float32)
+  torch.save(hodge_tensor, cache_path)
+  return hodge_tensor
+
+
+
+from dgl.data import FraudDataset
+from dgl.data.utils import load_graphs
+import dgl
+import torch
+import warnings
+import pickle as pkl
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+plt.rcParams['axes.unicode_minus'] = False
+import seaborn as sns
+from dgl.nn.pytorch.conv import EdgeWeightNorm
+import dgl.function as fn
+import pickle
+
+if not hasattr(np, 'bool'):
+    np.bool = bool
+warnings.filterwarnings("ignore")
+
+
+class Dataset:
+    def __init__(self, load_epoch, name='amazon', del_ratio=0., homo=True, data_path='', adj_type='sym'):
+        self.name = name
+        graph = None
+        prefix = data_path
+        if name == 'tfinance':
+            graph, label_dict = load_graphs(f'{prefix}/tfinance')
+            graph = graph[0]
+            graph.ndata['label'] = graph.ndata['label'].argmax(1)
+            if del_ratio != 0.:
+                graph = graph.add_self_loop()
+                with open(f'probs_tfinance_BWGNN_{load_epoch}_{homo}.pkl', 'rb') as f:
+                    pred_y = pkl.load(f)
+                    if torch.is_tensor(pred_y):
+                        pred_y = pred_y.detach().cpu()
+                    else:
+                        pred_y = torch.tensor(pred_y).cpu()
+                    graph.ndata['pred_y'] = pred_y
+                graph = random_walk_update(graph, del_ratio, adj_type)
+                graph = dgl.remove_self_loop(graph)
+
+        elif name == 'tsocial':
+            graph, label_dict = load_graphs(f'{prefix}/tsocial')
+            graph = graph[0]
+            if del_ratio != 0.:
+                graph = graph.add_self_loop()
+                with open(f'probs_tsocial_BWGNN_{load_epoch}_{homo}.pkl', 'rb') as f:
+                    pred_y = pkl.load(f)
+                    if torch.is_tensor(pred_y):
+                        pred_y = pred_y.detach().cpu()
+                    else:
+                        pred_y = torch.tensor(pred_y).cpu()
+                    graph.ndata['pred_y'] = pred_y
+                graph = random_walk_update(graph, del_ratio, adj_type)
+                graph = dgl.remove_self_loop(graph)
+
+        elif name == 'yelp':
+            dataset = FraudDataset(name, train_size=0.01, val_size=0.33)
+            graph = dataset[0]
+            if homo:
+                graph = dgl.to_homogeneous(dataset[0],
+                                           ndata=['feature', 'label', 'train_mask', 'val_mask', 'test_mask'])
+                graph = dgl.add_self_loop(graph)
+                if del_ratio != 0.:
+                    with open(f'probs_yelp_BWGNN_{load_epoch}_{homo}.pkl', 'rb') as f:
+                        pred_y = pkl.load(f)
+                        if torch.is_tensor(pred_y):
+                            pred_y = pred_y.detach().cpu()
+                        else:
+                            pred_y = torch.tensor(pred_y).cpu()
+                        graph.ndata['pred_y'] = pred_y
+                    graph = random_walk_update(graph, del_ratio, adj_type)
+                    graph = dgl.add_self_loop(dgl.remove_self_loop(graph))
+            else:
+                if del_ratio != 0.:
+                    with open(f'probs_yelp_BWGNN_{load_epoch}_{homo}.pkl', 'rb') as f:
+                        pred_y = pkl.load(f)
+                        if torch.is_tensor(pred_y):
+                            pred_y = pred_y.detach().cpu()
+                        else:
+                            pred_y = torch.tensor(pred_y).cpu()
+                    data_dict = {}
+                    flag = 1
+                    for relation in graph.canonical_etypes:
+                        graph_r = dgl.to_homogeneous(graph[relation],
+                                                     ndata=['feature', 'label', 'train_mask', 'val_mask', 'test_mask'])
+                        graph_r = dgl.add_self_loop(graph_r)
+                        graph_r.ndata['pred_y'] = pred_y
+                        graph_r = random_walk_update(graph_r, del_ratio, adj_type)
+                        graph_r = dgl.remove_self_loop(graph_r)
+                        data_dict[('review', str(flag), 'review')] = graph_r.edges()
+                        flag += 1
+                    graph_new = dgl.heterograph(data_dict)
+                    graph_new.ndata['label'] = graph.ndata['label']
+                    graph_new.ndata['feature'] = graph.ndata['feature']
+                    graph_new.ndata['train_mask'] = graph.ndata['train_mask']
+                    graph_new.ndata['val_mask'] = graph.ndata['val_mask']
+                    graph_new.ndata['test_mask'] = graph.ndata['test_mask']
+                    graph = graph_new
+
+        elif name == 'amazon':
+            print("Dataset")
+            dataset = FraudDataset(name, train_size=0.01, val_size=0.33)
+            graph = dataset[0]
+            print(homo)
+            if homo:
+                graph = dgl.to_homogeneous(dataset[0],
+                                           ndata=['feature', 'label', 'train_mask', 'val_mask', 'test_mask'])
+                graph = dgl.add_self_loop(graph)
+                if del_ratio != 0.:
+                    with open(f'probs_amazon_BWGNN_{load_epoch}_{homo}.pkl', 'rb') as f:
+                        pred_y = pkl.load(f)
+                        if torch.is_tensor(pred_y):
+                            pred_y = pred_y.detach().cpu()
+                        else:
+                            pred_y = torch.tensor(pred_y).cpu()
+                        graph.ndata['pred_y'] = pred_y
+                    graph = random_walk_update(graph, del_ratio, adj_type)
+                    graph = dgl.add_self_loop(dgl.remove_self_loop(graph))
+            else:
+                print(del_ratio)
+                if del_ratio != 0.:
+                    with open(f'probs_amazon_BWGNN_{load_epoch}_{homo}.pkl', 'rb') as f:
+                        pred_y = pkl.load(f)
+                        if torch.is_tensor(pred_y):
+                            pred_y = pred_y.detach().cpu()
+                        else:
+                            pred_y = torch.tensor(pred_y).cpu()
+                    data_dict = {}
+                    flag = 1
+                    for relation in graph.canonical_etypes:
+                        graph[relation].ndata['pred_y'] = pred_y
+                        graph_r = dgl.add_self_loop(graph[relation])
+                        graph_r = random_walk_update(graph_r, del_ratio, adj_type)
+                        graph_r = dgl.remove_self_loop(graph_r)
+                        data_dict[('review', str(flag), 'review')] = graph_r.edges()
+                        flag += 1
+                    graph_new = dgl.heterograph(data_dict)
+                    graph_new.ndata['label'] = graph.ndata['label']
+                    graph_new.ndata['feature'] = graph.ndata['feature']
+                    graph_new.ndata['train_mask'] = graph.ndata['train_mask']
+                    graph_new.ndata['val_mask'] = graph.ndata['val_mask']
+                    graph_new.ndata['test_mask'] = graph.ndata['test_mask']
+                    graph = graph_new
+        elif name == 'tolokers':
+          print('...')
+          if os.path.exists(f'{prefix}/tolokers'):
+            raw_graph, _ = load_graphs(f'{prefix}/tolokers')
+            raw_graph = raw_graph[0]
+            node_feats = raw_graph.ndata['feat'] if 'feat' in raw_graph.ndata else raw_graph.ndata['feature']
+            labels = raw_graph.ndata['label']
+            edges_u, edges_v = raw_graph.edges()
+            graph = dgl.graph((edges_u, edges_v), num_nodes=raw_graph.num_nodes())
+          elif os.path.exists(f'{prefix}/tolokers') or os.path.exists('tolokers.npz'):
+            npz_file = f'{prefix}/tolokers' if os.path.exists(f'{prefix}/tolokers') else 'tolokers.npz'
+            data = np.load(npz_file)
+            node_feats = torch.tensor(data['node_features']).float()
+            npz_label_key = 'node_labels' if 'node_labels' in data else 'label'
+            labels = torch.tensor(data[npz_label_key]).long()
+            edges = torch.tensor(data['edges']).long()
+            graph = dgl.graph((edges[:, 0], edges[:, 1]), num_nodes=node_feats.shape[0])
+          else:
+            from dgl.data import TolokersDataset
+            dataset = TolokersDataset(raw_dir=prefix if prefix != '' else './data')
+            raw_graph = dataset[0]
+            node_feats = raw_graph.ndata['feat']
+            labels = raw_graph.ndata['label']
+            edges_u, edges_v = raw_graph.edges()
+            graph = dgl.graph((edges_u, edges_v), num_nodes=raw_graph.num_nodes())
+
+          graph = dgl.to_bidirected(graph)
+          graph = dgl.remove_self_loop(graph)
+
+          temp_labels = labels.long()
+          if len(temp_labels.shape) == 1:
+              labels_2d = temp_labels.unsqueeze(-1)
+          else:
+              labels_2d = temp_labels
+
+          labels_id = labels_2d.squeeze(-1)
+          num_nodes = graph.num_nodes()
+
+          train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+          val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+          test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+
+          rng = torch.Generator().manual_seed(717)
+          for c in [0, 1]:
+            c_idx = (labels_id == c).nonzero(as_tuple=True)[0]
+            c_num = len(c_idx)
+              
+            perm = torch.randperm(c_num, generator=rng)
+            n_train = max(1, int(c_num * 0.01))
+            n_val = int(c_num * 0.33)
+              
+            train_mask[c_idx[perm[:n_train]]] = True
+            val_mask[c_idx[perm[n_train : n_train + n_val]]] = True
+            test_mask[c_idx[perm[n_train + n_val :]]] = True
+
+          graph.ndata['feature'] = node_feats
+          graph.ndata['label'] = labels_2d
+          graph.ndata['train_mask'] = train_mask
+          graph.ndata['val_mask'] = val_mask
+          graph.ndata['test_mask'] = test_mask
+
+          if del_ratio != 0.0:
+            graph = dgl.add_self_loop(graph)
+            pkl_path = f'{prefix}/tolokers'
+            if os.path.exists(pkl_path):
+              with open(pkl_path, 'rb') as f:
+                pred_y = pkl.load(f)
+                pred_y = [pred_y.detach().cpu() if torch.is_tensor(pred_y) else torch.tensor(pred_y).cpu()]
+                graph.ndata['pred_y'] = pred_y
+                        
+                graph = random_walk_update(graph, del_ratio, adj_type)
+                graph = dgl.add_self_loop(dgl.remove_self_loop(graph))
+            else:
+              print('...')
+              graph = dgl.add_self_loop(graph)
+          else:
+            graph = dgl.add_self_loop(graph)
+        else:
+            print('no such dataset')
+            exit(1)
+
+        graph.ndata['label'] = graph.ndata['label'].long().squeeze(-1)
+        graph.ndata['feature'] = graph.ndata['feature'].float()
+        print(graph)
+
+        self.graph = graph
+
+
+def random_walk_update(graph, delete_ratio, adj_type):
+    edge_weight = torch.ones(graph.num_edges())
+    if adj_type == 'sym':
+        norm = EdgeWeightNorm(norm='both')
+    else:
+        norm = EdgeWeightNorm(norm='left')
+    graph.edata['w'] = norm(graph, edge_weight)
+    aggregate_fn = fn.u_mul_e('h', 'w', 'm')
+    reduce_fn = fn.sum(msg='m', out='ay')
+
+    graph.ndata['h'] = graph.ndata['pred_y']
+    graph.update_all(aggregate_fn, reduce_fn)
+    graph.ndata['ly'] = graph.ndata['pred_y'] - graph.ndata['ay']
+    graph.apply_edges(inner_product_black)
+    black = graph.edata['inner_black']
+    threshold = int(delete_ratio * graph.num_edges())
+    edge_to_move = set(black.sort()[1][:threshold].tolist())
+    edge_to_protect = set()
+    graph_new = dgl.remove_edges(graph, list(edge_to_move.difference(edge_to_protect)))
+    return graph_new
+
+
+def inner_product_black(edges):
+    return {'inner_black': (edges.src['ly'] * edges.dst['ly']).sum(axis=1)}
+
+
+def inner_product_white(edges):
+    return {'inner_white': (edges.src['ay'] * edges.dst['ay']).sum(axis=1)}
+
+
+def find_inter(edges):
+    return edges.src['label'] != edges.dst['label']
+
+
+def cal_hetero(edges):
+    return {'same': edges.src['label'] != edges.dst['label']}
+
+
+def cal_hetero_normal(edges):
+    return {'same_normal': (edges.src['label'] != edges.dst['label']) & (edges.src['label'] == 0)}
+
+
+def cal_normal(edges):
+    return {'normal': edges.src['label'] == 0}
+
+
+def cal_hetero_anomal(edges):
+    return {'same_anomal': (edges.src['label'] != edges.dst['label']) & (edges.src['label'] == 1)}
+
+
+def cal_anomal(edges):
+    return {'anomal': edges.src['label'] == 1}
+
+
+
+
+
+class ADCGNN_amazon(nn.Module):
+    def __init__(
+        self,
+        in_feats,
+        h_feats,
+        num_classes,
+        graph,
+        d=2,
+        batch=False,
+        dropout=0.2,
+        hodge_dim=0,
+        use_sod=True,
+        use_ego=True,
+        use_norm=True
+    ):
+        super(ADCGNN_amazon, self).__init__()
+
+        # =========================================================
+        # Basic settings
+        # =========================================================
+        self.g = graph
+        self.d = d
+
+        self.hodge_dim = hodge_dim
+        self.use_sod = use_sod
+        self.use_ego = use_ego
+        self.use_norm = use_norm
+
+        # =========================================================
+        # ADCGNN polynomial branches
+        # =========================================================
+        self.thetas = calculate_theta2(d=d)
+        self.num_branches = len(self.thetas)
+
+        self.conv = nn.ModuleList()
+
+        for theta in self.thetas:
+            if not batch:
+                self.conv.append(
+                    PolyConv(h_feats, h_feats, theta, lin=False)
+                )
+            else:
+                self.conv.append(
+                    PolyConvBatch(h_feats, h_feats, theta, lin=False)
+                )
+
+        # =========================================================
+        # Original ADCGNN feature transformation
+        # =========================================================
+        self.linear = nn.Linear(in_feats, h_feats)
+        self.linear2 = nn.Linear(h_feats, h_feats)
+
+        self.act = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+        # =========================================================
+        # Original ADCGNN branch attention
+        # =========================================================
+        self.attention_fc = nn.Linear(h_feats, 1)
+
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(2 * h_feats, h_feats),
+            nn.ReLU(),
+            nn.Linear(h_feats, 1),
+            nn.Sigmoid()
+        )
+
+        # =========================================================
+        # Original ADCGNN output layers
+        # =========================================================
+        self.linear3 = nn.Linear(h_feats, h_feats)
+        self.linear4 = nn.Linear(h_feats, num_classes)
+
+        self.residual_fc = nn.Linear(h_feats, h_feats)
+
+        # =========================================================
+        # HODGE FEATURE
+        # =========================================================
+        if self.hodge_dim > 0:
+            self.hodge_proj = nn.Sequential(
+                nn.Linear(self.hodge_dim, h_feats, bias=False),
+                nn.LayerNorm(h_feats)
+            )
+        else:
+            self.hodge_proj = None
+
+        # =========================================================
+        # SOD BRANCH
+        #
+        # s_i = x_i - projection(x_i onto neighbor mean)
+        # =========================================================
+        if self.use_sod:
+            self.ortho_fc = nn.Linear(in_feats, h_feats)
+
+            # Hodge-aware gate for SOD
+            gate_in_dim = in_feats + self.hodge_dim
+
+            self.ortho_gate = nn.Sequential(
+                nn.Linear(gate_in_dim, h_feats),
+                nn.LeakyReLU(0.2),
+                nn.Linear(h_feats, 1),
+                nn.Sigmoid()
+            )
+
+            self.norm_s = (
+                nn.LayerNorm(h_feats)
+                if self.use_norm
+                else nn.Identity()
+            )
+
+            # Learnable contribution of SOD
+            self.sod_scale = nn.Parameter(torch.tensor(0.3))
+
+        # =========================================================
+        # EGO BRANCH
+        #
+        # Keeps node-specific information
+        # =========================================================
+        if self.use_ego:
+            self.ego_fc = nn.Linear(in_feats, h_feats)
+
+            self.ego_gate = nn.Sequential(
+                nn.Linear(in_feats, max(h_feats // 2, 1)),
+                nn.LeakyReLU(0.2),
+                nn.Linear(max(h_feats // 2, 1), 1),
+                nn.Sigmoid()
+            )
+
+            self.norm_ego = (
+                nn.LayerNorm(h_feats)
+                if self.use_norm
+                else nn.Identity()
+            )
+
+    # =============================================================
+    # FORWARD
+    # =============================================================
+    def forward(self, in_feat, hodge_feat=None):
+        device = in_feat.device
+
+        # =========================================================
+        # 1. SOD BRANCH
+        # =========================================================
+        if self.use_sod:
+            with self.g.local_scope():
+                self.g.ndata['f_tmp'] = in_feat
+                self.g.update_all(
+                    fn.copy_u('f_tmp', 'm'),
+                    fn.mean('m', 'neigh_m')
+                )
+                h_nbr = self.g.ndata['neigh_m']
+
+            # -----------------------------------------------------
+            # Projection of node feature onto neighborhood direction
+            # -----------------------------------------------------
+            dot_prod = torch.sum(in_feat * h_nbr, dim=-1, keepdim=True)
+            norm_sq = torch.sum(h_nbr * h_nbr, dim=-1, keepdim=True) + 1e-8
+
+            proj = (dot_prod / norm_sq) * h_nbr
+
+            # -----------------------------------------------------
+            # Orthogonal / deviation component
+            # -----------------------------------------------------
+            s_i = in_feat - proj
+
+            # -----------------------------------------------------
+            # SOD embedding
+            # -----------------------------------------------------
+            s_emb = self.norm_s(self.ortho_fc(s_i))
+
+            # -----------------------------------------------------
+            # Hodge-aware SOD gate
+            # -----------------------------------------------------
+            if self.hodge_dim > 0:
+                if hodge_feat is not None:
+                    gate_input = torch.cat([s_i, hodge_feat.to(device)], dim=-1)
+                else:
+                    pad = torch.zeros(s_i.size(0), self.hodge_dim, device=device)
+                    gate_input = torch.cat([s_i, pad], dim=-1)
+            else:
+                gate_input = s_i
+
+            cam_gate = self.ortho_gate(gate_input)
+
+            # -----------------------------------------------------
+            # Final SOD contribution
+            # -----------------------------------------------------
+            s_term = self.sod_scale * cam_gate * s_emb
+        else:
+            s_term = torch.zeros(
+                in_feat.size(0),
+                self.linear.out_features,
+                device=device,
+                dtype=in_feat.dtype
+            )
+
+        # =========================================================
+        # 2. ORIGINAL ADCGNN MAIN BRANCH
+        # =========================================================
+        h_pre = self.linear(in_feat)
+
+        # ---------------------------------------------------------
+        # Optional Hodge injection
+        # ---------------------------------------------------------
+        if self.hodge_proj is not None and hodge_feat is not None:
+            h_pre = h_pre + 0.3 * self.hodge_proj(hodge_feat.to(device))
+
+        # ---------------------------------------------------------
+        # Original ADCGNN transformation
+        # ---------------------------------------------------------
+        h_pre = self.act(h_pre)
+        h_pre = self.linear2(h_pre)
+        h_pre = self.act(h_pre)
+        h_pre = self.dropout(h_pre)
+
+        # =========================================================
+        # 3. ORIGINAL ADCGNN RESIDUAL
+        # =========================================================
+        res = self.residual_fc(h_pre)
+
+        # =========================================================
+        # 4. ORIGINAL ADCGNN POLYNOMIAL BRANCHES
+        # =========================================================
+        branch_outputs = []
+
+        for conv in self.conv:
+            h0 = conv(self.g, h_pre)
+            h0 = h0.to(device)
+            branch_outputs.append(h0)
+
+        h_stack = torch.stack(branch_outputs, dim=1)
+
+        # Shape: [N, num_branches, h_feats]
+        N, B, F_dim = h_stack.shape
+
+        # =========================================================
+        # 5. ORIGINAL ADCGNN ATTENTION FUSION
+        # =========================================================
+        h_flat = h_stack.view(-1, F_dim)
+        attn_scores = self.attention_fc(h_flat)
+        attn_scores = attn_scores.view(N, B)
+
+        attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)
+        attn_fused = torch.sum(h_stack * attn_weights, dim=1)
+
+        # =========================================================
+        # 6. ORIGINAL ADCGNN MEAN FUSION
+        # =========================================================
+        mean_fused = torch.mean(h_stack, dim=1)
+
+        # =========================================================
+        # 7. ORIGINAL ADCGNN FUSION MLP
+        # =========================================================
+        fusion_input = torch.cat([attn_fused, mean_fused], dim=-1)
+        fusion_weight = self.fusion_mlp(fusion_input)
+
+        # Keep original ADCGNN formulation
+        fused = (
+            0.1 * fusion_weight * attn_fused
+            + (1.0 - fusion_weight) * mean_fused
+        )
+
+        # Original residual connection
+        fused = fused + 0.8 * res
+
+        # =========================================================
+        # 8. EGO BRANCH
+        # =========================================================
+        if self.use_ego:
+            ego_emb = self.ego_fc(in_feat)
+            ego_emb = self.norm_ego(ego_emb)
+            ego_gate = self.ego_gate(in_feat)
+            ego_term = ego_gate * ego_emb
+        else:
+            ego_term = torch.zeros_like(fused)
+
+        # =========================================================
+        # 9. COMBINE ADCGNN + SOD + EGO
+        #
+        # IMPORTANT:
+        # We keep the original ADCGNN fused representation.
+        # We DO NOT replace it with h_pre.
+        # =========================================================
+        fused = fused + s_term + ego_term
+
+        # =========================================================
+        # 10. ORIGINAL ADCGNN OUTPUT HEAD
+        # =========================================================
+        fused = self.linear3(fused)
+        fused = self.act(fused)
+        fused = self.dropout(fused)
+
+        logits = self.linear4(fused)
+
+        return logits
+
+
+
+
+
+
+
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import dgl
+import dgl.function as fn
+import sympy
+import scipy
+import numpy as np
+
+from torch.nn import init
+
+
+# ============================================================
+# 1. ORIGINAL ADCGNN POLYNOMIAL CONVOLUTION
+# ============================================================
+
+class PolyConv(nn.Module):
+    def __init__(
+        self,
+        in_feats,
+        out_feats,
+        theta,
+        activation=F.leaky_relu,
+        lin=False,
+        bias=False
+    ):
+        super(PolyConv, self).__init__()
+
+        self._theta = theta
+        self._k = len(self._theta)
+        self._in_feats = in_feats
+        self._out_feats = out_feats
+        self.activation = activation
+
+        self.linear = nn.Linear(
+            in_feats,
+            out_feats,
+            bias=bias
+        )
+
+        self.lin = lin
+
+    def reset_parameters(self):
+        if self.linear.weight is not None:
+            init.xavier_uniform_(self.linear.weight)
+
+        if self.linear.bias is not None:
+            init.zeros_(self.linear.bias)
+
+    def forward(self, graph, feat):
+
+        def unnLaplacian(feat, D_invsqrt, graph):
+
+            graph.ndata["poly_h"] = feat * D_invsqrt
+
+            graph.update_all(
+                fn.copy_u("poly_h", "m"),
+                fn.sum("m", "poly_h")
+            )
+
+            return (
+                feat
+                - graph.ndata.pop("poly_h") * D_invsqrt
+            )
+
+        with graph.local_scope():
+
+            D_invsqrt = torch.pow(
+                graph.in_degrees()
+                .float()
+                .clamp(min=1),
+                -0.5
+            ).unsqueeze(-1).to(feat.device)
+
+            h = self._theta[0] * feat
+
+            for k in range(1, self._k):
+
+                feat = unnLaplacian(
+                    feat,
+                    D_invsqrt,
+                    graph
+                )
+
+                h += self._theta[k] * feat
+
+        if self.lin:
+            h = self.linear(h)
+            h = self.activation(h)
+
+        return h
+
+
+# ============================================================
+# 2. ORIGINAL THETA CALCULATION
+# ============================================================
+
+def calculate_theta2(d):
+
+    thetas = []
+
+    x = sympy.symbols("x")
+
+    for i in range(d + 1):
+
+        f = sympy.poly(
+            (x / 2) ** i
+            * (1 - x / 2) ** (d - i)
+            / scipy.special.beta(i + 1, d + 1 - i)
+        )
+
+        coeff = f.all_coeffs()
+
+        inv_coeff = []
+
+        for j in range(d + 1):
+            inv_coeff.append(
+                float(coeff[d - j])
+            )
+
+        thetas.append(inv_coeff)
+
+    return thetas
+
+
+# ============================================================
+# 3. SOD
+#    Structural Orthogonal Deviation
+# ============================================================
+
+class SODModule(nn.Module):
+
+    def __init__(
+        self,
+        h_feats,
+        hodge_dim=4,
+        dropout=0.2
+    ):
+        super(SODModule, self).__init__()
+
+        self.ortho_fc = nn.Linear(
+            h_feats,
+            h_feats
+        )
+
+        self.norm_s = nn.LayerNorm(
+            h_feats
+        )
+
+        # Hodge is used to condition the SOD gate.
+        self.ortho_gate = nn.Sequential(
+            nn.Linear(
+                h_feats + hodge_dim,
+                h_feats
+            ),
+            nn.ReLU(),
+
+            nn.Linear(
+                h_feats,
+                1
+            ),
+
+            nn.Sigmoid()
+        )
+
+        self.sod_scale = nn.Parameter(
+            torch.tensor(0.3)
+        )
+
+        self.dropout = nn.Dropout(
+            dropout
+        )
+
+    def forward(
+        self,
+        g,
+        in_feat,
+        hodge_feat
+    ):
+
+        # ----------------------------------------------------
+        # Neighborhood mean
+        # ----------------------------------------------------
+
+        with g.local_scope():
+
+            g.ndata["sod_feat"] = in_feat
+
+            g.update_all(
+                fn.copy_u(
+                    "sod_feat",
+                    "m"
+                ),
+                fn.mean(
+                    "m",
+                    "sod_neigh"
+                )
+            )
+
+            h_nbr = g.ndata["sod_neigh"]
+
+        # ----------------------------------------------------
+        # Projection of node representation onto neighborhood
+        # direction
+        # ----------------------------------------------------
+
+        dot_prod = torch.sum(
+            in_feat * h_nbr,
+            dim=-1,
+            keepdim=True
+        )
+
+        norm_sq = torch.sum(
+            h_nbr * h_nbr,
+            dim=-1,
+            keepdim=True
+        ) + 1e-8
+
+        proj = (
+            dot_prod / norm_sq
+        ) * h_nbr
+
+        # ----------------------------------------------------
+        # Orthogonal deviation
+        # ----------------------------------------------------
+
+        s_i = in_feat - proj
+
+        s_emb = self.ortho_fc(
+            s_i
+        )
+
+        s_emb = self.norm_s(
+            s_emb
+        )
+
+        s_emb = F.relu(
+            s_emb
+        )
+
+        s_emb = self.dropout(
+            s_emb
+        )
+
+        # ----------------------------------------------------
+        # Hodge-conditioned gate
+        # ----------------------------------------------------
+
+        gate_input = torch.cat(
+            [
+                s_i,
+                hodge_feat
+            ],
+            dim=-1
+        )
+
+        cam_gate = self.ortho_gate(
+            gate_input
+        )
+
+        # ----------------------------------------------------
+        # SOD residual
+        # ----------------------------------------------------
+
+        s_term = (
+            self.sod_scale
+            * cam_gate
+            * s_emb
+        )
+
+        return s_term
+
+
+# ============================================================
+# 4. EGO BRANCH
+# ============================================================
+
+class EgoModule(nn.Module):
+
+    def __init__(
+        self,
+        h_feats
+    ):
+        super(EgoModule, self).__init__()
+
+        self.ego_fc = nn.Linear(
+            h_feats,
+            h_feats
+        )
+
+        self.norm_ego = nn.LayerNorm(
+            h_feats
+        )
+
+        self.ego_gate = nn.Sequential(
+            nn.Linear(
+                h_feats,
+                h_feats
+            ),
+            nn.ReLU(),
+
+            nn.Linear(
+                h_feats,
+                1
+            ),
+
+            nn.Sigmoid()
+        )
+
+    def forward(
+        self,
+        in_feat
+    ):
+
+        ego_emb = self.ego_fc(
+            in_feat
+        )
+
+        ego_emb = self.norm_ego(
+            ego_emb
+        )
+
+        ego_emb = F.relu(
+            ego_emb
+        )
+
+        ego_gate = self.ego_gate(
+            in_feat
+        )
+
+        ego_term = (
+            ego_gate
+            * ego_emb
+        )
+
+        return ego_term
+
+
+# ============================================================
+# 5. TOPOLOGICAL DIFFUSION
+#
+# NOTE:
+# Đây là module Topological Diffusion bổ sung.
+# Nó không sử dụng Hodge trực tiếp.
+# ============================================================
+
+class TopologicalDiffusion(nn.Module):
+
+    def __init__(
+        self,
+        h_feats,
+        dropout=0.2
+    ):
+        super(TopologicalDiffusion, self).__init__()
+
+        # Node representation
+        self.node_encoder = nn.Sequential(
+
+            nn.Linear(
+                h_feats,
+                h_feats
+            ),
+
+            nn.LayerNorm(
+                h_feats
+            ),
+
+            nn.ReLU()
+        )
+
+        # Topological representation
+        self.topo_encoder = nn.Sequential(
+
+            nn.Linear(
+                h_feats,
+                h_feats
+            ),
+
+            nn.LayerNorm(
+                h_feats
+            ),
+
+            nn.ReLU()
+        )
+
+        # Gate
+        self.topo_gate = nn.Sequential(
+
+            nn.Linear(
+                2 * h_feats,
+                h_feats
+            ),
+
+            nn.ReLU(),
+
+            nn.Linear(
+                h_feats,
+                1
+            ),
+
+            nn.Sigmoid()
+        )
+
+        # Output projection
+        self.out_proj = nn.Sequential(
+
+            nn.Linear(
+                h_feats,
+                h_feats
+            ),
+
+            nn.ReLU(),
+
+            nn.Dropout(
+                dropout
+            )
+        )
+
+        self.scale = nn.Parameter(
+            torch.tensor(0.3)
+        )
+
+    def forward(
+        self,
+        g,
+        h_pre
+    ):
+
+        node_repr = self.node_encoder(
+            h_pre
+        )
+
+        topo_input = self.topo_encoder(
+            h_pre
+        )
+
+        # ----------------------------------------------------
+        # Topological neighborhood diffusion
+        # ----------------------------------------------------
+
+        with g.local_scope():
+
+            g.ndata["topo_h"] = topo_input
+
+            g.update_all(
+                fn.copy_u(
+                    "topo_h",
+                    "m"
+                ),
+                fn.mean(
+                    "m",
+                    "topo_nbr"
+                )
+            )
+
+            topo_nbr = g.ndata[
+                "topo_nbr"
+            ]
+
+        # ----------------------------------------------------
+        # Gate
+        # ----------------------------------------------------
+
+        gate_input = torch.cat(
+            [
+                node_repr,
+                topo_nbr
+            ],
+            dim=-1
+        )
+
+        gate = self.topo_gate(
+            gate_input
+        )
+
+        topo_diffused = (
+            gate
+            * topo_nbr
+        )
+
+        topo_diffused = self.out_proj(
+            topo_diffused
+        )
+
+        return (
+            self.scale
+            * topo_diffused
+        )
+
+
+# ============================================================
+# 6. FULL ADCGNN
+# ============================================================
+
+class ADCGNN_amazon(nn.Module):
+
+    def __init__(
+        self,
+        in_feats,
+        h_feats,
+        num_classes,
+        graph,
+        d=2,
+        batch=False,
+        dropout=0.2,
+        hodge_dim=4
+    ):
+
+        super(ADCGNN_amazon, self).__init__()
+
+        self.g = graph
+
+        self.d = d
+
+        self.hodge_dim = hodge_dim
+
+        # ====================================================
+        # ORIGINAL ADCGNN GRAPH DIFFUSION
+        # ====================================================
+
+        self.thetas = calculate_theta2(
+            d=d
+        )
+
+        self.num_branches = len(
+            self.thetas
+        )
+
+        self.conv = nn.ModuleList()
+
+        for theta in self.thetas:
+
+            # Full model uses the original
+            # non-batch PolyConv.
+            self.conv.append(
+                PolyConv(
+                    h_feats,
+                    h_feats,
+                    theta,
+                    lin=False
+                )
+            )
+
+        # ====================================================
+        # BASE ENCODER
+        # ====================================================
+
+        self.linear = nn.Linear(
+            in_feats,
+            h_feats
+        )
+
+        self.linear2 = nn.Linear(
+            h_feats,
+            h_feats
+        )
+
+        self.act = nn.ReLU()
+
+        self.dropout = nn.Dropout(
+            dropout
+        )
+
+        # ====================================================
+        # HODGE
+        # ====================================================
+
+        self.hodge_proj = nn.Sequential(
+
+            nn.Linear(
+                hodge_dim,
+                h_feats
+            ),
+
+            nn.ReLU(),
+
+            nn.Linear(
+                h_feats,
+                h_feats
+            )
+        )
+
+        # ====================================================
+        # ORIGINAL ADCGNN ATTENTION
+        # ====================================================
+
+        self.attention_fc = nn.Linear(
+            h_feats,
+            1
+        )
+
+        self.fusion_mlp = nn.Sequential(
+
+            nn.Linear(
+                2 * h_feats,
+                h_feats
+            ),
+
+            nn.ReLU(),
+
+            nn.Linear(
+                h_feats,
+                1
+            ),
+
+            nn.Sigmoid()
+        )
+
+        # ====================================================
+        # ORIGINAL ADCGNN RESIDUAL
+        # ====================================================
+
+        self.residual_fc = nn.Linear(
+            h_feats,
+            h_feats
+        )
+
+        # ====================================================
+        # SOD
+        # ====================================================
+
+        self.sod = SODModule(
+            h_feats=h_feats,
+            hodge_dim=hodge_dim,
+            dropout=dropout
+        )
+
+        # ====================================================
+        # EGO
+        # ====================================================
+
+        self.ego = EgoModule(
+            h_feats=h_feats
+        )
+
+        # ====================================================
+        # TOPOLOGICAL DIFFUSION
+        # ====================================================
+
+        self.topo_diffusion = TopologicalDiffusion(
+            h_feats=h_feats,
+            dropout=dropout
+        )
+
+        # ====================================================
+        # CLASSIFIER
+        # ====================================================
+
+        self.linear3 = nn.Linear(
+            h_feats,
+            h_feats
+        )
+
+        self.linear4 = nn.Linear(
+            h_feats,
+            num_classes
+        )
+
+    # ========================================================
+    # FORWARD
+    # ========================================================
+
+    def forward(
+        self,
+        in_feat,
+        hodge_feat
+    ):
+
+        device = in_feat.device
+
+        # ====================================================
+        # STEP 1 — BASE REPRESENTATION
+        # ====================================================
+
+        h_pre = self.linear(
+            in_feat
+        )
+
+        # ----------------------------------------------------
+        # Hodge injection
+        # ----------------------------------------------------
+
+        hodge_emb = self.hodge_proj(
+            hodge_feat
+        )
+
+        h_pre = (
+            h_pre
+            + 0.3 * hodge_emb
+        )
+
+        h_pre = self.act(
+            h_pre
+        )
+
+        h_pre = self.linear2(
+            h_pre
+        )
+
+        h_pre = self.act(
+            h_pre
+        )
+
+        h_pre = self.dropout(
+            h_pre
+        )
+
+        # ====================================================
+        # STEP 2 — ORIGINAL ADCGNN RESIDUAL
+        # ====================================================
+
+        res = self.residual_fc(
+            h_pre
+        )
+
+        # ====================================================
+        # STEP 3 — ORIGINAL ADCGNN GRAPH DIFFUSION
+        # ====================================================
+
+        branch_outputs = []
+
+        for conv in self.conv:
+
+            h0 = conv(
+                self.g,
+                h_pre
+            )
+
+            h0 = h0.to(device)
+
+            branch_outputs.append(
+                h0
+            )
+
+        # ----------------------------------------------------
+        # [N, num_branches, hidden]
+        # ----------------------------------------------------
+
+        h_stack = torch.stack(
+            branch_outputs,
+            dim=1
+        )
+
+        N, B, F_dim = h_stack.shape
+
+        # ====================================================
+        # ATTENTION FUSION
+        # ====================================================
+
+        h_flat = h_stack.view(
+            -1,
+            F_dim
+        )
+
+        attn_scores = self.attention_fc(
+            h_flat
+        )
+
+        attn_scores = attn_scores.view(
+            N,
+            B
+        )
+
+        attn_weights = F.softmax(
+            attn_scores,
+            dim=1
+        )
+
+        attn_weights = attn_weights.unsqueeze(
+            -1
+        )
+
+        attn_fused = torch.sum(
+            h_stack
+            * attn_weights,
+            dim=1
+        )
+
+        # ====================================================
+        # MEAN FUSION
+        # ====================================================
+
+        mean_fused = torch.mean(
+            h_stack,
+            dim=1
+        )
+
+        # ====================================================
+        # ORIGINAL ADCGNN FUSION
+        # ====================================================
+
+        fusion_input = torch.cat(
+            [
+                attn_fused,
+                mean_fused
+            ],
+            dim=-1
+        )
+
+        fusion_weight = self.fusion_mlp(
+            fusion_input
+        )
+
+        graph_fused = (
+            0.1
+            * fusion_weight
+            * attn_fused
+            + (1 - fusion_weight)
+            * mean_fused
+        )
+
+        # ====================================================
+        # ORIGINAL ADCGNN RESIDUAL
+        #
+        # Giữ nguyên 0.8 như backbone gốc.
+        # ====================================================
+
+        graph_fused = (
+            graph_fused
+            + 0.8 * res
+        )
+
+        # ====================================================
+        # STEP 4 — SOD
+        # ====================================================
+
+        s_term = self.sod(
+            self.g,
+            h_pre,
+            hodge_feat
+        )
+
+        # ====================================================
+        # STEP 5 — EGO
+        # ====================================================
+
+        ego_term = self.ego(
+            h_pre
+        )
+
+        # ====================================================
+        # STEP 6 — TOPOLOGICAL DIFFUSION
+        # ====================================================
+
+        topo_term = self.topo_diffusion(
+            self.g,
+            h_pre
+        )
+
+        # ====================================================
+        # STEP 7 — FULL FUSION
+        #
+        # Original ADCGNN backbone
+        # + SOD
+        # + Ego
+        # + Topological Diffusion
+        # ====================================================
+
+        fused = (
+            graph_fused
+            + s_term
+            + ego_term
+            + topo_term
+        )
+
+        # ====================================================
+        # STEP 8 — CLASSIFIER
+        # ====================================================
+
+        fused = self.linear3(
+            fused
+        )
+
+        fused = self.act(
+            fused
+        )
+
+        fused = self.dropout(
+            fused
+        )
+
+        logits = self.linear4(
+            fused
+        )
+
+        return logits
+
+
+# ============================================================
+# ALIASES
+#
+# Hiện tại dùng cùng Full architecture cho các dataset.
+# Nếu sau này bạn có architecture riêng của từng dataset,
+# có thể thay từng class riêng.
+# ============================================================
+
+class ADCGNN_yelp(ADCGNN_amazon):
+    pass
+
+
+class ADCGNN_tfinance(ADCGNN_amazon):
+    pass
+
+
+class ADCGNN_CM(ADCGNN_amazon):
+    pass
+
+
+
+
+
+import torch
+import torch.nn.functional as F
+import argparse
+import time
+
+from dataset import Dataset, extract_hodge_descriptors
+
+from sklearn.metrics import (
+    f1_score,
+    recall_score,
+    roc_auc_score,
+    precision_score
+)
+
+from ADCGNN import *
+
+from sklearn.model_selection import train_test_split
+
+import pickle as pkl
+import numpy as np
+
+from diffusion import (
+    GaussianDiffusion,
+    make_beta_schedule
+)
+
+
+# ============================================================
+# G-MEAN
+# ============================================================
+
+def compute_gmean(
+    y_true,
+    y_pred
+):
+
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    TP = np.sum(
+        (y_true == 1)
+        & (y_pred == 1)
+    )
+
+    TN = np.sum(
+        (y_true == 0)
+        & (y_pred == 0)
+    )
+
+    FP = np.sum(
+        (y_true == 0)
+        & (y_pred == 1)
+    )
+
+    FN = np.sum(
+        (y_true == 1)
+        & (y_pred == 0)
+    )
+
+    recall_pos = (
+        TP / (TP + FN)
+        if (TP + FN) > 0
+        else 0.0
+    )
+
+    recall_neg = (
+        TN / (TN + FP)
+        if (TN + FP) > 0
+        else 0.0
+    )
+
+    return np.sqrt(
+        recall_pos
+        * recall_neg
+    )
+
+
+# ============================================================
+# MODEL WRAPPER
+#
+# GaussianDiffusion cần noise prediction.
+# Base model cần thêm Hodge feature.
+# ============================================================
+
+class ModelWrapper(torch.nn.Module):
+
+    def __init__(
+        self,
+        base_model,
+        num_classes,
+        in_feats,
+        hodge_feat
+    ):
+
+        super().__init__()
+
+        self.base_model = base_model
+
+        self.noise_head = torch.nn.Linear(
+            num_classes,
+            in_feats
+        )
+
+        # Hodge descriptors của toàn bộ graph.
+        # Không trainable.
+        self.register_buffer(
+            "hodge_feat",
+            hodge_feat
+        )
+
+    def forward(
+        self,
+        x,
+        t=None
+    ):
+
+        logits = self.base_model(
+            x,
+            self.hodge_feat
+        )
+
+        noise_pred = self.noise_head(
+            logits
+        )
+
+        return noise_pred, logits
+
+
+# ============================================================
+# TRAIN
+# ============================================================
+
+def train(
+    model,
+    g,
+    args
+):
+
+    features = g.ndata["feature"]
+    labels = g.ndata["label"]
+
+    device = features.device
+
+    in_feats = features.shape[1]
+
+    print(
+        "in_feats:",
+        in_feats
+    )
+
+    print(
+        "g.ndata['feature'].shape:",
+        features.shape
+    )
+
+    features_reshaped = features
+
+    print(
+        "features_reshaped:",
+        features_reshaped.shape
+    )
+
+    # ========================================================
+    # GAUSSIAN DIFFUSION
+    #
+    # GIỮ NGUYÊN.
+    # ========================================================
+
+    betas = make_beta_schedule(
+        schedule="cosine",
+        n_timestep=1500,
+        cosine_s=12e-3
+    )
+
+    diffusion = GaussianDiffusion(
+        betas
+    ).to(device)
+
+    # ========================================================
+    # TRAIN / VAL / TEST MASK
+    # ========================================================
+
+    if "train_mask" not in g.ndata:
+
+        num_nodes = labels.shape[0]
+
+        train_mask = torch.zeros(
+            num_nodes,
+            dtype=torch.bool
+        )
+
+        val_mask = torch.zeros(
+            num_nodes,
+            dtype=torch.bool
+        )
+
+        test_mask = torch.zeros(
+            num_nodes,
+            dtype=torch.bool
+        )
+
+        indices = np.arange(
+            num_nodes
+        )
+
+        train_idx, rest_idx = train_test_split(
+            indices,
+            train_size=args.train_ratio,
+            stratify=labels.cpu().numpy(),
+            random_state=2
+        )
+
+        val_idx, test_idx = train_test_split(
+            rest_idx,
+            test_size=0.67,
+            stratify=labels.cpu().numpy()[rest_idx],
+            random_state=2
+        )
+
+        train_mask[train_idx] = True
+        val_mask[val_idx] = True
+        test_mask[test_idx] = True
+
+        # Đưa mask lên GPU nếu graph đang ở GPU.
+        train_mask = train_mask.to(device)
+        val_mask = val_mask.to(device)
+        test_mask = test_mask.to(device)
+
+    else:
+
+        train_mask = g.ndata["train_mask"]
+        val_mask = g.ndata["val_mask"]
+        test_mask = g.ndata["test_mask"]
+
+    print(
+        "train/dev/test samples: ",
+        train_mask.sum().item(),
+        val_mask.sum().item(),
+        test_mask.sum().item()
+    )
+
+    # ========================================================
+    # OPTIMIZER
+    # ========================================================
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=0.01
+    )
+
+    best_loss = 1e6
+
+    final_trec = 0.0
+    final_tpre = 0.0
+    final_tmf1 = 0.0
+    final_tauc = 0.0
+    final_tgmean = 0.0
+
+    # ========================================================
+    # CLASS WEIGHT
+    # ========================================================
+
+    weight_val = (
+        (1 - labels[train_mask]).sum().item()
+        /
+        labels[train_mask].sum().item()
+    )
+
+    num_classes = 2
+
+    weight_tensor = torch.ones(
+        num_classes,
+        device=device
+    )
+
+    weight_tensor[1] = weight_val
+
+    print(
+        "cross entropy weight:",
+        weight_tensor
+    )
+
+    # ========================================================
+    # TRAINING
+    # ========================================================
+
+    time_start = time.time()
+
+    for e in range(
+        1,
+        args.epoch + 1
+    ):
+
+        model.train()
+
+        # ----------------------------------------------------
+        # Classification forward
+        # ----------------------------------------------------
+
+        n, logits = model(
+            features
+        )
+
+        loss = F.cross_entropy(
+            logits[train_mask],
+            labels[train_mask].long(),
+            weight=weight_tensor
+        )
+
+        # ----------------------------------------------------
+        # Gaussian Diffusion
+        #
+        # GIỮ NGUYÊN OBJECTIVE.
+        # ----------------------------------------------------
+
+        batch_size = features_reshaped.shape[0]
+
+        t = torch.randint(
+            0,
+            diffusion.num_timesteps,
+            (batch_size,)
+        ).to(device)
+
+        loss_diff = diffusion.p_loss_contrastive(
+            model,
+            features_reshaped,
+            t,
+            temperature=0.1,
+            lambda_contrast=0.1
+        )
+
+        # ----------------------------------------------------
+        # Total loss
+        # ----------------------------------------------------
+
+        total_loss = (
+            loss
+            + 0.1 * loss_diff
+        )
+
+        optimizer.zero_grad()
+
+        total_loss.backward()
+
+        optimizer.step()
+
+        # ====================================================
+        # EVALUATION
+        # ====================================================
+
+        model.eval()
+
+        with torch.no_grad():
+
+            _, logits_val = model(
+                features
+            )
+
+            loss_val = F.cross_entropy(
+                logits_val[val_mask],
+                labels[val_mask].long(),
+                weight=weight_tensor
+            )
+
+            probs = logits_val.softmax(
+                1
+            )
+
+            f1, thres = get_best_f1(
+                labels[val_mask],
+                probs[val_mask]
+            )
+
+            preds = torch.zeros_like(
+                labels
+            ).to(device)
+
+            preds[
+                probs[:, 1] > thres
+            ] = 1
+
+            # ------------------------------------------------
+            # TEST METRICS
+            # ------------------------------------------------
+
+            y_true = labels[
+                test_mask
+            ].cpu().numpy()
+
+            y_pred = preds[
+                test_mask
+            ].cpu().numpy()
+
+            trec = recall_score(
+                y_true,
+                y_pred
+            )
+
+            tpre = precision_score(
+                y_true,
+                y_pred
+            )
+
+            tmf1 = f1_score(
+                y_true,
+                y_pred,
+                average="macro"
+            )
+
+            tauc = roc_auc_score(
+                y_true,
+                probs[
+                    test_mask
+                ][:, 1].cpu().numpy()
+            )
+
+            tgmean = compute_gmean(
+                y_true,
+                y_pred
+            )
+
+        # ====================================================
+        # SAVE BEST
+        # ====================================================
+
+        if loss_val <= best_loss:
+
+            best_loss = loss_val
+
+            final_trec = trec
+            final_tpre = tpre
+            final_tmf1 = tmf1
+            final_tauc = tauc
+            final_tgmean = tgmean
+
+            pred_y = probs
+
+        print(
+            "Epoch {}, loss: {:.4f}, "
+            "val mf1: {:.4f}, "
+            "test AUC: {:.4f}, "
+            "test MF1: {:.4f}".format(
+                e,
+                loss_val,
+                f1,
+                tauc,
+                tmf1
+            )
+        )
+
+        # ----------------------------------------------------
+        # Save probabilities
+        # ----------------------------------------------------
+
+        if (
+            args.del_ratio == 0
+            and e % 20 == 0
+        ):
+
+            with open(
+                f"probs_{args.dataset}_ADCGNN",
+                "wb"
+            ) as f:
+
+                pkl.dump(
+                    pred_y,
+                    f
+                )
+
+    # ========================================================
+    # TIME
+    # ========================================================
+
+    time_end = time.time()
+
+    print(
+        "time cost: ",
+        time_end - time_start,
+        "s"
+    )
+
+    # ========================================================
+    # FINAL RESULT
+    # ========================================================
+
+    result = (
+        "REC {:.2f} "
+        "PRE {:.2f} "
+        "MF1 {:.2f} "
+        "AUC {:.2f} "
+        "GMean {:.2f}"
+    ).format(
+        final_trec * 100,
+        final_tpre * 100,
+        final_tmf1 * 100,
+        final_tauc * 100,
+        final_tgmean * 100
+    )
+
+    print(result)
+
+    with open(
+        "result.txt",
+        "a+"
+    ) as f:
+
+        f.write(
+            f"{result}\n"
+        )
+
+    return (
+        final_tmf1,
+        final_tauc,
+        final_tgmean
+    )
+
+
+# ============================================================
+# FIND BEST F1 THRESHOLD
+# ============================================================
+
+def get_best_f1(
+    labels,
+    probs
+):
+
+    if labels.is_cuda:
+        labels = labels.cpu().numpy()
+    else:
+        labels = labels.numpy()
+
+    if probs.is_cuda:
+        probs = probs.cpu().numpy()
+    else:
+        probs = probs.numpy()
+
+    best_f1 = 0
+    best_thre = 0
+
+    for thres in np.linspace(
+        0.05,
+        0.95,
+        19
+    ):
+
+        preds = np.zeros_like(
+            labels
+        )
+
+        preds[
+            probs[:, 1] > thres
+        ] = 1
+
+        mf1 = f1_score(
+            labels,
+            preds,
+            average="macro"
+        )
+
+        if mf1 > best_f1:
+
+            best_f1 = mf1
+            best_thre = thres
+
+    return (
+        best_f1,
+        best_thre
+    )
+
+
+# ============================================================
+# RANDOM SEED
+# ============================================================
+
+def set_random_seed(
+    seed
+):
+
+    torch.manual_seed(
+        seed
+    )
+
+    torch.cuda.manual_seed_all(
+        seed
+    )
+
+    np.random.seed(
+        seed
+    )
+
+    print(
+        "seed:",
+        seed,
+        "\n"
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(
+        description="Full ADCGNN"
+    )
+
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="amazon",
+        help="Dataset: yelp/amazon/tfinance/CM"
+    )
+
+    parser.add_argument(
+        "--train_ratio",
+        type=float,
+        default=0.01,
+        help="Training ratio"
+    )
+
+    parser.add_argument(
+        "--hid_dim",
+        type=int,
+        default=64,
+        help="Hidden layer dimension"
+    )
+
+    parser.add_argument(
+        "--order",
+        type=int,
+        default=2,
+        help="Polynomial diffusion order"
+    )
+
+    parser.add_argument(
+        "--epoch",
+        type=int,
+        default=100,
+        help="Number of epochs"
+    )
+
+    parser.add_argument(
+        "--run",
+        type=int,
+        default=1,
+        help="Running times"
+    )
+
+    parser.add_argument(
+        "--del_ratio",
+        type=float,
+        default=0.0,
+        help="Deletion ratio"
+    )
+
+    parser.add_argument(
+        "--adj_type",
+        type=str,
+        default="sym",
+        help="sym or rw"
+    )
+
+    parser.add_argument(
+        "--load_epoch",
+        type=int,
+        default=100,
+        help="Load epoch prediction"
+    )
+
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default="./data",
+        help="Data path"
+    )
+
+    args = parser.parse_args()
+
+    print(
+        "Training ratio :",
+        args.train_ratio
+    )
+
+    print(
+        "Deletion ratio :",
+        args.del_ratio
+    )
+
+    print(args)
+
+    # ========================================================
+    # RANDOM SEED
+    # ========================================================
+
+    set_random_seed(72)
+
+    # ========================================================
+    # DATASET
+    # ========================================================
+
+    dataset_name = args.dataset
+
+    del_ratio = args.del_ratio
+
+    if args.dataset == "yelp":
+        homo = 0
+    else:
+        homo = args.dataset
+
+    order = args.order
+    h_feats = args.hid_dim
+    adj_type = args.adj_type
+    load_epoch = args.load_epoch
+    data_path = args.data_path
+
+    # ========================================================
+    # DEVICE
+    # ========================================================
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    print(
+        "Device:",
+        device
+    )
+
+    # ========================================================
+    # LOAD GRAPH
+    # ========================================================
+
+    graph = Dataset(
+        load_epoch,
+        dataset_name,
+        del_ratio,
+        homo,
+        data_path,
+        adj_type=adj_type
+    ).graph
+
+    print(
+        "Graph loaded."
+    )
+
+    print(
+        "Number of nodes:",
+        graph.num_nodes()
+    )
+
+    print(
+        "Number of edges:",
+        graph.num_edges()
+    )
+
+    # ========================================================
+    # HODGE DESCRIPTORS
+    #
+    # Tính một lần và cache.
+    # ========================================================
+
+    print(
+        "\nExtracting Hodge descriptors..."
+    )
+
+    hodge_feat = extract_hodge_descriptors(
+        graph,
+        dataset_name,
+        data_path=data_path
+    )
+
+    print(
+        "Hodge feature shape:",
+        hodge_feat.shape
+    )
+
+    # ========================================================
+    # MOVE GRAPH + HODGE TO DEVICE
+    # ========================================================
+
+    graph = graph.to(
+        device
+    )
+
+    hodge_feat = hodge_feat.to(
+        device
+    )
+
+    # ========================================================
+    # INPUT DIMENSION
+    # ========================================================
+
+    in_feats = graph.ndata[
+        "feature"
+    ].shape[1]
+
+    num_classes = 2
+
+    print(
+        "Input features:",
+        in_feats
+    )
+
+    print(
+        "Hidden dimension:",
+        h_feats
+    )
+
+    print(
+        "Hodge dimension:",
+        hodge_feat.shape[1]
+    )
+
+    # ========================================================
+    # FULL MODEL
+    # ========================================================
+
+    if args.run == 1:
+
+        if homo == "amazon":
+
+            base_model = ADCGNN_amazon(
+                in_feats,
+                h_feats,
+                num_classes,
+                graph,
+                d=order
+            )
+
+        elif homo == 0:
+
+            base_model = ADCGNN_yelp(
+                in_feats,
+                h_feats,
+                num_classes,
+                graph,
+                d=order
+            )
+
+        elif homo == "tfinance":
+
+            base_model = ADCGNN_tfinance(
+                in_feats,
+                h_feats,
+                num_classes,
+                graph,
+                d=order
+            )
+
+        elif homo == "CM":
+
+            base_model = ADCGNN_CM(
+                in_feats,
+                h_feats,
+                num_classes,
+                graph,
+                d=order
+            )
+
+        else:
+
+            raise ValueError(
+                f"Unknown dataset: {dataset_name}"
+            )
+
+        base_model = base_model.to(
+            device
+        )
+
+        model = ModelWrapper(
+            base_model,
+            num_classes,
+            in_feats,
+            hodge_feat
+        ).to(device)
+
+        print(
+            "\n========================================"
+        )
+
+        print(
+            "FULL MODEL"
+        )
+
+        print(
+            "========================================"
+        )
+
+        print(
+            "Components:"
+        )
+
+        print(
+            "  [1] Hodge descriptors"
+        )
+
+        print(
+            "  [2] SOD"
+        )
+
+        print(
+            "  [3] Ego branch"
+        )
+
+        print(
+            "  [4] Graph Diffusion"
+        )
+
+        print(
+            "  [5] Topological Diffusion"
+        )
+
+        print(
+            "  [6] Gaussian Diffusion"
+        )
+
+        print(
+            "========================================\n"
+        )
+
+        train(
+            model,
+            graph,
+            args
+        )
+
+    # ========================================================
+    # MULTIPLE RUNS
+    # ========================================================
+
+    else:
+
+        final_mf1s = []
+        final_aucs = []
+        final_gmeans = []
+
+        for tt in range(
+            args.run
+        ):
+
+            print(
+                "\n"
+                "========================================"
+            )
+
+            print(
+                f"RUN {tt + 1}/{args.run}"
+            )
+
+            print(
+                "========================================"
+            )
+
+            if homo == "amazon":
+
+                base_model = ADCGNN_amazon(
+                    in_feats,
+                    h_feats,
+                    num_classes,
+                    graph,
+                    d=order
+                )
+
+            elif homo == 0:
+
+                base_model = ADCGNN_yelp(
+                    in_feats,
+                    h_feats,
+                    num_classes,
+                    graph,
+                    d=order
+                )
+
+            elif homo == "tfinance":
+
+                base_model = ADCGNN_tfinance(
+                    in_feats,
+                    h_feats,
+                    num_classes,
+                    graph,
+                    d=order
+                )
+
+            elif homo == "CM":
+
+                base_model = ADCGNN_CM(
+                    in_feats,
+                    h_feats,
+                    num_classes,
+                    graph,
+                    d=order
+                )
+
+            else:
+
+                raise ValueError(
+                    f"Unknown dataset: {dataset_name}"
+                )
+
+            base_model = base_model.to(
+                device
+            )
+
+            model = ModelWrapper(
+                base_model,
+                num_classes,
+                in_feats,
+                hodge_feat
+            ).to(device)
+
+            mf1, auc, gmean = train(
+                model,
+                graph,
+                args
+            )
+
+            final_mf1s.append(
+                mf1
+            )
+
+            final_aucs.append(
+                auc
+            )
+
+            final_gmeans.append(
+                gmean
+            )
+
+        # ====================================================
+        # FINAL AVERAGE
+        # ====================================================
+
+        final_mf1s = np.array(
+            final_mf1s
+        )
+
+        final_aucs = np.array(
+            final_aucs
+        )
+
+        final_gmeans = np.array(
+            final_gmeans
+        )
+
+        result = (
+            "MF1-mean: {:.2f}, "
+            "AUC-mean: {:.2f}, "
+            "GMean-mean: {:.2f}"
+        ).format(
+            100 * np.mean(
+                final_mf1s
+            ),
+
+            100 * np.mean(
+                final_aucs
+            ),
+
+            100 * np.mean(
+                final_gmeans
+            )
+        )
+
+        print(
+            "\n"
+            "========================================"
+        )
+
+        print(
+            result
+        )
+
+        print(
+            "========================================"
+        )
+
+
+
+
+
+
+
+
+
 
 
 
