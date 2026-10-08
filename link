@@ -1,6 +1,214 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import dgl.function as fn
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import dgl
+import dgl.function as fn
+import sympy
+import scipy
+import numpy as np
+from torch.nn import init
+
+class PolyConv(nn.Module):
+    def __init__(self,
+                 in_feats,
+                 out_feats,
+                 theta,
+                 activation=F.leaky_relu,
+                 lin=False,
+                 bias=False):
+        super(PolyConv, self).__init__()
+        self._theta = theta
+        self._k = len(self._theta)
+        self._in_feats = in_feats
+        self._out_feats = out_feats
+        self.activation = activation
+        self.linear = nn.Linear(in_feats, out_feats, bias)
+        self.lin = lin
+
+    def reset_parameters(self):
+        if self.linear.weight is not None:
+            init.xavier_uniform_(self.linear.weight)
+        if self.linear.bias is not None:
+            init.zeros_(self.linear.bias)
+
+    def forward(self, graph, feat):
+        def unnLaplacian(feat, D_invsqrt, graph):
+            graph.ndata['poly_h'] = feat * D_invsqrt
+            graph.update_all(fn.copy_u('poly_h', 'm'), fn.sum('m', 'poly_h'))
+            return feat - graph.ndata.pop('poly_h') * D_invsqrt
+
+        with graph.local_scope():
+            D_invsqrt = torch.pow(graph.in_degrees().float().clamp(min=1), -0.5).unsqueeze(-1).to(feat.device)
+            h = self._theta[0] * feat
+            for k in range(1, self._k):
+                feat = unnLaplacian(feat, D_invsqrt, graph)
+                h += self._theta[k] * feat
+        if self.lin:
+            h = self.linear(h)
+            h = self.activation(h)
+        return h
+
+def calculate_theta2(d):
+    thetas = []
+    x = sympy.symbols('x')
+    for i in range(d + 1):
+        f = sympy.poly((x/2)**i * (1 - x/2)**(d - i) / (scipy.special.beta(i+1, d+1-i)))
+        coeff = f.all_coeffs()
+        inv_coeff = []
+        for j in range(d+1):
+            inv_coeff.append(float(coeff[d - j]))
+        thetas.append(inv_coeff)
+    return thetas
+
+
+class ADCGNN(nn.Module):
+    def __init__(
+        self, in_feats, h_feats, num_classes, graph, d=2, 
+        batch=False, dropout=0.2, hodge_dim=0, 
+        use_sod=True, use_ego=True, use_norm=True
+    ):
+        super().__init__()
+        self.g = graph
+        self.d = d
+        self.hodge_dim = hodge_dim
+        self.use_sod = use_sod
+        self.use_ego = use_ego
+        self.use_norm = use_norm
+
+        # Polynomial branches
+        self.thetas = calculate_theta2(d=d)
+        self.num_branches = len(self.thetas)
+        conv_cls = PolyConv
+        self.conv = nn.ModuleList([
+            conv_cls(h_feats, h_feats, theta, lin=False) for theta in self.thetas
+        ])
+
+        # Feature transformations & layers
+        self.linear = nn.Linear(in_feats, h_feats)
+        self.linear2 = nn.Linear(h_feats, h_feats)
+        self.linear3 = nn.Linear(h_feats, h_feats)
+        self.linear4 = nn.Linear(h_feats, num_classes)
+        self.residual_fc = nn.Linear(h_feats, h_feats)
+
+        self.act = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+        # Attention & Fusion
+        self.attention_fc = nn.Linear(h_feats, 1)
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(2 * h_feats, h_feats),
+            nn.LeakyReLU(),
+            nn.Linear(h_feats, 1),
+            nn.Sigmoid()
+        )
+
+        # Hodge projection
+        self.hodge_proj = nn.Sequential(
+            nn.Linear(hodge_dim, h_feats, bias=False),
+            nn.LayerNorm(h_feats)
+        ) if hodge_dim > 0 else None
+
+        # SOD branch
+        if self.use_sod:
+            self.ortho_fc = nn.Linear(in_feats, h_feats)
+            self.ortho_gate = nn.Sequential(
+                nn.Linear(in_feats + hodge_dim, h_feats),
+                nn.LeakyReLU(0.2),
+                nn.Linear(h_feats, 1),
+                nn.Sigmoid()
+            )
+            self.norm_s = nn.LayerNorm(h_feats) if use_norm else nn.Identity()
+            self.sod_scale = nn.Parameter(torch.tensor(0.3))
+
+        # Ego branch
+        if self.use_ego:
+            self.ego_fc = nn.Linear(in_feats, h_feats)
+            ego_hidden = max(h_feats // 2, 1)
+            self.ego_gate = nn.Sequential(
+                nn.Linear(in_feats, ego_hidden),
+                nn.LeakyReLU(0.2),
+                nn.Linear(ego_hidden, 1),
+                nn.Sigmoid()
+            )
+            self.norm_ego = nn.LayerNorm(h_feats) if use_norm else nn.Identity()
+
+    def forward(self, in_feat, hodge_feat=None):
+        device = in_feat.device
+
+        # 1. SOD Branch
+        if self.use_sod:
+            with self.g.local_scope():
+                self.g.ndata['f_tmp'] = in_feat
+                self.g.update_all(fn.copy_u('f_tmp', 'm'), fn.mean('m', 'neigh_m'))
+                h_nbr = self.g.ndata['neigh_m']
+                dot_prod = torch.sum(in_feat * h_nbr, dim=-1, keepdim=True)
+                norm_sq = torch.sum(h_nbr * h_nbr, dim=-1, keepdim=True) + 1e-8
+                s_i = in_feat - (dot_prod / norm_sq) * h_nbr
+            s_emb = self.norm_s(self.ortho_fc(s_i))
+
+            if self.hodge_dim > 0:
+                h_feat = hodge_feat.to(device) if hodge_feat is not None else torch.zeros(s_i.size(0), self.hodge_dim, device=device)
+                gate_input = torch.cat([s_i, h_feat], dim=-1)
+            else:
+                gate_input = s_i
+
+            s_term = self.sod_scale * self.ortho_gate(gate_input) * s_emb
+        else:
+            s_term = torch.zeros(in_feat.size(0), self.linear.out_features, device=device, dtype=in_feat.dtype)
+
+        # 2. Main ADCGNN & Hodge Injection
+        h_pre = self.linear(in_feat)
+        h_pre = self.dropout(self.act(self.linear2(self.act(h_pre))))
+        res = self.residual_fc(h_pre)
+
+        # 3. Polynomial Branches & Attention Fusion
+        branch_outputs = [conv(self.g, h_pre).to(device) for conv in self.conv]
+        h_stack = torch.stack(branch_outputs, dim=1)  # [N, B, F]
+        N, B, F_dim = h_stack.shape
+
+        attn_scores = self.attention_fc(h_stack.view(-1, F_dim)).view(N, B)
+        attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)
+        
+        attn_fused = torch.sum(h_stack * attn_weights, dim=1)
+        mean_fused = torch.mean(h_stack, dim=1)
+
+        fusion_weight = self.fusion_mlp(torch.cat([attn_fused, mean_fused], dim=-1))
+        fused = (0.1 * fusion_weight * attn_fused) + ((1.0 - fusion_weight) * mean_fused) + (0.8 * res)
+
+        # 4. Ego Branch & Combination
+        if self.use_ego:
+            ego_term = self.ego_gate(in_feat) * self.norm_ego(self.ego_fc(in_feat))
+        else:
+            ego_term = torch.zeros_like(fused)
+
+        fused = fused + s_term + ego_term
+
+        # 5. Output Head
+        return self.linear4(self.dropout(self.act(self.linear3(fused))))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import dgl
 import dgl.function as fn
 import sympy
