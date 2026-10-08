@@ -65,6 +65,762 @@ def calculate_theta2(d):
     return thetas
 
 
+class ADCGNN_amazon(nn.Module):
+    def __init__(
+        self, in_feats, h_feats, num_classes, graph, d=2, 
+        batch=False, dropout=0.2, hodge_dim=0, 
+        use_sod=True, use_ego=True, use_norm=True
+    ):
+        super().__init__()
+        self.g = graph
+        self.d = d
+        self.hodge_dim = hodge_dim
+        self.use_sod = use_sod
+        self.use_ego = use_ego
+        self.use_norm = use_norm
+
+        # Polynomial branches
+        self.thetas = calculate_theta2(d=d)
+        self.num_branches = len(self.thetas)
+        conv_cls = PolyConv
+        self.conv = nn.ModuleList([
+            conv_cls(h_feats, h_feats, theta, lin=False) for theta in self.thetas
+        ])
+
+        # Feature transformations & layers
+        self.linear = nn.Linear(in_feats, h_feats)
+        self.linear2 = nn.Linear(h_feats, h_feats)
+        self.linear3 = nn.Linear(h_feats, h_feats)
+        self.linear4 = nn.Linear(h_feats, num_classes)
+        self.residual_fc = nn.Linear(h_feats, h_feats)
+
+        self.act = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+        # Attention & Fusion
+        self.attention_fc = nn.Linear(h_feats, 1)
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(2 * h_feats, h_feats),
+            nn.LeakyReLU(),
+            nn.Linear(h_feats, 1),
+            nn.Sigmoid()
+        )
+
+        # Hodge projection
+        self.hodge_proj = nn.Sequential(
+            nn.Linear(hodge_dim, h_feats, bias=False),
+            nn.LayerNorm(h_feats)
+        ) if hodge_dim > 0 else None
+
+        # SOD branch
+        if self.use_sod:
+            self.ortho_fc = nn.Linear(in_feats, h_feats)
+            self.ortho_gate = nn.Sequential(
+                nn.Linear(in_feats + hodge_dim, h_feats),
+                nn.LeakyReLU(0.2),
+                nn.Linear(h_feats, 1),
+                nn.Sigmoid()
+            )
+            self.norm_s = nn.LayerNorm(h_feats) if use_norm else nn.Identity()
+            self.sod_scale = nn.Parameter(torch.tensor(0.3))
+
+        # Ego branch
+        if self.use_ego:
+            self.ego_fc = nn.Linear(in_feats, h_feats)
+            ego_hidden = max(h_feats // 2, 1)
+            self.ego_gate = nn.Sequential(
+                nn.Linear(in_feats, ego_hidden),
+                nn.LeakyReLU(0.2),
+                nn.Linear(ego_hidden, 1),
+                nn.Sigmoid()
+            )
+            self.norm_ego = nn.LayerNorm(h_feats) if use_norm else nn.Identity()
+
+    def forward(self, in_feat, hodge_feat=None):
+        device = in_feat.device
+
+        # 1. SOD Branch
+        if self.use_sod:
+            with self.g.local_scope():
+                self.g.ndata['f_tmp'] = in_feat
+                self.g.update_all(fn.copy_u('f_tmp', 'm'), fn.mean('m', 'neigh_m'))
+                h_nbr = self.g.ndata['neigh_m']
+                dot_prod = torch.sum(in_feat * h_nbr, dim=-1, keepdim=True)
+                norm_sq = torch.sum(h_nbr * h_nbr, dim=-1, keepdim=True) + 1e-8
+                s_i = in_feat - (dot_prod / norm_sq) * h_nbr
+            s_emb = self.norm_s(self.ortho_fc(s_i))
+
+            if self.hodge_dim > 0:
+                h_feat = hodge_feat.to(device) if hodge_feat is not None else torch.zeros(s_i.size(0), self.hodge_dim, device=device)
+                gate_input = torch.cat([s_i, h_feat], dim=-1)
+            else:
+                gate_input = s_i
+
+            s_term = self.sod_scale * self.ortho_gate(gate_input) * s_emb
+        else:
+            s_term = torch.zeros(in_feat.size(0), self.linear.out_features, device=device, dtype=in_feat.dtype)
+
+        # 2. Main ADCGNN & Hodge Injection
+        h_pre = self.linear(in_feat)
+        h_pre = self.dropout(self.act(self.linear2(self.act(h_pre))))
+        res = self.residual_fc(h_pre)
+
+        # 3. Polynomial Branches & Attention Fusion
+        branch_outputs = [conv(self.g, h_pre).to(device) for conv in self.conv]
+        h_stack = torch.stack(branch_outputs, dim=1)  # [N, B, F]
+        N, B, F_dim = h_stack.shape
+
+        attn_scores = self.attention_fc(h_stack.view(-1, F_dim)).view(N, B)
+        attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)
+        
+        attn_fused = torch.sum(h_stack * attn_weights, dim=1)
+        mean_fused = torch.mean(h_stack, dim=1)
+
+        fusion_weight = self.fusion_mlp(torch.cat([attn_fused, mean_fused], dim=-1))
+        fused = (0.1 * fusion_weight * attn_fused) + ((1.0 - fusion_weight) * mean_fused) + (0.8 * res)
+
+        # 4. Ego Branch & Combination
+        if self.use_ego:
+            ego_term = self.ego_gate(in_feat) * self.norm_ego(self.ego_fc(in_feat))
+        else:
+            ego_term = torch.zeros_like(fused)
+
+        fused = fused + s_term + ego_term
+
+        # 5. Output Head
+        return self.linear4(self.dropout(self.act(self.linear3(fused))))
+
+
+
+
+
+
+
+import argparse
+import os
+import pickle as pkl
+import random
+import time
+
+import dgl
+import numpy as np
+import scipy.sparse as sp
+import torch
+import torch.nn.functional as F
+from sklearn.metrics import (
+    average_precision_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+
+# from ADCGNN import *
+# from dataset import Dataset
+# from diffusion import GaussianDiffusion, make_beta_schedule
+
+
+# ============================================================
+# Reproducibility Setup
+# ============================================================
+
+def set_strict_seed(seed=72):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # Ép CUDNN dùng thuật toán deterministic
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # Tắt TF32 trên Ampere GPU (A100) để tính toán FP32 chuẩn
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = False
+
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except AttributeError:
+        pass
+
+    print(f"[Seed] Fixed global random seed to: {seed}")
+
+
+# ============================================================
+# Metric & Threshold Functions
+# ============================================================
+
+def compute_recall_at_k(y_true, scores):
+    """Tính Recall@K với K = Số lượng mẫu Fraud thực tế trong tập Test."""
+    y_true = np.asarray(y_true)
+    scores = np.asarray(scores)
+
+    positive_count = int(np.sum(y_true == 1))
+    if positive_count == 0:
+        return 0.0, 0
+
+    top_k_idx = np.argsort(scores)[-positive_count:]
+    top_k_true_positive = np.sum(y_true[top_k_idx] == 1)
+    recall_at_k = top_k_true_positive / positive_count
+
+    return recall_at_k, positive_count
+
+
+def get_best_f1_threshold(labels, probs):
+    """Tìm ngưỡng phân loại tối ưu Macro-F1 trên tập Validation."""
+    if labels.is_cuda:
+        labels = labels.cpu().numpy()
+    else:
+        labels = labels.numpy()
+
+    if probs.is_cuda:
+        probs = probs.cpu().numpy()
+    else:
+        probs = probs.numpy()
+
+    best_f1 = 0.0
+    best_thre = 0.5
+
+    for thres in np.linspace(0.05, 0.95, 19):
+        preds = np.zeros_like(labels)
+        preds[probs[:, 1] > thres] = 1
+
+        mf1 = f1_score(labels, preds, average="macro", zero_division=0)
+
+        if mf1 > best_f1:
+            best_f1 = mf1
+            best_thre = thres
+
+    return best_f1, best_thre
+
+
+# ============================================================
+# Hodge Descriptor Extraction
+# ============================================================
+
+def extract_hodge_descriptors(g, dataset_name, data_path="./data", chunk_size=4000):
+    cache_dir = os.path.join(data_path, "hodge_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(cache_dir, f"{dataset_name}_hodge_feat.pt")
+
+    if os.path.exists(cache_path):
+        print(f"[Hodge] Loading cached features: {cache_path}")
+        return torch.load(cache_path, weights_only=True)
+
+    print("\n" + "=" * 60)
+    print("Extracting Hodge structural descriptors")
+    print("=" * 60)
+
+    if isinstance(g, dgl.DGLGraph):
+        if len(g.canonical_etypes) > 1:
+            homo_g = dgl.to_homogeneous(g)
+        else:
+            homo_g = g
+    else:
+        homo_g = g
+
+    num_nodes = homo_g.num_nodes()
+    print("[Hodge] Number of nodes:", num_nodes)
+
+    src, dst = homo_g.edges()
+    src_np = src.detach().cpu().numpy()
+    dst_np = dst.detach().cpu().numpy()
+
+    mask = src_np != dst_np
+    src_clean = src_np[mask]
+    dst_clean = dst_np[mask]
+
+    adj_data = np.ones(len(src_clean), dtype=np.float32)
+    A = sp.csr_matrix((adj_data, (src_clean, dst_clean)), shape=(num_nodes, num_nodes))
+    A = A.maximum(A.T)
+    A.setdiag(0)
+    A.eliminate_zeros()
+
+    node_degrees = np.asarray(A.sum(axis=1)).flatten()
+    deg_safe = np.maximum(node_degrees, 1.0)
+
+    node_triangles = np.zeros(num_nodes, dtype=np.float32)
+    A_csc = A.tocsc()
+
+    for start_idx in tqdm(
+        range(0, num_nodes, chunk_size), desc="[Hodge] Computing triangles"
+    ):
+        end_idx = min(start_idx + chunk_size, num_nodes)
+        A_chunk = A[start_idx:end_idx, :]
+        A2_chunk = A_chunk.dot(A_csc)
+        A_tri_chunk = A_chunk.multiply(A2_chunk)
+        node_triangles[start_idx:end_idx] = (
+            np.asarray(A_tri_chunk.sum(axis=1)).flatten() / 2.0
+        )
+
+    neighbor_degree_sum = np.asarray(A.dot(node_degrees)).flatten()
+    curv_deg_part = 4.0 - node_degrees - (neighbor_degree_sum / deg_safe)
+    curv_tri_part = 6.0 * node_triangles / deg_safe
+    ricci_curvature = curv_deg_part + curv_tri_part
+
+    if "feature" in homo_g.ndata:
+        feats = homo_g.ndata["feature"]
+        if torch.is_tensor(feats):
+            feats_np = feats.detach().cpu().numpy()
+        else:
+            feats_np = np.asarray(feats)
+
+        D_inv = sp.diags(1.0 / deg_safe)
+        A_norm = D_inv.dot(A)
+        neigh_feat_mean = A_norm.dot(feats_np)
+        dispersion = np.linalg.norm(feats_np - neigh_feat_mean, axis=1)
+    else:
+        dispersion = np.abs(node_degrees - (neighbor_degree_sum / deg_safe))
+
+    log_degree = np.log1p(node_degrees)
+    triangle_ratio = node_triangles / deg_safe
+
+    hodge_matrix = np.stack(
+        [ricci_curvature, dispersion, log_degree, triangle_ratio], axis=1
+    ).astype(np.float32)
+
+    hodge_matrix = np.nan_to_num(
+        hodge_matrix, nan=0.0, posinf=0.0, neginf=0.0
+    )
+
+    mean_val = np.mean(hodge_matrix, axis=0)
+    std_val = np.std(hodge_matrix, axis=0) + 1e-6
+    hodge_matrix = (hodge_matrix - mean_val) / std_val
+
+    hodge_tensor = torch.tensor(hodge_matrix, dtype=torch.float32)
+    torch.save(hodge_tensor, cache_path)
+
+    print("[Hodge] Final shape:", tuple(hodge_tensor.shape))
+    print("[Hodge] Saved to:", cache_path)
+    print("=" * 60)
+
+    return hodge_tensor
+
+
+# ============================================================
+# Model Architecture
+# ============================================================
+
+class ModelWrapper(torch.nn.Module):
+    def __init__(self, base_model, num_classes, in_feats, hodge_feat=None):
+        super().__init__()
+        self.base_model = base_model
+        self.noise_head = torch.nn.Linear(num_classes, in_feats)
+
+        if hodge_feat is not None:
+            self.register_buffer("hodge_feat", hodge_feat.float())
+        else:
+            self.hodge_feat = None
+
+    def forward(self, x, t=None):
+        if self.hodge_feat is not None:
+            logits = self.base_model(x, hodge_feat=self.hodge_feat)
+        else:
+            logits = self.base_model(x)
+
+        noise_pred = self.noise_head(logits)
+        return noise_pred, logits
+
+
+def build_base_model(homo, in_feats, h_feats, num_classes, graph, order, hodge_dim=None):
+    if homo == "amazon":
+        if hodge_dim is not None:
+            return ADCGNN_amazon(in_feats, h_feats, num_classes, graph, d=order, hodge_dim=hodge_dim)
+        return ADCGNN_amazon(in_feats, h_feats, num_classes, graph, d=order)
+    elif homo == 0:
+        if hodge_dim is not None:
+            return ADCGNN_yelp(in_feats, h_feats, num_classes, graph, d=order, hodge_dim=hodge_dim)
+        return ADCGNN_yelp(in_feats, h_feats, num_classes, graph, d=order)
+    elif homo == "tfinance":
+        if hodge_dim is not None:
+            return ADCGNN_tfinance(in_feats, h_feats, num_classes, graph, d=order, hodge_dim=hodge_dim)
+        return ADCGNN_tfinance(in_feats, h_feats, num_classes, graph, d=order)
+    elif homo == "CM":
+        if hodge_dim is not None:
+            return ADCGNN_CM(in_feats, h_feats, num_classes, graph, d=order, hodge_dim=hodge_dim)
+        return ADCGNN_CM(in_feats, h_feats, num_classes, graph, d=order)
+    else:
+        raise ValueError(f"Unsupported dataset: {homo}")
+
+
+# ============================================================
+# Training Pipeline
+# ============================================================
+
+def train(model, g, args, hodge_feat=None):
+    features = g.ndata["feature"]
+    labels = g.ndata["label"]
+    device = features.device
+
+    in_feats = features.shape[1]
+
+    features_reshaped = features
+    betas = make_beta_schedule(
+        schedule="cosine", n_timestep=1500, cosine_s=12e-3
+    )
+    diffusion = GaussianDiffusion(betas).to(device)
+
+    # Data Split
+    if "train_mask" not in g.ndata:
+        num_nodes = labels.shape[0]
+
+        train_mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+        val_mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+        test_mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+
+        indices = np.arange(num_nodes)
+
+        train_idx, rest_idx = train_test_split(
+            indices,
+            train_size=args.train_ratio,
+            stratify=labels.cpu().numpy(),
+            random_state=2,
+        )
+
+        val_idx, test_idx = train_test_split(
+            rest_idx,
+            test_size=0.67,
+            stratify=labels.cpu().numpy()[rest_idx],
+            random_state=2,
+        )
+
+        train_mask[train_idx] = True
+        val_mask[val_idx] = True
+        test_mask[test_idx] = True
+    else:
+        train_mask = g.ndata["train_mask"]
+        val_mask = g.ndata["val_mask"]
+        test_mask = g.ndata["test_mask"]
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+    best_val_ap = -1.0
+    final_tap = 0.0
+    final_tauc = 0.0
+    final_trec_at_k = 0.0
+    final_tmf1 = 0.0
+
+    best_epoch = 0
+    best_threshold = 0.5
+    pred_y = None
+
+    positive_count = labels[train_mask].sum().item()
+    negative_count = (1 - labels[train_mask]).sum().item()
+    weight_val = negative_count / max(positive_count, 1)
+
+    num_classes = 2
+    weight_tensor = torch.ones(num_classes, device=device)
+    weight_tensor[1] = weight_val
+
+    time_start = time.time()
+
+    for e in range(1, args.epoch + 1):
+        model.train()
+
+        _, logits = model(features)
+        loss = F.cross_entropy(
+            logits[train_mask],
+            labels[train_mask].long(),
+            weight=weight_tensor,
+        )
+
+        batch_size = features_reshaped.shape[0]
+        t = torch.randint(
+            0,
+            diffusion.num_timesteps,
+            (batch_size,),
+            device=device,
+        )
+        loss_diff = diffusion.p_loss_contrastive(
+            model,
+            features_reshaped,
+            t,
+            temperature=0.1,
+            lambda_contrast=0.1,
+        )
+
+        total_loss = loss + 0.1 * loss_diff
+
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
+
+        # Evaluation
+        model.eval()
+
+        with torch.no_grad():
+            _, logits_eval = model(features)
+            probs = logits_eval.softmax(dim=1)
+
+            val_probs = probs[val_mask][:, 1].detach().cpu().numpy()
+            val_labels = labels[val_mask].detach().cpu().numpy()
+            val_ap = average_precision_score(val_labels, val_probs)
+
+            val_f1, threshold = get_best_f1_threshold(
+                labels[val_mask], probs[val_mask]
+            )
+
+            test_probs = probs[test_mask][:, 1].detach().cpu().numpy()
+            test_labels = labels[test_mask].detach().cpu().numpy()
+
+            test_preds = (test_probs > threshold).astype(np.int64)
+
+            test_ap = average_precision_score(test_labels, test_probs)
+            test_auc = roc_auc_score(test_labels, test_probs)
+            test_mf1 = f1_score(
+                test_labels, test_preds, average="macro", zero_division=0
+            )
+            test_recall_at_k, k = compute_recall_at_k(
+                test_labels, test_probs
+            )
+
+        # Selection criterion = Validation AP
+        if val_ap > best_val_ap:
+            best_val_ap = val_ap
+
+            final_tap = test_ap
+            final_tauc = test_auc
+            final_trec_at_k = test_recall_at_k
+            final_tmf1 = test_mf1
+
+            best_epoch = e
+            best_threshold = threshold
+            pred_y = probs.detach().clone()
+
+        if e % 20 == 0 or e == args.epoch:
+            print(
+                "Epoch {:03d} | Loss: {:.4f} | Val AP: {:.4f} | Val F1: {:.4f} | "
+                "Test AP: {:.4f} | Test AUC: {:.4f} | Test R@K: {:.4f} | Test MF1: {:.4f}".format(
+                    e,
+                    loss.item(),
+                    val_ap,
+                    val_f1,
+                    test_ap,
+                    test_auc,
+                    test_recall_at_k,
+                    test_mf1,
+                )
+            )
+
+        if args.del_ratio == 0 and e % 20 == 0:
+            with open(f"probs_{args.dataset}_ADCGNN", "wb") as f:
+                pkl.dump(pred_y.cpu(), f)
+
+    time_end = time.time()
+
+    result = "AP {:.2f} AUROC {:.2f} Rec@K {:.2f} F1-macro {:.2f}".format(
+        final_tap * 100,
+        final_tauc * 100,
+        final_trec_at_k * 100,
+        final_tmf1 * 100,
+    )
+
+    print("-" * 50)
+    print(f"Run Finished | Best Epoch: {best_epoch} (Val AP: {best_val_ap:.4f}) | Selected Threshold: {best_threshold:.4f}")
+    print(f"Test Result: {result}")
+    print("-" * 50)
+
+    return final_tap, final_tauc, final_trec_at_k, final_tmf1
+
+
+# ============================================================
+# Notebook Execution Entrypoint (5 SEEDS RUN)
+# ============================================================
+
+parser = argparse.ArgumentParser(description="ADCGNN Multi-run Pipeline")
+parser.add_argument("--dataset", type=str, default="amazon", help="Dataset (yelp/amazon/tfinance/CM)")
+parser.add_argument("--train_ratio", type=float, default=0.01, help="Training ratio")
+parser.add_argument("--hid_dim", type=int, default=64, help="Hidden layer dimension")
+parser.add_argument("--order", type=int, default=2, help="Order C in Beta Wavelet")
+parser.add_argument("--epoch", type=int, default=100, help="The max number of epochs")
+parser.add_argument("--run", type=int, default=5, help="Running 5 seeds")
+parser.add_argument("--del_ratio", type=float, default=0.0, help="delete ratios")
+parser.add_argument("--adj_type", type=str, default="sym", help="sym or rw")
+parser.add_argument("--load_epoch", type=int, default=100, help="load epoch prediction")
+parser.add_argument("--data_path", type=str, default="./data", help="data path")
+parser.add_argument("--use_hodge", action="store_true", default=True, help="Whether to use Hodge features")
+
+# Tương thích Notebook
+args = parser.parse_args([])
+
+print("Training ratio :", args.train_ratio)
+print("Deletion ratio :", args.del_ratio)
+print("Total Runs     :", args.run)
+
+dataset_name = args.dataset
+del_ratio = args.del_ratio
+homo = 0 if args.dataset == "yelp" else args.dataset
+
+order = args.order
+h_feats = args.hid_dim
+adj_type = args.adj_type
+load_epoch = args.load_epoch
+data_path = args.data_path
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using Device:", device)
+
+# Load Graph
+graph = Dataset(load_epoch, dataset_name, del_ratio, homo, data_path, adj_type=adj_type).graph
+graph = graph.to(device)
+in_feats = graph.ndata["feature"].shape[1]
+num_classes = 2
+
+# Hodge features
+if args.use_hodge:
+    hodge_feat = extract_hodge_descriptors(graph, dataset_name, data_path=data_path)
+    hodge_feat = hodge_feat.to(device)
+    hodge_dim = hodge_feat.shape[1]
+else:
+    hodge_feat = None
+    hodge_dim = None
+
+# Vòng lặp chạy 5 Seed
+final_aps, final_aucs, final_recalls, final_mf1s = [], [], [], []
+
+for tt in range(args.run):
+    current_seed = 72 + tt
+    print(f"\n" + "=" * 70)
+    print(f"RUN {tt + 1}/{args.run} (Seed: {current_seed})")
+    print("=" * 70)
+
+    set_strict_seed(current_seed)
+
+    base_model = build_base_model(
+        homo=homo,
+        in_feats=in_feats,
+        h_feats=h_feats,
+        num_classes=num_classes,
+        graph=graph,
+        order=order,
+        hodge_dim=hodge_dim,
+    ).to(device)
+
+    model = ModelWrapper(
+        base_model=base_model,
+        num_classes=num_classes,
+        in_feats=in_feats,
+        hodge_feat=hodge_feat,
+    ).to(device)
+
+    ap, auc, recall_at_k, mf1 = train(model, graph, args, hodge_feat=hodge_feat)
+
+    final_aps.append(ap)
+    final_aucs.append(auc)
+    final_recalls.append(recall_at_k)
+    final_mf1s.append(mf1)
+
+# Tổng hợp kết quả Mean +- Std
+final_aps = np.array(final_aps) * 100
+final_aucs = np.array(final_aucs) * 100
+final_recalls = np.array(final_recalls) * 100
+final_mf1s = np.array(final_mf1s) * 100
+
+summary_result = (
+    "AP: {:.2f} ± {:.2f} | "
+    "AUROC: {:.2f} ± {:.2f} | "
+    "Rec@K: {:.2f} ± {:.2f} | "
+    "F1-macro: {:.2f} ± {:.2f}"
+).format(
+    np.mean(final_aps), np.std(final_aps),
+    np.mean(final_aucs), np.std(final_aucs),
+    np.mean(final_recalls), np.std(final_recalls),
+    np.mean(final_mf1s), np.std(final_mf1s),
+)
+
+print("\n" + "=" * 75)
+print("FINAL 5-RUN AGGREGATED RESULT (MEAN ± STD):")
+print(summary_result)
+print("=" * 75 + "\n")
+
+with open("result_5runs.txt", "a+") as f:
+    f.write(f"Dataset: {dataset_name} | {summary_result}\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import dgl.function as fn
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import dgl
+import dgl.function as fn
+import sympy
+import scipy
+import numpy as np
+from torch.nn import init
+
+class PolyConv(nn.Module):
+    def __init__(self,
+                 in_feats,
+                 out_feats,
+                 theta,
+                 activation=F.leaky_relu,
+                 lin=False,
+                 bias=False):
+        super(PolyConv, self).__init__()
+        self._theta = theta
+        self._k = len(self._theta)
+        self._in_feats = in_feats
+        self._out_feats = out_feats
+        self.activation = activation
+        self.linear = nn.Linear(in_feats, out_feats, bias)
+        self.lin = lin
+
+    def reset_parameters(self):
+        if self.linear.weight is not None:
+            init.xavier_uniform_(self.linear.weight)
+        if self.linear.bias is not None:
+            init.zeros_(self.linear.bias)
+
+    def forward(self, graph, feat):
+        def unnLaplacian(feat, D_invsqrt, graph):
+            graph.ndata['poly_h'] = feat * D_invsqrt
+            graph.update_all(fn.copy_u('poly_h', 'm'), fn.sum('m', 'poly_h'))
+            return feat - graph.ndata.pop('poly_h') * D_invsqrt
+
+        with graph.local_scope():
+            D_invsqrt = torch.pow(graph.in_degrees().float().clamp(min=1), -0.5).unsqueeze(-1).to(feat.device)
+            h = self._theta[0] * feat
+            for k in range(1, self._k):
+                feat = unnLaplacian(feat, D_invsqrt, graph)
+                h += self._theta[k] * feat
+        if self.lin:
+            h = self.linear(h)
+            h = self.activation(h)
+        return h
+
+def calculate_theta2(d):
+    thetas = []
+    x = sympy.symbols('x')
+    for i in range(d + 1):
+        f = sympy.poly((x/2)**i * (1 - x/2)**(d - i) / (scipy.special.beta(i+1, d+1-i)))
+        coeff = f.all_coeffs()
+        inv_coeff = []
+        for j in range(d+1):
+            inv_coeff.append(float(coeff[d - j]))
+        thetas.append(inv_coeff)
+    return thetas
+
+
 class ADCGNN(nn.Module):
     def __init__(
         self, in_feats, h_feats, num_classes, graph, d=2, 
