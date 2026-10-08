@@ -3,6 +3,355 @@ import torch.nn as nn
 import torch.nn.functional as F
 import dgl
 import dgl.function as fn
+import sympy
+import scipy
+import numpy as np
+from torch.nn import init
+
+
+# ============================================================
+# 1. Polynomial Convolution
+# ============================================================
+
+class PolyConv(nn.Module):
+    def __init__(self, in_feats, out_feats, theta, activation=F.leaky_relu, lin=False, bias=False):
+        super(PolyConv, self).__init__()
+
+        self._theta = theta
+        self._k = len(self._theta)
+        self._in_feats = in_feats
+        self._out_feats = out_feats
+
+        self.activation = activation
+        self.linear = nn.Linear(in_feats, out_feats, bias=bias)
+        self.lin = lin
+
+    def reset_parameters(self):
+        if self.linear.weight is not None:
+            init.xavier_uniform_(self.linear.weight)
+        if self.linear.bias is not None:
+            init.zeros_(self.linear.bias)
+
+    def forward(self, graph, feat):
+
+        def unnLaplacian(feat, D_invsqrt, graph):
+            graph.ndata["poly_h"] = feat * D_invsqrt
+            graph.update_all(
+                fn.copy_u("poly_h", "m"),
+                fn.sum("m", "poly_h")
+            )
+            return feat - graph.ndata.pop("poly_h") * D_invsqrt
+
+        with graph.local_scope():
+            D_invsqrt = torch.pow(
+                graph.in_degrees().float().clamp(min=1), -0.5
+            ).unsqueeze(-1).to(feat.device)
+
+            h = self._theta[0] * feat
+            for k in range(1, self._k):
+                feat = unnLaplacian(feat, D_invsqrt, graph)
+                h += self._theta[k] * feat
+
+        if self.lin:
+            h = self.linear(h)
+            h = self.activation(h)
+
+        return h
+
+
+# ============================================================
+# 2. Polynomial Convolution for Mini-batch
+# ============================================================
+
+class PolyConvBatch(nn.Module):
+    def __init__(self, in_feats, out_feats, theta, activation=F.leaky_relu, lin=False, bias=False):
+        super(PolyConvBatch, self).__init__()
+
+        self._theta = theta
+        self._k = len(self._theta)
+        self._in_feats = in_feats
+        self._out_feats = out_feats
+
+        self.activation = activation
+        self.lin = lin
+
+    def forward(self, block, feat):
+
+        def unnLaplacian(feat, D_invsqrt, block):
+            block.srcdata["h"] = feat * D_invsqrt
+            block.update_all(
+                fn.copy_u("h", "m"),
+                fn.sum("m", "h")
+            )
+            return feat - block.srcdata.pop("h") * D_invsqrt
+
+        with block.local_scope():
+            D_invsqrt = torch.pow(
+                block.out_degrees().float().clamp(min=1), -0.5
+            ).unsqueeze(-1).to(feat.device)
+
+            h = self._theta[0] * feat
+            for k in range(1, self._k):
+                feat = unnLaplacian(feat, D_invsqrt, block)
+                h += self._theta[k] * feat
+
+        return h
+
+
+# ============================================================
+# 3. Calculate Polynomial Coefficients
+# ============================================================
+
+def calculate_theta2(d):
+    thetas = []
+    x = sympy.symbols("x")
+
+    for i in range(d + 1):
+        f = sympy.poly(
+            (x / 2) ** i
+            * (1 - x / 2) ** (d - i)
+            / scipy.special.beta(i + 1, d + 1 - i)
+        )
+
+        coeff = f.all_coeffs()
+        inv_coeff = []
+
+        for j in range(d + 1):
+            inv_coeff.append(float(coeff[d - j]))
+
+        thetas.append(inv_coeff)
+
+    return thetas
+
+
+# ============================================================
+# 4. ADCGNN + Hodge
+# ============================================================
+
+class ADCGNN_amazon(nn.Module):
+
+    def __init__(
+        self,
+        in_feats,
+        h_feats,
+        num_classes,
+        graph,
+        d=2,
+        batch=False,
+        dropout=0.2,
+        hodge_dim=0,
+        use_sod=True,
+        use_ego=True,
+        use_norm=True
+    ):
+        super().__init__()
+
+        # Basic configuration
+        self.g = graph
+        self.d = d
+        self.hodge_dim = hodge_dim
+
+        self.use_sod = use_sod
+        self.use_ego = use_ego
+        self.use_norm = use_norm
+
+        # Polynomial branches
+        self.thetas = calculate_theta2(d=d)
+        self.num_branches = len(self.thetas)
+
+        conv_cls = PolyConvBatch if batch else PolyConv
+
+        self.conv = nn.ModuleList([
+            conv_cls(h_feats, h_feats, theta, lin=False)
+            for theta in self.thetas
+        ])
+
+        # Main feature transformations
+        self.linear = nn.Linear(in_feats, h_feats)
+        self.linear2 = nn.Linear(h_feats, h_feats)
+        self.linear3 = nn.Linear(h_feats, h_feats)
+        self.linear4 = nn.Linear(h_feats, num_classes)
+
+        # Residual
+        self.residual_fc = nn.Linear(h_feats, h_feats)
+
+        # Activation / Dropout
+        self.act = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+        # HODGE MODULE
+        if hodge_dim > 0:
+            self.hodge_proj = nn.Sequential(
+                nn.Linear(hodge_dim, h_feats, bias=False),
+                nn.LayerNorm(h_feats)
+            )
+            # Learnable Hodge contribution
+            self.hodge_scale = nn.Parameter(torch.tensor(0.3))
+        else:
+            self.hodge_proj = None
+            self.hodge_scale = None
+
+        # Attention + Fusion
+        self.attention_fc = nn.Linear(h_feats, 1)
+
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(2 * h_feats, h_feats),
+            nn.LeakyReLU(),
+            nn.Linear(h_feats, 1),
+            nn.Sigmoid()
+        )
+
+        # SOD BRANCH
+        if self.use_sod:
+            # Original feature -> SOD embedding
+            self.ortho_fc = nn.Linear(in_feats, h_feats)
+
+            # IMPORTANT: Hodge KHÔNG đi vào SOD gate
+            self.ortho_gate = nn.Sequential(
+                nn.Linear(in_feats, h_feats),
+                nn.LeakyReLU(0.2),
+                nn.Linear(h_feats, 1),
+                nn.Sigmoid()
+            )
+
+            self.norm_s = nn.LayerNorm(h_feats) if use_norm else nn.Identity()
+            self.sod_scale = nn.Parameter(torch.tensor(0.3))
+
+        # EGO BRANCH
+        if self.use_ego:
+            self.ego_fc = nn.Linear(in_feats, h_feats)
+            ego_hidden = max(h_feats // 2, 1)
+
+            self.ego_gate = nn.Sequential(
+                nn.Linear(in_feats, ego_hidden),
+                nn.LeakyReLU(0.2),
+                nn.Linear(ego_hidden, 1),
+                nn.Sigmoid()
+            )
+
+            self.norm_ego = nn.LayerNorm(h_feats) if use_norm else nn.Identity()
+
+    # FORWARD
+    def forward(self, in_feat, hodge_feat=None):
+        device = in_feat.device
+
+        # 1. SOD BRANCH
+        if self.use_sod:
+            with self.g.local_scope():
+                # Original node feature
+                self.g.ndata["f_tmp"] = in_feat
+
+                # Neighbor mean
+                self.g.update_all(
+                    fn.copy_u("f_tmp", "m"),
+                    fn.mean("m", "neigh_m")
+                )
+
+                h_nbr = self.g.ndata["neigh_m"]
+
+                # Projection component
+                dot_prod = torch.sum(in_feat * h_nbr, dim=-1, keepdim=True)
+                norm_sq = torch.sum(h_nbr * h_nbr, dim=-1, keepdim=True) + 1e-8
+
+                # Orthogonal component
+                s_i = in_feat - (dot_prod / norm_sq) * h_nbr
+
+            # SOD embedding
+            s_emb = self.norm_s(self.ortho_fc(s_i))
+
+            # SOD gate (ONLY original SOD feature)
+            s_gate = self.ortho_gate(s_i)
+
+            # SOD contribution
+            s_term = self.sod_scale * s_gate * s_emb
+        else:
+            s_term = torch.zeros(
+                in_feat.size(0),
+                self.linear.out_features,
+                device=device,
+                dtype=in_feat.dtype
+            )
+
+        # 2. MAIN ADCGNN
+        # Original feature
+        h_pre = self.linear(in_feat)
+
+        # Main feature transformation
+        h_pre = self.act(h_pre)
+        h_pre = self.linear2(h_pre)
+        h_pre = self.act(h_pre)
+        h_pre = self.dropout(h_pre)
+
+        # Residual
+        res = self.residual_fc(h_pre)
+
+        # 3. POLYNOMIAL BRANCHES
+        branch_outputs = []
+        for conv in self.conv:
+            branch_out = conv(self.g, h_pre)
+            branch_outputs.append(branch_out)
+
+        # [N, B, h_feats]
+        h_stack = torch.stack(branch_outputs, dim=1)
+        N, B, F_dim = h_stack.shape
+
+        # 4. ATTENTION
+        attn_scores = self.attention_fc(h_stack.reshape(-1, F_dim)).reshape(N, B)
+        attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)
+
+        # Attention-weighted branches & Mean branches
+        attn_fused = torch.sum(h_stack * attn_weights, dim=1)
+        mean_fused = torch.mean(h_stack, dim=1)
+
+        # 5. FUSION
+        fusion_weight = self.fusion_mlp(
+            torch.cat([attn_fused, mean_fused], dim=-1)
+        )
+
+        fused = (
+            0.1 * fusion_weight * attn_fused
+            + (1.0 - fusion_weight) * mean_fused
+            + 0.8 * res
+        )
+
+        # 6. EGO BRANCH
+        if self.use_ego:
+            ego_emb = self.norm_ego(self.ego_fc(in_feat))
+            ego_gate = self.ego_gate(in_feat)
+            ego_term = ego_gate * ego_emb
+        else:
+            ego_term = torch.zeros_like(fused)
+
+        # 7. FINAL FUSION
+        fused = fused + s_term + ego_term
+
+        # 8. OUTPUT HEAD
+        fused = self.linear3(fused)
+        fused = self.act(fused)
+        fused = self.dropout(fused)
+        logits = self.linear4(fused)
+
+        return logits
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import dgl
+import dgl.function as fn
 
 import sympy
 import scipy
