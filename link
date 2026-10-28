@@ -1,4 +1,349 @@
 import torch
+import torch.nn as nn
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+from torch_scatter import scatter, scatter_softmax
+
+
+class ExSTraQtPnaFeatureConcatAgg(nn.Module):
+    """ExSTraQt Temporal Features combined with PNA (Degree Scaler Aggregation).
+
+    This module extracts temporal features from edge timestamps and amounts,
+    fuses them with local features, and aggregates them using Principal
+    Neighbour Aggregation (PNA).
+    """
+
+    def __init__(self, n_hidden: int, deg: torch.Tensor, dropout_p: float = 0.4):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.exstraqt_ln = nn.LayerNorm(6)
+
+        # Concatenate x (n_hidden) and 8 edge features, then project.
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(n_hidden + 8, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p),
+        )
+
+        aggregators = ["mean", "min", "max", "std"]
+        scalers = ["identity", "amplification", "attenuation"]
+        
+        self.pna_core = DegreeScalerAggregation(
+            aggregators=aggregators, 
+            scalers=scalers, 
+            deg=deg
+        )
+        
+        pna_out = len(aggregators) * len(scalers) * n_hidden
+
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p),
+        )
+        
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p),
+        )
+        
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Resets learnable parameters using Kaiming normal initialization."""
+        self.pna_core.reset_parameters()
+        self.exstraqt_ln.reset_parameters()
+        
+        for seq in [self.feature_fusion, self.pna_project, self.post_transition]:
+            nn.init.kaiming_normal_(seq[0].weight, nonlinearity="relu")
+            nn.init.zeros_(seq[0].bias)
+            seq[1].reset_parameters()
+
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        index: torch.Tensor, 
+        timestamps_: torch.Tensor, 
+        log_amounts: torch.Tensor, 
+        num_groups: int = None
+    ) -> torch.Tensor:
+        num_edges = x.size(0)
+        
+        if num_groups is None:
+            num_groups = int(index.max().item()) + 1 if num_edges > 0 else 0
+            
+        if num_edges == 0:
+            return x.new_zeros((num_groups, self.n_hidden))
+
+        # Đảm bảo edge_counts cùng device và dtype với x
+        edge_counts = torch.bincount(
+            index, minlength=num_groups
+        ).to(device=x.device, dtype=x.dtype)
+        eps_counts = edge_counts + 1e-5
+
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce="min")
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce="max")
+        duration_safe = (max_t - min_t) + 1.0
+        
+        tau = (timestamps_ - min_t[index]) / duration_safe[index].clamp_min(1e-5)
+
+        # 1. Time-flow centrality
+        temperature = 3.0
+        global_std = torch.std(log_amounts, unbiased=False).clamp_min(1e-5)
+        
+        raw_weights = scatter_softmax(
+            log_amounts / (global_std * temperature), 
+            index, 
+            dim=0
+        )
+        amt_weights = raw_weights / eps_counts[index]
+        tf_c = scatter(amt_weights * tau, index, dim=0, dim_size=num_groups, reduce="sum")
+
+        # 2. Time variance
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_groups, reduce="mean")
+        time_var = scatter(
+            (tau - mean_tau[index]) ** 2, 
+            index, 
+            dim=0, 
+            dim_size=num_groups, 
+            reduce="sum"
+        ) / eps_counts
+        tf_std = torch.sqrt(time_var + 1e-5)
+
+        # 3. Burst density
+        burst_density = torch.log1p(edge_counts)
+
+        # 4. Money velocity
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce="mean")
+        velocity_ratio = mean_log_amount / torch.log1p(duration_safe)
+        money_velocity = torch.log1p(velocity_ratio.clamp_min(-0.999))
+
+        # 5. Flow skewness
+        centered = log_amounts - mean_log_amount[index]
+        skew_num = scatter(
+            centered ** 3, 
+            index, 
+            dim=0, 
+            dim_size=num_groups, 
+            reduce="sum"
+        ) / eps_counts
+        skew_moment = scatter(
+            centered ** 2, 
+            index, 
+            dim=0, 
+            dim_size=num_groups, 
+            reduce="sum"
+        ) / eps_counts
+        skew_den = skew_moment.clamp_min(0).pow(1.5) + 1e-5
+        flow_skew = torch.clamp(skew_num / skew_den, min=-2.0, max=2.0)
+
+        # 6. Average inter-arrival time
+        avg_inter_arrival = torch.log1p(duration_safe / eps_counts)
+
+        # Gom nhóm ExSTraQt features (6 chiều)
+        group_context = torch.stack([
+            tf_c, tf_std, burst_density, money_velocity,
+            flow_skew, avg_inter_arrival
+        ], dim=-1)
+        group_context = self.exstraqt_ln(group_context)
+
+        # Phân rã lại cho từng edge + local features (2 chiều) -> Tổng cộng 8 chiều
+        edge_context = group_context[index]
+        edge_local = torch.stack([tau, log_amounts], dim=-1)
+        edge_features = torch.cat([edge_context, edge_local], dim=-1)
+
+        # Ghép nối với node/edge features ban đầu (x)
+        fused_x = self.feature_fusion(torch.cat([x, edge_features], dim=-1))
+
+        # PNA Aggregation
+        pna_raw = self.pna_core(fused_x, index, dim_size=num_groups)
+        pna_feats = self.pna_project(pna_raw)
+        
+        # Residual connection
+        return self.post_transition(pna_feats) + pna_feats
+
+
+import torch
+import torch.nn as nn
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+from torch_scatter import scatter, scatter_softmax
+
+
+class ExSTraQtPnaFeatureConcatAgg(nn.Module):
+    """ExSTraQt Temporal Features combined with PNA (Degree Scaler Aggregation).
+
+    This module extracts temporal features from edge timestamps and amounts,
+    fuses them with local features, and aggregates them using Principal
+    Neighbour Aggregation (PNA).
+    """
+
+    def __init__(self, n_hidden: int, deg: torch.Tensor, dropout_p: float = 0.4):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.exstraqt_ln = nn.LayerNorm(6)
+
+        # Concatenate x (n_hidden) and 8 edge features, then project.
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(n_hidden + 8, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p),
+        )
+
+        aggregators = ["mean", "min", "max", "std"]
+        scalers = ["identity", "amplification", "attenuation"]
+        
+        self.pna_core = DegreeScalerAggregation(
+            aggregators=aggregators, 
+            scalers=scalers, 
+            deg=deg
+        )
+        
+        pna_out = len(aggregators) * len(scalers) * n_hidden
+
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p),
+        )
+        
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p),
+        )
+        
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Resets learnable parameters using Kaiming normal initialization."""
+        self.pna_core.reset_parameters()
+        self.exstraqt_ln.reset_parameters()
+        
+        for seq in [self.feature_fusion, self.pna_project, self.post_transition]:
+            nn.init.kaiming_normal_(seq[0].weight, nonlinearity="relu")
+            nn.init.zeros_(seq[0].bias)
+            seq[1].reset_parameters()
+
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        index: torch.Tensor, 
+        timestamps_: torch.Tensor, 
+        log_amounts: torch.Tensor, 
+        num_groups: int = None
+    ) -> torch.Tensor:
+        num_edges = x.size(0)
+        
+        if num_groups is None:
+            num_groups = int(index.max().item()) + 1 if num_edges > 0 else 0
+            
+        if num_edges == 0:
+            return x.new_zeros((num_groups, self.n_hidden))
+
+        # Đảm bảo edge_counts cùng device và dtype với x
+        edge_counts = torch.bincount(
+            index, minlength=num_groups
+        ).to(device=x.device, dtype=x.dtype)
+        eps_counts = edge_counts + 1e-5
+
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce="min")
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce="max")
+        duration_safe = (max_t - min_t) + 1.0
+        
+        # Tránh chia cho 0
+        tau = (timestamps_ - min_t[index]) / duration_safe[index].clamp_min(1e-5)
+
+        # 1. Time-flow centrality
+        temperature = 3.0
+        global_std = torch.std(log_amounts, unbiased=False).clamp_min(1e-5)
+        
+        raw_weights = scatter_softmax(
+            log_amounts / (global_std * temperature), 
+            index, 
+            dim=0
+        )
+        amt_weights = raw_weights / eps_counts[index]
+        tf_c = scatter(amt_weights * tau, index, dim=0, dim_size=num_groups, reduce="sum")
+
+        # 2. Time variance
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_groups, reduce="mean")
+        time_var = scatter(
+            (tau - mean_tau[index]) ** 2, 
+            index, 
+            dim=0, 
+            dim_size=num_groups, 
+            reduce="sum"
+        ) / eps_counts
+        tf_std = torch.sqrt(time_var + 1e-5)
+
+        # 3. Burst density
+        burst_density = torch.log1p(edge_counts)
+
+        # 4. Money velocity
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce="mean")
+        velocity_ratio = mean_log_amount / torch.log1p(duration_safe)
+        money_velocity = torch.log1p(velocity_ratio.clamp_min(-0.999))
+
+        # 5. Flow skewness
+        centered = log_amounts - mean_log_amount[index]
+        skew_num = scatter(
+            centered ** 3, 
+            index, 
+            dim=0, 
+            dim_size=num_groups, 
+            reduce="sum"
+        ) / eps_counts
+        skew_moment = scatter(
+            centered ** 2, 
+            index, 
+            dim=0, 
+            dim_size=num_groups, 
+            reduce="sum"
+        ) / eps_counts
+        skew_den = skew_moment.clamp_min(0).pow(1.5) + 1e-5
+        flow_skew = torch.clamp(skew_num / skew_den, min=-2.0, max=2.0)
+
+        # 6. Average inter-arrival time
+        avg_inter_arrival = torch.log1p(duration_safe / eps_counts)
+
+        # Gom nhóm ExSTraQt features (6 chiều)
+        group_context = torch.stack([
+            tf_c, tf_std, burst_density, money_velocity,
+            flow_skew, avg_inter_arrival
+        ], dim=-1)
+        group_context = self.exstraqt_ln(group_context)
+
+        # Phân rã lại cho từng edge + local features (2 chiều) -> Tổng cộng 8 chiều
+        edge_context = group_context[index]
+        edge_local = torch.stack([tau, log_amounts], dim=-1)
+        edge_features = torch.cat([edge_context, edge_local], dim=-1)
+
+        # Ghép nối với node/edge features ban đầu (x)
+        fused_x = self.feature_fusion(torch.cat([x, edge_features], dim=-1))
+
+        # PNA Aggregation (Truyền thêm dim_size để tránh lỗi kích thước)
+        pna_raw = self.pna_core(fused_x, index, dim_size=num_groups)
+        pna_feats = self.pna_project(pna_raw)
+        
+        # Residual connection
+        return self.post_transition(pna_feats) + pna_feats
+
+
+
+
+
+
+
+
+
+
+import torch
 from torch_geometric.data import Data, HeteroData
 from torch_geometric.typing import OptTensor
 import numpy as np
